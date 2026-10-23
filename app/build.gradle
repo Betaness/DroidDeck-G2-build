@@ -125,7 +125,7 @@ android {
         manifestPlaceholders = [appLabel: "DroidDeck G2"]
         minSdkVersion 26
         targetSdkVersion 28
-        versionCode 14
+        versionCode 16
         versionName "0.5.0"
         buildConfigField "String", "BUILD_LABEL", "\"${escapedBuildLabel}\""
         buildConfigField "String", "SOURCE_COMMIT", "\"${sourceCommit}\""
