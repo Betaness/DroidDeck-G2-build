@@ -24,19 +24,26 @@
  * RELEASE_RESOURCES (FL_STEPS=draw,query FL_PASSES=16: ~6.7 KB per frame).
  * Query variants: FL_QUERY_KIND=ts (default: vkCmdWriteTimestamp after the rendering), ts2
  * (vkCmdWriteTimestamp2), inrp (timestamp inside the rendering), occl (an occlusion query around
- * the draws); FL_QUERY_COUNT (default 1) such queries per frame; FL_QUERY_READ=0 skips
+ * the draws), reset (only the vkCmdResetQueryPool of the first command buffer, no query written);
+ * FL_QUERY_COUNT (default 1) such queries per frame; FL_QUERY_READ=0 skips
  * vkGetQueryPoolResults; FL_QUERY_WHERE=top|bottom writes only the timestamp at the start of the
  * first command buffer or only the queries of the last one; FL_QUERY_HOSTRESET=1 resets with
  * vkResetQueryPool instead of vkCmdResetQueryPool.
  * FL_PASSES (default 1): the draws split over that many vkCmdBeginRendering/vkCmdEndRendering
- * (occl/inrp queries need FL_QUERY_COUNT a multiple of it). FL_POOL_RELEASE=1 resets the command
- * pools with VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT. FL_RECREATE=N: every N frames, after
+ * (occl/inrp queries need FL_QUERY_COUNT a multiple of it). FL_RENDERPASS=1/2 records them as
+ * render pass instances of a VkRenderPass with vkCmdBeginRenderPass / vkCmdBeginRenderPass2 instead.
+ * FL_POOL_RELEASE=N resets each command pool at every Nth use with VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT
+ * (1 = always). With FL_TIMING=1 the end line is followed by "FL timing:" with the CPU time of the
+ * command pool resets that released (FL_POOL_RELEASE) and of the others, and of recording the frame
+ * right after a release and the other frames (recording = begin to end of the frame's command buffers),
+ * and every FL frame line by "FL window N reset_us R rec_us C", the means over that report window. FL_RECREATE=N: every N frames, after
  * vkDeviceWaitIdle, destroys and recreates FL_RECREATE_WHAT (cmdpool, querypool or both).
  * FL_CB_RESET=1/2: vkResetCommandBuffer before each begin, with flags 0 / RELEASE_RESOURCES.
  * FL_SERVER_PID: the Vortek server's pid; every FL frame line then also carries the server's malloc
  * heap ("srvheap", kB of resident Scudo/malloc mappings from /proc/<pid>/smaps). FL_SERVER_PID=self
  * measures this process (the in-process Mali path, ../../hybris/tests/frame_leak_test.sh), counting
- * unnamed anonymous mappings and [heap] as heap, with its whole resident size ("rss", kB) too.
+ * unnamed anonymous mappings and [heap] as heap, with its whole resident size ("rss", kB) too. Each FL
+ * frame line is then followed by "FL cpu N ms T", the server's (this process's) CPU time so far.
  * Also builds as a bionic program against the device's own loader and driver (no Vortek, no X11,
  * offscreen only); it then prints the process's malloc heap with every FL frame line:
  *   clang --target=aarch64-linux-android30 -O2 -o frame_leak_test frame_leak_test.c -lvulkan
@@ -116,6 +123,23 @@ static long selfRssKb(void) {
     return kb;
 }
 
+/* utime + stime of the process, ms */
+static double procCpuMs(int pid) {
+    char path[64], line[1024];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    FILE* f = fopen(path, "r");
+    if (!f) return -1;
+    double ms = -1;
+    if (fgets(line, sizeof(line), f)) {
+        const char* p = strrchr(line, ')');
+        unsigned long utime, stime;
+        if (p && sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &utime, &stime) == 2)
+            ms = (utime + stime) * 1000.0 / sysconf(_SC_CLK_TCK);
+    }
+    fclose(f);
+    return ms;
+}
+
 static VkPhysicalDeviceMemoryProperties mp;
 static uint32_t findType(uint32_t bits, VkMemoryPropertyFlags want) {
     for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
@@ -132,6 +156,7 @@ int main(void) {
     if (selfHeap) serverPid = getpid();
 #endif
     int passes = envInt("FL_PASSES", 1), poolRelease = envInt("FL_POOL_RELEASE", 0), recreate = envInt("FL_RECREATE", 0);
+    int renderPassKind = envInt("FL_RENDERPASS", 0), timing = envInt("FL_TIMING", 0);
     const char* recreateWhat = getenv("FL_RECREATE_WHAT") && *getenv("FL_RECREATE_WHAT") ? getenv("FL_RECREATE_WHAT") : "both";
     if (passes < 1) passes = 1;
     int queryRead = envInt("FL_QUERY_READ", 1), queryHostReset = envInt("FL_QUERY_HOSTRESET", 0);
@@ -139,6 +164,8 @@ int main(void) {
     bool queryTop = strcmp(queryWhere, "bottom") != 0, queryBottom = strcmp(queryWhere, "top") != 0;
     const char* queryKind = getenv("FL_QUERY_KIND") && *getenv("FL_QUERY_KIND") ? getenv("FL_QUERY_KIND") : "ts";
     bool occl = strcmp(queryKind, "occl") == 0, ts2 = strcmp(queryKind, "ts2") == 0, inrp = strcmp(queryKind, "inrp") == 0;
+    bool resetOnly = strcmp(queryKind, "reset") == 0;
+    if (resetOnly) queryRead = 0, queryTop = queryBottom = false;
     int queryCount = envInt("FL_QUERY_COUNT", 1);
     if (queryCount < 1) queryCount = 1;
     if (queryCount > QUERIES_PER_SLOT - 1) queryCount = QUERIES_PER_SLOT - 1;
@@ -299,6 +326,27 @@ int main(void) {
         layout, VK_NULL_HANDLE, 0};
     VkPipeline pipeline;
     CK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, 0, &pipeline));
+    /* FL_RENDERPASS: a single-subpass VkRenderPass that loads and stores the image, a framebuffer per
+     * image and a pipeline for it */
+    VkRenderPass renderPass = VK_NULL_HANDLE;
+    VkFramebuffer* framebuffers = NULL;
+    if (renderPassKind) {
+        VkAttachmentDescription ad = {0, format, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE,
+            VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkAttachmentReference ar = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription sd = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, 0, 1, &ar};
+        VkRenderPassCreateInfo rpi = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, 0, 0, 1, &ad, 1, &sd};
+        CK(vkCreateRenderPass(dev, &rpi, 0, &renderPass));
+        framebuffers = calloc(imageCount, sizeof(VkFramebuffer));
+        for (uint32_t i = 0; i < imageCount; i++) {
+            VkFramebufferCreateInfo fbi = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, 0, 0, renderPass, 1, &views[i], extent.width, extent.height, 1};
+            CK(vkCreateFramebuffer(dev, &fbi, 0, &framebuffers[i]));
+        }
+        gpi.pNext = NULL;
+        gpi.renderPass = renderPass;
+        CK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, 0, &pipeline));
+    }
 
     VkQueryPool queryPool, occlPool;
     VkQueryPoolCreateInfo qpi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, 0, 0, VK_QUERY_TYPE_TIMESTAMP, QUERIES_PER_SLOT * MAX_INFLIGHT};
@@ -330,6 +378,10 @@ int main(void) {
     CK(vkCreateSemaphore(dev, &tsi, 0, &timeline));
 
     double t0 = now(), tReport = t0, recordTime = 0;
+    /* FL_TIMING: [0] resets without release, [1] with; recording [0] other frames, [1] right after a release */
+    double resetSum[2] = {0}, resetMax[2] = {0}, recSum[2] = {0}, recMax[2] = {0};
+    long resetN[2] = {0}, recN[2] = {0};
+    double winReset = 0, winRec = 0;  /* this report window's totals, for "reset_us" / "rec_us" */
     uint64_t submitted = 0;
     for (int f = 0; f < frames; f++) {
         int slot = f % inflight;
@@ -385,7 +437,18 @@ int main(void) {
             vkResetQueryPool(dev, occlPool, qbase, QUERIES_PER_SLOT);
         }
         double tRecord = now();
-        if (usePoolReset) CK(vkResetCommandPool(dev, pools[slot], poolRelease ? VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT : 0));
+        bool released = poolRelease > 0 && (f / inflight) % poolRelease == 0;  /* every Nth use of each slot's pool */
+        if (usePoolReset) {
+            CK(vkResetCommandPool(dev, pools[slot], released ? VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT : 0));
+            double dt = now() - tRecord;
+            winReset += dt;
+            if (f >= 2 * inflight) {
+                resetSum[released] += dt;
+                resetN[released]++;
+                if (dt > resetMax[released]) resetMax[released] = dt;
+            }
+        }
+        double tCommands = now();
         if (useDesc) CK(vkResetDescriptorPool(dev, descPool[slot], 0));
 
         uint32_t index = f % imageCount;
@@ -441,10 +504,22 @@ int main(void) {
                     for (int d = 0; d < draws; d++) {
                       if (d % ((draws + passes - 1) / passes) == 0) {
                         if (d > 0) {
-                            vkCmdEndRendering(cb);
+                            if (renderPassKind == 2) {
+                                VkSubpassEndInfo se = {VK_STRUCTURE_TYPE_SUBPASS_END_INFO};
+                                vkCmdEndRenderPass2(cb, &se);
+                            }
+                            else if (renderPassKind) vkCmdEndRenderPass(cb);
+                            else vkCmdEndRendering(cb);
                             att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
                         }
-                        vkCmdBeginRendering(cb, &ri);
+                        VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, 0, renderPass,
+                                                     framebuffers ? framebuffers[index] : VK_NULL_HANDLE, {{0, 0}, extent}};
+                        if (renderPassKind == 2) {
+                            VkSubpassBeginInfo sb = {VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO, 0, VK_SUBPASS_CONTENTS_INLINE};
+                            vkCmdBeginRenderPass2(cb, &rbi, &sb);
+                        }
+                        else if (renderPassKind) vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+                        else vkCmdBeginRendering(cb, &ri);
                         vkCmdSetViewport(cb, 0, 1, &vp);
                         vkCmdSetScissor(cb, 0, 1, &sc);
                         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -461,7 +536,12 @@ int main(void) {
                         bool queryEnds = d == draws - 1 || (d + 1) * queryCount / draws != q;
                         if (rpQueries && occl && queryEnds) vkCmdEndQuery(cb, occlPool, qbase + 1 + q);
                     }
-                    vkCmdEndRendering(cb);
+                    if (renderPassKind == 2) {
+                        VkSubpassEndInfo se = {VK_STRUCTURE_TYPE_SUBPASS_END_INFO};
+                        vkCmdEndRenderPass2(cb, &se);
+                    }
+                    else if (renderPassKind) vkCmdEndRenderPass(cb);
+                    else vkCmdEndRendering(cb);
                 }
                 else {
                     VkClearColorValue color = {.float32 = {(f & 0xff) / 255.0f, 0.2f, 0.6f, 1}};
@@ -492,7 +572,15 @@ int main(void) {
             CK(vkEndCommandBuffer(cb));
         }
 
-        recordTime += now() - tRecord;
+        double tEnd = now();
+        recordTime += tEnd - tRecord;
+        winRec += tEnd - tCommands;
+        if (f >= 2 * inflight) {
+            bool after = released && usePoolReset;  /* recorded into the pool just reset with release */
+            recSum[after] += tEnd - tCommands;
+            recN[after]++;
+            if (tEnd - tCommands > recMax[after]) recMax[after] = tEnd - tCommands;
+        }
         submitted++;
         if (useSubmit2) {
             VkCommandBufferSubmitInfo cbi[MAX_CMDBUFS];
@@ -533,6 +621,9 @@ int main(void) {
             else if (serverPid > 0) printf("FL frame %d t %.2f fps %.1f srvheap %ld\n", f + 1, t - t0, report / (t - tReport), serverHeapKb(serverPid, false));
             else printf("FL frame %d t %.2f fps %.1f\n", f + 1, t - t0, report / (t - tReport));
 #endif
+            if (timing) printf("FL window %d reset_us %.1f rec_us %.1f\n", f + 1, winReset * 1e6 / report, winRec * 1e6 / report);
+            if (serverPid > 0) printf("FL cpu %d ms %.0f\n", f + 1, procCpuMs(serverPid));
+            winReset = winRec = 0;
             fflush(stdout);
             tReport = t;
         }
@@ -540,6 +631,13 @@ int main(void) {
     CK(vkDeviceWaitIdle(dev));
     printf("FL done: %d frames in %.1f s, command pool reset + recording %.1f us per frame on the CPU\n", frames, now() - t0,
            recordTime * 1e6 / frames);
+    if (timing)
+        printf("FL timing: reset %.1f us (n %ld, max %.1f), reset+release %.1f us (n %ld, max %.1f); "
+               "recording %.1f us (n %ld, max %.1f), after a release %.1f us (n %ld, max %.1f)\n",
+               resetN[0] ? resetSum[0] * 1e6 / resetN[0] : 0, resetN[0], resetMax[0] * 1e6,
+               resetN[1] ? resetSum[1] * 1e6 / resetN[1] : 0, resetN[1], resetMax[1] * 1e6,
+               recN[0] ? recSum[0] * 1e6 / recN[0] : 0, recN[0], recMax[0] * 1e6,
+               recN[1] ? recSum[1] * 1e6 / recN[1] : 0, recN[1], recMax[1] * 1e6);
     printf("FRAMELEAK-DONE\n");
     return 0;
 }

@@ -1,31 +1,45 @@
-[mali-g2] Release command buffer memory now and then, and two small per-call leaks.
+[mali-g2] Release command buffer memory by an estimate of what the driver keeps, and two small per-call leaks.
 
-The Mali driver keeps host memory for every render pass instance (about 420 bytes per
-vkCmdBeginRendering) recorded into a command buffer that also records a query (timestamp or
-occlusion), until that command buffer is reset with RELEASE_RESOURCES or its pool is destroyed;
-resets with flags 0 never give it back. DXVK resets its command pools with flags 0 and records the
-game's D3D11 queries into the same command buffer as its rendering, so a Unity game's server grew by
-~85 MB a minute until Scudo could no longer map memory (abort in malloc under vkBeginCommandBuffer).
-The server now adds RELEASE_RESOURCES to every VORTEK_CMD_RELEASE_EVERY-th (default 32, 1 = always,
-0 = never) vkResetCommandPool / vkResetCommandBuffer of the same pool or command buffer (a 64-entry
-table per connection; a new or colliding handle releases). Implicit resets by vkBeginCommandBuffer
-are not covered. Test: tests/frame_leak_test.c, tests/frame_leak_test.sh.
+The Mali driver keeps host memory for every vkCmdBeginRendering (about 420 bytes) recorded into a
+command buffer that also writes a query (timestamp or occlusion), until that command buffer is reset
+with RELEASE_RESOURCES, its pool is reset that way, or the pool is destroyed; resets with flags 0 and
+the implicit reset of vkBeginCommandBuffer never give it back. DXVK resets its command pools with
+flags 0 and records the game's D3D11 queries into the same command buffer as its rendering, so a
+Unity game's server grew by ~85 MB a minute until Scudo could no longer map memory (abort in malloc
+under vkBeginCommandBuffer). VkRenderPass instances (vkCmdBeginRenderPass/2) keep nothing, nor does a
+command buffer whose only query command is vkCmdResetQueryPool (tests/frame_leak_test.c).
+
+By default the server now estimates, per command pool of the connection, what the driver keeps
+(mali-g2/vortek/src/cmd_memory.h): the command batches replayed into a command buffer are scanned for
+vkCmdBeginRendering and query writes, and at vkEndCommandBuffer a recording with both adds 420 bytes
+per vkCmdBeginRendering to its buffer and pool. A vkResetCommandPool / vkResetCommandBuffer adds
+RELEASE_RESOURCES when the pool's estimate reaches VORTEK_CMD_RELEASE_BYTES (default 16m) or the
+connection's reaches VORTEK_CMD_RELEASE_TOTAL_BYTES (default 2 x that) and the pool (buffer) holds
+some; vkBeginCommandBuffer of a buffer due for release in a pool that allows single resets resets it
+with RELEASE_RESOURCES first. Pools without queries never release. VORTEK_CMD_RELEASE_LOG=1 logs
+every release (otherwise the first four and every 64th). With VORTEK_CMD_RELEASE_EVERY set, every
+Nth reset of the same pool or command buffer releases as before (1 = always, 0 = never; a 64-entry
+table per connection, a new or colliding handle releases) and nothing is counted. The estimate's
+tables have fixed sizes; when one is full, the server falls back to every 32nd reset.
+Tests: tests/frame_leak_test.c, tests/frame_leak_test.sh.
 
 vkWaitSemaphores (timeline_semaphore.c) and the async pipeline creation unserialize into a
 MemoryPool without a backing buffer, and vt_free() frees the chunks but not the allocation list's
 array: 32 bytes leaked per call.
 
 diff --git a/app/src/main/cpp/vortekrenderer/include/vk_context.h b/app/src/main/cpp/vortekrenderer/include/vk_context.h
-index 50cf1c2..ecec294 100644
+index 50cf1c2..5df8c41 100644
 --- a/app/src/main/cpp/vortekrenderer/include/vk_context.h
 +++ b/app/src/main/cpp/vortekrenderer/include/vk_context.h
-@@ -53,6 +53,9 @@ typedef struct VkContext {
+@@ -53,6 +53,11 @@ typedef struct VkContext {
      pthread_mutex_t ownedLock;
      ArrayList ownedDevices;
      ArrayList ownedInstances;
 +
-+    /* [mali-g2] resets per command pool / command buffer since the last one that released its memory */
++    /* [mali-g2] resets per command pool / command buffer since the last one that released its memory
++     * (VORTEK_CMD_RELEASE_EVERY), or the estimate of the Mali's retained command memory (cmd_memory.h) */
 +    struct { uint64_t handle; uint32_t resets; } commandResets[64];
++    struct CmdMem* commandMemory;
      int untrackedLogged;
  } VkContext;
  
@@ -42,27 +56,86 @@ index 5364368..a63c582 100644
      /* [mali-g2] owned by the connection before the client can see (and destroy) them (winlator-0015) */
      for (int i = 0; i < pipelineCreateRequest->pipelineCount; i++) {
 diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
-index 9b27820..201da4b 100644
+index 9b27820..29c3a29 100644
 --- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
 +++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
-@@ -1367,6 +1367,32 @@ void vt_handle_vkDestroyCommandPool(VkContext* context) {
-     if (VkContext_untrack(context, device, OWNED_COMMAND_POOL, commandPool)) vulkanWrapper.vkDestroyCommandPool(device, commandPool, NULL);
+@@ -2,6 +2,8 @@
+ #include "vk_context.h"
+ #include "vulkan_helper.h"
+ #include "sysvshared_memory.h"
++#define CMDMEM_LOG(...) println("vortek: " __VA_ARGS__)
++#include "cmd_memory.h"
+ 
+ #define MSG_DEBUG_UNIMPLEMENTED_FUNC "%s not implemented yet\n"
+ 
+@@ -244,6 +246,7 @@ void vt_handle_vkDestroyDevice(VkContext* context) {
+ 
+     /* [mali-g2] with what the client left on it, the texture decoder and the pipeline library
+      * references; a device this connection does not own is left alone (winlator-0015) */
++    cmdmem_device_destroyed(context->commandMemory, deviceId);
+     VkContext_destroyDevice(context, device);
  }
  
-+/* [mali-g2] The Mali driver keeps host memory for every render pass instance recorded into a command
-+ * buffer that also records a query until the command buffer is reset with RELEASE_RESOURCES or its pool
-+ * is destroyed (about 420 bytes per vkCmdBeginRendering, tests/frame_leak_test.c). DXVK resets its pools
-+ * with flags 0, so a game issuing D3D11 queries grew the server by tens of MB a minute until malloc
-+ * failed. Every VORTEK_CMD_RELEASE_EVERY-th reset of a pool or command buffer (default 32, 1 = every
-+ * reset, 0 = never) releases. Implicit resets by vkBeginCommandBuffer are not covered. */
-+static bool releaseCommandMemory(VkContext* context, uint64_t handle) {
-+    static int every = -1;
-+    if (every < 0) {
-+        const char* value = getenv("VORTEK_CMD_RELEASE_EVERY");
-+        int parsed = value && *value ? atoi(value) : 32;
-+        if (value && *value) println("vortek: VORTEK_CMD_RELEASE_EVERY=%d", parsed);
-+        every = parsed < 0 ? 0 : parsed;
+@@ -1341,6 +1344,74 @@ void vt_handle_vkGetRenderAreaGranularity(VkContext* context) {
+     vt_send(context->clientRing, VK_SUCCESS, outputBuffer, bufferSize);
+ }
+ 
++/* [mali-g2] The Mali driver keeps host memory for every vkCmdBeginRendering recorded into a command
++ * buffer that also writes a query (about 420 bytes each, tests/frame_leak_test.c) until the command
++ * buffer is reset with RELEASE_RESOURCES or its pool is reset that way or destroyed. DXVK resets its
++ * pools with flags 0, so a game issuing D3D11 queries grew the server by tens of MB a minute until
++ * malloc failed. Resets add RELEASE_RESOURCES:
++ *   - by default when the estimate of what the driver keeps (cmd_memory.h) reaches
++ *     VORTEK_CMD_RELEASE_BYTES for the pool (default 16m) or VORTEK_CMD_RELEASE_TOTAL_BYTES over all
++ *     pools of the connection (default 2 x VORTEK_CMD_RELEASE_BYTES); pools without queries never
++ *     release. Implicit resets by vkBeginCommandBuffer are covered for pools that allow single resets
++ *     (an explicit releasing vkResetCommandBuffer first). VORTEK_CMD_RELEASE_LOG=1 logs every release
++ *     (otherwise the first four and every 64th).
++ *   - with VORTEK_CMD_RELEASE_EVERY set: every VORTEK_CMD_RELEASE_EVERY-th reset of the same pool or
++ *     command buffer (1 = every reset, 0 = never; a 64-entry table per connection, a new or colliding
++ *     handle releases), the policy before the estimate. */
++typedef struct CommandReleaseConfig {
++    int every;               /* -1: by the estimate */
++    uint64_t perPool, total;
++    int log;
++} CommandReleaseConfig;
++
++static CommandReleaseConfig commandRelease;
++
++static void readCommandReleaseConfig(void) {
++    const char* value = getenv("VORTEK_CMD_RELEASE_EVERY");
++    if (value && *value) {
++        int parsed = atoi(value);
++        commandRelease.every = parsed < 0 ? 0 : parsed;
++        println("vortek: VORTEK_CMD_RELEASE_EVERY=%d", commandRelease.every);
++        return;
 +    }
++    commandRelease.every = -1;
++    commandRelease.perPool = cmdmem_parse_bytes(getenv("VORTEK_CMD_RELEASE_BYTES"), CMDMEM_DEFAULT_PER_POOL);
++    commandRelease.total = cmdmem_parse_bytes(getenv("VORTEK_CMD_RELEASE_TOTAL_BYTES"), CMDMEM_DEFAULT_TOTAL(commandRelease.perPool));
++    const char* log = getenv("VORTEK_CMD_RELEASE_LOG");
++    commandRelease.log = log && *log && *log != '0';
++    println("vortek: command memory released by estimate: %.1f MiB per pool, %.1f MiB in all", commandRelease.perPool / 1048576.0,
++            commandRelease.total / 1048576.0);
++}
++
++static const CommandReleaseConfig* commandReleaseConfig(void) {
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++    pthread_once(&once, readCommandReleaseConfig);
++    return &commandRelease;
++}
++
++/* The connection's estimate, created with its first command pool; NULL with VORTEK_CMD_RELEASE_EVERY. */
++static CmdMem* commandMemoryOf(VkContext* context) {
++    const CommandReleaseConfig* config = commandReleaseConfig();
++    if (config->every >= 0) return NULL;
++    if (!context->commandMemory) context->commandMemory = cmdmem_create(config->perPool, config->total, config->log);
++    return context->commandMemory;
++}
++
++static bool releaseCommandMemory(VkContext* context, uint64_t handle) {
++    int every = commandReleaseConfig()->every;
++    if (every < 0) every = CMDMEM_FALLBACK_EVERY; /* the estimate could not be allocated */
 +    if (every <= 1) return every == 1;
 +    uint32_t slot = (uint32_t)((handle * 0x9E3779B97F4A7C15ull) >> 58);
 +    if (context->commandResets[slot].handle != handle) {
@@ -75,22 +148,123 @@ index 9b27820..201da4b 100644
 +    return true;
 +}
 +
- void vt_handle_vkResetCommandPool(VkContext* context) {
+ void vt_handle_vkCreateCommandPool(VkContext* context) {
      uint64_t deviceId;
-     uint64_t commandPoolId;
-@@ -1376,6 +1402,7 @@ void vt_handle_vkResetCommandPool(VkContext* context) {
+     VkCommandPoolCreateInfo createInfo = {0};
+@@ -1350,7 +1421,11 @@ void vt_handle_vkCreateCommandPool(VkContext* context) {
+ 
+     VkCommandPool commandPool;
+     VkResult result = vulkanWrapper.vkCreateCommandPool(device, &createInfo, NULL, &commandPool);
+-    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_COMMAND_POOL, commandPool);
++    if (result == VK_SUCCESS) {
++        VkContext_track(context, device, OWNED_COMMAND_POOL, commandPool);
++        cmdmem_pool_created(commandMemoryOf(context), deviceId, (uint64_t)commandPool,
++                            createInfo.flags & VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
++    }
+ 
+     VT_SERIALIZE_CMD(VkCommandPool, commandPool);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -1364,7 +1439,10 @@ void vt_handle_vkDestroyCommandPool(VkContext* context) {
      VkDevice device = VkObject_fromId(deviceId);
      VkCommandPool commandPool = VkObject_fromId(commandPoolId);
  
-+    if (releaseCommandMemory(context, commandPoolId)) flags |= VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT;
+-    if (VkContext_untrack(context, device, OWNED_COMMAND_POOL, commandPool)) vulkanWrapper.vkDestroyCommandPool(device, commandPool, NULL);
++    if (VkContext_untrack(context, device, OWNED_COMMAND_POOL, commandPool)) {
++        cmdmem_pool_destroyed(context->commandMemory, commandPoolId);
++        vulkanWrapper.vkDestroyCommandPool(device, commandPool, NULL);
++    }
+ }
+ 
+ void vt_handle_vkResetCommandPool(VkContext* context) {
+@@ -1376,6 +1454,8 @@ void vt_handle_vkResetCommandPool(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkCommandPool commandPool = VkObject_fromId(commandPoolId);
+ 
++    if (context->commandMemory ? cmdmem_pool_reset(context->commandMemory, commandPoolId) : releaseCommandMemory(context, commandPoolId))
++        flags |= VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT;
      vulkanWrapper.vkResetCommandPool(device, commandPool, flags);
  }
  
-@@ -1487,6 +1514,7 @@ void vt_handle_vkResetCommandBuffer(VkContext* context) {
+@@ -1388,6 +1468,9 @@ void vt_handle_vkAllocateCommandBuffers(VkContext* context) {
+ 
+     VkCommandBuffer commandBuffers[allocateInfo.commandBufferCount];
+     VkResult result = vulkanWrapper.vkAllocateCommandBuffers(device, &allocateInfo, commandBuffers);
++    if (result == VK_SUCCESS)
++        cmdmem_buffers_allocated(context->commandMemory, (uint64_t)allocateInfo.commandPool, allocateInfo.commandBufferCount,
++                                 (const uint64_t*)commandBuffers);
+ 
+     VT_SERIALIZE_CMD(vkAllocateCommandBuffers, VK_NULL_HANDLE, &allocateInfo, commandBuffers);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -1404,6 +1487,7 @@ void vt_handle_vkFreeCommandBuffers(VkContext* context) {
+ 
+     VkCommandBuffer commandBuffers[commandBufferCount];
+     vt_unserialize_vkFreeCommandBuffers(VK_NULL_HANDLE, VK_NULL_HANDLE, NULL, commandBuffers, context->inputBuffer, &context->memoryPool);
++    cmdmem_buffers_freed(context->commandMemory, commandBufferCount, (const uint64_t*)commandBuffers);
+ 
+     vulkanWrapper.vkFreeCommandBuffers(device, commandPool, commandBufferCount, commandBuffers);
+ }
+@@ -1414,6 +1498,9 @@ void vt_handle_vkBeginCommandBuffer(VkContext* context) {
+     vt_unserialize_vkBeginCommandBuffer((VkCommandBuffer)&commandBufferId, &beginInfo, context->inputBuffer, &context->memoryPool);
+     VkCommandBuffer commandBuffer = VkObject_fromId(commandBufferId);
+ 
++    /* [mali-g2] the implicit reset would keep the driver's memory (winlator-0018) */
++    if (cmdmem_begin(context->commandMemory, commandBufferId))
++        vulkanWrapper.vkResetCommandBuffer(commandBuffer, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+     vulkanWrapper.vkBeginCommandBuffer(commandBuffer, &beginInfo);
+ }
+ 
+@@ -1441,11 +1528,27 @@ static VkCommandBuffer replayCommands(VkContext* context) {
+     VkCommandBuffer commandBuffer = VkObject_fromId(commandBufferId);
+     if (commandBuffer == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+     position += VK_HANDLE_BYTE_COUNT;
++    /* [mali-g2] what the driver keeps for this recording (winlator-0018) */
++    CmdMem* commandMemory = context->commandMemory;
++    uint32_t renderings = 0;
++    bool query = false, renderPass = false;
+ 
+     while (position + HEADER_SIZE <= inputBufferSize) {
+         int requestCode = *(int*)(inputBuffer + position + 0);
+         int size = *(int*)(inputBuffer + position + 4);
+         if (size < 0 || position + HEADER_SIZE + size > inputBufferSize) break;
++        if (commandMemory) {
++            switch (requestCode) {
++            case REQUEST_CODE_VK_CMD_BEGIN_RENDERING: renderings++; break;
++            case REQUEST_CODE_VK_CMD_BEGIN_QUERY:
++            case REQUEST_CODE_VK_CMD_BEGIN_QUERY_INDEXED_EXT:
++            case REQUEST_CODE_VK_CMD_WRITE_TIMESTAMP:
++            case REQUEST_CODE_VK_CMD_WRITE_TIMESTAMP2: query = true; break;
++            case REQUEST_CODE_VK_CMD_BEGIN_RENDER_PASS:
++            case REQUEST_CODE_VK_CMD_BEGIN_RENDER_PASS2: renderPass = true; break;
++            default: break;
++            }
++        }
+ 
+         context->inputBuffer = inputBuffer + position + HEADER_SIZE;
+         HandleRequestFunc handleRequestFunc = getHandleRequestFunc(requestCode);
+@@ -1460,12 +1563,16 @@ static VkCommandBuffer replayCommands(VkContext* context) {
+         position += size + HEADER_SIZE;
+     }
+ 
++    if (renderings || query || renderPass) cmdmem_recorded(commandMemory, commandBufferId, renderings, query, renderPass);
+     return commandBuffer;
+ }
+ 
+ void vt_handle_vkEndCommandBuffer(VkContext* context) {
+     VkCommandBuffer commandBuffer = replayCommands(context);
+-    if (commandBuffer) vulkanWrapper.vkEndCommandBuffer(commandBuffer);
++    if (commandBuffer) {
++        vulkanWrapper.vkEndCommandBuffer(commandBuffer);
++        cmdmem_end(context->commandMemory, (uint64_t)commandBuffer);
++    }
+ }
+ 
+ #ifdef VORTEK_STANDALONE
+@@ -1487,6 +1594,8 @@ void vt_handle_vkResetCommandBuffer(VkContext* context) {
      vt_unserialize_vkResetCommandBuffer((VkCommandBuffer)&commandBufferId, &flags, context->inputBuffer, &context->memoryPool);
      VkCommandBuffer commandBuffer = VkObject_fromId(commandBufferId);
  
-+    if (releaseCommandMemory(context, commandBufferId)) flags |= VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT;
++    if (context->commandMemory ? cmdmem_buffer_reset(context->commandMemory, commandBufferId) : releaseCommandMemory(context, commandBufferId))
++        flags |= VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT;
      vulkanWrapper.vkResetCommandBuffer(commandBuffer, flags);
  }
  
@@ -106,3 +280,22 @@ index d20430b..0d2547c 100644
      MEMFREE(waitSemaphoresRequest->inputBuffer);
      MEMFREE(waitSemaphoresRequest);
  }
+diff --git a/app/src/main/cpp/vortekrenderer/src/vk_context.c b/app/src/main/cpp/vortekrenderer/src/vk_context.c
+index 9f4684d..e759186 100644
+--- a/app/src/main/cpp/vortekrenderer/src/vk_context.c
++++ b/app/src/main/cpp/vortekrenderer/src/vk_context.c
+@@ -1,4 +1,6 @@
+ #include "vk_context.h"
++#define CMDMEM_LOG(...) println(__VA_ARGS__)
++#include "cmd_memory.h"
+ #include "vulkan_helper.h"
+ #include "request_handler.h"
+ #include "sysvshared_memory.h"
+@@ -659,6 +661,7 @@ void destroyVkContext(JNIEnv* env, VkContext* context) {
+ 
+ static void freeVkContext(VkContext* context) {
+     context->graphicsQueueIndex = 0;
++    cmdmem_destroy(context->commandMemory); /* [mali-g2] winlator-0018 */
+ 
+     if (context->textureDecoder) {
+         TextureDecoder_destroy(context->textureDecoder);

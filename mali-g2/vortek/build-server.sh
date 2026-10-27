@@ -34,7 +34,7 @@ CFLAGS="-O2 -g0 -fPIE -fno-stack-protector -mno-outline-atomics
  -DVORTEK_STANDALONE=1 -DVK_USE_PLATFORM_ANDROID_KHR
  -Wno-unused-function -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-incompatible-function-pointer-types
  -Wno-pointer-sign -Wno-format -Wno-deprecated-non-prototype -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast
- -I$VR/include -I$WL/include"
+ -I$VR/include -I$WL/include -I$HERE/src"
 
 SRCS="$VR/src/vk_object.c $VR/src/request_handler.c $VR/src/vulkan_helper.c $VR/src/vk_context.c
  $VR/src/resource_memory.c $VR/src/texture_decoder.c $VR/src/shader_inspector.c

@@ -533,6 +533,7 @@ static void VKAPI_CALL DestroyDevice(VkDevice handle, const VkAllocationCallback
     Device* device = icd_device(handle);
     if (!device) return;
     wsi_device_destroyed(device);
+    mali_device_destroyed(device);
     pthread_mutex_lock(&registryLock);
     Device** link = &devices;
     while (*link && *link != device) link = &(*link)->next;
@@ -624,7 +625,7 @@ static PFN_vkVoidFunction ownDeviceProc(VkDevice handle, const char* name) {
     if (!strcmp(name, "vkDestroyDevice")) return (PFN_vkVoidFunction)DestroyDevice;
     if (!strcmp(name, "vkDeviceWaitIdle")) return (PFN_vkVoidFunction)DeviceWaitIdle;
     PFN_vkVoidFunction f = wsi_device_proc(name);
-    if (!f) f = mali_device_proc(name);
+    if (!f) f = mali_device_proc(handle, name);
     if (f) return f;
     Device* device = handle ? icd_device(handle) : NULL;
     if ((f = placed_device_proc(device, name))) return f;
