@@ -68,14 +68,55 @@ int main(void) {
     CHECK(__atomic_load_n(&m->retained, __ATOMIC_RELAXED) == 0);
     CHECK(cmdmem_pool(m, pool)->retained == 0);
 
-    /* no query, or a query in another buffer: nothing kept, no release */
+    /* no query since the release: nothing kept, no release */
     cmdmem_buffers_allocated(m, pool, 1, &other);
     for (int i = 0; i < 10000; i++) {
         CHECK(!cmdmem_pool_reset(m, pool));
         record(m, cb, 16, false);
-        record(m, other, 0, true);
+        record(m, other, 0, false);
+    }
+    CHECK(cmdmem_pool(m, pool)->retained == 0 && !cmdmem_pool(m, pool)->tainted);
+
+    /* one query once, in another command buffer of the pool: the pool's memory keeps the mark, so
+     * every later vkCmdBeginRendering in any of its buffers counts until the pool releases (the device
+     * leaks for each of them; DXVK's HUD frame-time timestamp in the init command buffer) */
+    record(m, other, 0, true);
+    CHECK(cmdmem_pool(m, pool)->tainted);
+    resets = 0;
+    while (!cmdmem_pool_reset(m, pool)) {
+        record(m, cb, 16, false);
+        resets++;
+        if (resets > 100000) break;
+    }
+    CHECK(resets == (int)((1 * MIB + 16 * 420 - 1) / (16 * 420)));
+    /* the release clears the mark: without a new query nothing counts again */
+    CHECK(!cmdmem_pool(m, pool)->tainted);
+    for (int i = 0; i < 10000; i++) {
+        CHECK(!cmdmem_pool_reset(m, pool));
+        record(m, cb, 16, false);
     }
     CHECK(cmdmem_pool(m, pool)->retained == 0);
+    /* a query in a buffer of another pool does not mark this one */
+    uint64_t pool3 = 0x8000, cb3 = 0x8001;
+    cmdmem_pool_created(m, 1, pool3, false);
+    cmdmem_buffers_allocated(m, pool3, 1, &cb3);
+    record(m, cb3, 0, true);
+    record(m, cb, 16, false);
+    CHECK(cmdmem_pool(m, pool3)->tainted && !cmdmem_pool(m, pool)->tainted && cmdmem_pool(m, pool)->retained == 0);
+    cmdmem_pool_destroyed(m, pool3);
+
+    /* a marked pool that the estimate never fills (no vkCmdBeginRendering) still releases at its
+     * CMDMEM_TAINT_BACKSTOP_RESETS-th reset */
+    record(m, other, 0, true);
+    int taintBackstop = 0;
+    for (int i = 1; i <= 2 * (int)CMDMEM_TAINT_BACKSTOP_RESETS + 10; i++) {
+        if (cmdmem_pool_reset(m, pool)) {
+            CHECK(i == (int)CMDMEM_TAINT_BACKSTOP_RESETS);
+            taintBackstop++;
+        }
+        record(m, cb, 0, false);
+    }
+    CHECK(taintBackstop == 1); /* the release cleared the mark */
 
     /* a VkRenderPass with a query (a fresh pool): the backstop at every 1024th reset */
     cmdmem_pool_destroyed(m, pool);
@@ -128,6 +169,7 @@ int main(void) {
     int cbReleases = 0, beginReleases = 0;
     for (int f = 0; f < 10000; f++) {
         cbReleases += cmdmem_buffer_reset(m, cb);
+        CHECK(!cmdmem_begin(m, cb)); /* after an explicit reset the memory is the pool's: no release here */
         cmdmem_recorded(m, cb, 16, true, false);
         cmdmem_end(m, cb);
         beginReleases += cmdmem_begin(m, other); /* no explicit reset */
@@ -136,6 +178,22 @@ int main(void) {
     }
     CHECK(cbReleases + beginReleases >= 2 * (int)(10000ull * 16 * 420 / MIB) - 2);
     CHECK(cmdmem_pool(m, pool)->retained <= 1 * MIB + 2 * 16 * 420);
+    /* clients that only reset single buffers: a query once in one buffer marks the pool, and the
+     * other buffer's renderings count and release with its own resets */
+    uint64_t pool4 = 0x9000, four[2] = {0x9001, 0x9002};
+    cmdmem_pool_created(m, 1, pool4, true);
+    cmdmem_buffers_allocated(m, pool4, 2, four);
+    record(m, four[1], 0, true);
+    int singleReleases = 0;
+    for (int f = 0; f < 10000; f++) {
+        singleReleases += cmdmem_buffer_reset(m, four[0]);
+        CHECK(!cmdmem_begin(m, four[0]));
+        cmdmem_recorded(m, four[0], 16, false, false);
+        cmdmem_end(m, four[0]);
+    }
+    CHECK(singleReleases == (int)(10000ull * 16 * 420 / MIB) || singleReleases == (int)(10000ull * 16 * 420 / MIB) - 1);
+    CHECK(cmdmem_pool(m, pool4)->retained <= 1 * MIB);
+    cmdmem_pool_destroyed(m, pool4);
     /* a pool without RESET_COMMAND_BUFFER_BIT never releases at begin */
     uint64_t pool2 = 0x5000, cb2 = 0x5001;
     cmdmem_pool_created(m, 1, pool2, false);

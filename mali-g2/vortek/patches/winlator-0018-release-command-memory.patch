@@ -1,26 +1,31 @@
 [mali-g2] Release command buffer memory by an estimate of what the driver keeps, and two small per-call leaks.
 
-The Mali driver keeps host memory for every vkCmdBeginRendering (about 420 bytes) recorded into a
-command buffer that also writes a query (timestamp or occlusion), until that command buffer is reset
-with RELEASE_RESOURCES, its pool is reset that way, or the pool is destroyed; resets with flags 0 and
-the implicit reset of vkBeginCommandBuffer never give it back. DXVK resets its command pools with
-flags 0 and records the game's D3D11 queries into the same command buffer as its rendering, so a
-Unity game's server grew by ~85 MB a minute until Scudo could no longer map memory (abort in malloc
-under vkBeginCommandBuffer). VkRenderPass instances (vkCmdBeginRenderPass/2) keep nothing, nor does a
-command buffer whose only query command is vkCmdResetQueryPool (tests/frame_leak_test.c).
+The Mali driver keeps host memory for every vkCmdBeginRendering (about 420 bytes) recorded into
+command pool memory that has held a query (timestamp, occlusion, ..., in any command buffer of the
+pool, even once) since the pool last released, until the pool is reset with RELEASE_RESOURCES,
+trimmed or destroyed (clients that reset single command buffers: that buffer's reset with
+RELEASE_RESOURCES); resets with flags 0 and the implicit reset of vkBeginCommandBuffer never give it
+back. DXVK resets its command pools with flags 0 and records the game's D3D11 queries into the same
+command buffers as its rendering, so a Unity game's server grew by ~85 MB a minute until Scudo could
+no longer map memory (abort in malloc under vkBeginCommandBuffer). VkRenderPass instances
+(vkCmdBeginRenderPass/2) keep nothing, nor does a pool whose only query command is
+vkCmdResetQueryPool (tests/frame_leak_test.c).
 
 By default the server now estimates, per command pool of the connection, what the driver keeps
 (mali-g2/vortek/src/cmd_memory.h): the command batches replayed into a command buffer are scanned for
-vkCmdBeginRendering and query writes, and at vkEndCommandBuffer a recording with both adds 420 bytes
-per vkCmdBeginRendering to its buffer and pool. A vkResetCommandPool / vkResetCommandBuffer adds
+vkCmdBeginRendering and query writes; a query marks the pool until it releases, and at
+vkEndCommandBuffer a recording into a marked pool adds 420 bytes per vkCmdBeginRendering to its
+buffer and pool (counting only recordings with a query of their own missed DXVK's HUD frame-time
+timestamp: 12.9 MB a minute on the device). A vkResetCommandPool / vkResetCommandBuffer adds
 RELEASE_RESOURCES when the pool's estimate reaches VORTEK_CMD_RELEASE_BYTES (default 16m) or the
 connection's reaches VORTEK_CMD_RELEASE_TOTAL_BYTES (default 2 x that) and the pool (buffer) holds
 at least 1/16 of the smaller limit (idle pools, such as DXVK's recycled command lists, would
 otherwise make the active ones release at every reset); after a vkResetCommandPool with flags 0 the
 memory is the pool's (releasing or freeing single buffers then gives nothing back), so the pool's
 buffers no longer carry shares of it; vkBeginCommandBuffer of a buffer due for release in a pool
-that allows single resets resets it with RELEASE_RESOURCES first. Pools without queries never
-release. VORTEK_CMD_RELEASE_LOG=1 logs every release (otherwise the first four and every 64th). With
+that allows single resets resets it with RELEASE_RESOURCES first, unless the client reset it
+explicitly (with flags 0 the memory is the pool's then). Pools without queries never release; marked
+pools release at least at every 4096th reset. VORTEK_CMD_RELEASE_LOG=1 logs every release (otherwise the first four and every 64th). With
 VORTEK_CMD_RELEASE_EVERY set to a number, every Nth reset of the same pool or command buffer releases
 as before (1 = always, 0 = never; a 64-entry table per connection, a new or colliding handle
 releases) and nothing is counted; any other value is ignored (logged). The estimate's
@@ -60,7 +65,7 @@ index 5364368..a63c582 100644
      /* [mali-g2] owned by the connection before the client can see (and destroy) them (winlator-0015) */
      for (int i = 0; i < pipelineCreateRequest->pipelineCount; i++) {
 diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
-index 9b27820..7a06bb0 100644
+index 9b27820..8a8ad7f 100644
 --- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
 +++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
 @@ -2,6 +2,8 @@
@@ -80,13 +85,14 @@ index 9b27820..7a06bb0 100644
      VkContext_destroyDevice(context, device);
  }
  
-@@ -1341,6 +1344,74 @@ void vt_handle_vkGetRenderAreaGranularity(VkContext* context) {
+@@ -1341,6 +1344,75 @@ void vt_handle_vkGetRenderAreaGranularity(VkContext* context) {
      vt_send(context->clientRing, VK_SUCCESS, outputBuffer, bufferSize);
  }
  
-+/* [mali-g2] The Mali driver keeps host memory for every vkCmdBeginRendering recorded into a command
-+ * buffer that also writes a query (about 420 bytes each, tests/frame_leak_test.c) until the command
-+ * buffer is reset with RELEASE_RESOURCES or its pool is reset that way or destroyed. DXVK resets its
++/* [mali-g2] The Mali driver keeps host memory for every vkCmdBeginRendering recorded into command pool
++ * memory that has held a query since the pool last released (about 420 bytes each,
++ * tests/frame_leak_test.c, cmd_memory.h) until the pool is reset with RELEASE_RESOURCES or destroyed
++ * (or, for single command buffer resets, the buffer is reset that way). DXVK resets its
 + * pools with flags 0, so a game issuing D3D11 queries grew the server by tens of MB a minute until
 + * malloc failed. Resets add RELEASE_RESOURCES:
 + *   - by default when the estimate of what the driver keeps (cmd_memory.h) reaches
@@ -155,7 +161,7 @@ index 9b27820..7a06bb0 100644
  void vt_handle_vkCreateCommandPool(VkContext* context) {
      uint64_t deviceId;
      VkCommandPoolCreateInfo createInfo = {0};
-@@ -1350,7 +1421,11 @@ void vt_handle_vkCreateCommandPool(VkContext* context) {
+@@ -1350,7 +1422,11 @@ void vt_handle_vkCreateCommandPool(VkContext* context) {
  
      VkCommandPool commandPool;
      VkResult result = vulkanWrapper.vkCreateCommandPool(device, &createInfo, NULL, &commandPool);
@@ -168,7 +174,7 @@ index 9b27820..7a06bb0 100644
  
      VT_SERIALIZE_CMD(VkCommandPool, commandPool);
      vt_send(context->clientRing, result, outputBuffer, bufferSize);
-@@ -1364,7 +1439,10 @@ void vt_handle_vkDestroyCommandPool(VkContext* context) {
+@@ -1364,7 +1440,10 @@ void vt_handle_vkDestroyCommandPool(VkContext* context) {
      VkDevice device = VkObject_fromId(deviceId);
      VkCommandPool commandPool = VkObject_fromId(commandPoolId);
  
@@ -180,7 +186,7 @@ index 9b27820..7a06bb0 100644
  }
  
  void vt_handle_vkResetCommandPool(VkContext* context) {
-@@ -1376,6 +1454,8 @@ void vt_handle_vkResetCommandPool(VkContext* context) {
+@@ -1376,6 +1455,8 @@ void vt_handle_vkResetCommandPool(VkContext* context) {
      VkDevice device = VkObject_fromId(deviceId);
      VkCommandPool commandPool = VkObject_fromId(commandPoolId);
  
@@ -189,7 +195,7 @@ index 9b27820..7a06bb0 100644
      vulkanWrapper.vkResetCommandPool(device, commandPool, flags);
  }
  
-@@ -1388,6 +1468,9 @@ void vt_handle_vkAllocateCommandBuffers(VkContext* context) {
+@@ -1388,6 +1469,9 @@ void vt_handle_vkAllocateCommandBuffers(VkContext* context) {
  
      VkCommandBuffer commandBuffers[allocateInfo.commandBufferCount];
      VkResult result = vulkanWrapper.vkAllocateCommandBuffers(device, &allocateInfo, commandBuffers);
@@ -199,7 +205,7 @@ index 9b27820..7a06bb0 100644
  
      VT_SERIALIZE_CMD(vkAllocateCommandBuffers, VK_NULL_HANDLE, &allocateInfo, commandBuffers);
      vt_send(context->clientRing, result, outputBuffer, bufferSize);
-@@ -1404,6 +1487,7 @@ void vt_handle_vkFreeCommandBuffers(VkContext* context) {
+@@ -1404,6 +1488,7 @@ void vt_handle_vkFreeCommandBuffers(VkContext* context) {
  
      VkCommandBuffer commandBuffers[commandBufferCount];
      vt_unserialize_vkFreeCommandBuffers(VK_NULL_HANDLE, VK_NULL_HANDLE, NULL, commandBuffers, context->inputBuffer, &context->memoryPool);
@@ -207,7 +213,7 @@ index 9b27820..7a06bb0 100644
  
      vulkanWrapper.vkFreeCommandBuffers(device, commandPool, commandBufferCount, commandBuffers);
  }
-@@ -1414,6 +1498,9 @@ void vt_handle_vkBeginCommandBuffer(VkContext* context) {
+@@ -1414,6 +1499,9 @@ void vt_handle_vkBeginCommandBuffer(VkContext* context) {
      vt_unserialize_vkBeginCommandBuffer((VkCommandBuffer)&commandBufferId, &beginInfo, context->inputBuffer, &context->memoryPool);
      VkCommandBuffer commandBuffer = VkObject_fromId(commandBufferId);
  
@@ -217,7 +223,7 @@ index 9b27820..7a06bb0 100644
      vulkanWrapper.vkBeginCommandBuffer(commandBuffer, &beginInfo);
  }
  
-@@ -1441,11 +1528,27 @@ static VkCommandBuffer replayCommands(VkContext* context) {
+@@ -1441,11 +1529,27 @@ static VkCommandBuffer replayCommands(VkContext* context) {
      VkCommandBuffer commandBuffer = VkObject_fromId(commandBufferId);
      if (commandBuffer == VK_NULL_HANDLE) return VK_NULL_HANDLE;
      position += VK_HANDLE_BYTE_COUNT;
@@ -245,7 +251,7 @@ index 9b27820..7a06bb0 100644
  
          context->inputBuffer = inputBuffer + position + HEADER_SIZE;
          HandleRequestFunc handleRequestFunc = getHandleRequestFunc(requestCode);
-@@ -1460,12 +1563,16 @@ static VkCommandBuffer replayCommands(VkContext* context) {
+@@ -1460,12 +1564,16 @@ static VkCommandBuffer replayCommands(VkContext* context) {
          position += size + HEADER_SIZE;
      }
  
@@ -263,7 +269,7 @@ index 9b27820..7a06bb0 100644
  }
  
  #ifdef VORTEK_STANDALONE
-@@ -1487,6 +1594,8 @@ void vt_handle_vkResetCommandBuffer(VkContext* context) {
+@@ -1487,6 +1595,8 @@ void vt_handle_vkResetCommandBuffer(VkContext* context) {
      vt_unserialize_vkResetCommandBuffer((VkCommandBuffer)&commandBufferId, &flags, context->inputBuffer, &context->memoryPool);
      VkCommandBuffer commandBuffer = VkObject_fromId(commandBufferId);
  

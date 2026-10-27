@@ -2,30 +2,38 @@
  * command pool, shared by the Vortek server (winlator-0018) and the in-process path
  * (../../hybris/src/mali_fixes.c).
  *
- * The Mali-G2 driver (r56p0) keeps host memory for every vkCmdBeginRendering recorded into a command
- * buffer that also writes a query, until that command buffer is reset with RELEASE_RESOURCES (or its
- * pool is reset with RELEASE_RESOURCES, or freed, or destroyed); resets with flags 0, and the implicit
- * reset of vkBeginCommandBuffer, never give it back. tests/frame_leak_test.c measures 415-421 bytes per
- * vkCmdBeginRendering, independent of the draws in it and of the number and kind of queries
- * (vkCmdWriteTimestamp, vkCmdWriteTimestamp2, vkCmdBeginQuery occlusion, inside or outside the
- * rendering, reset with vkCmdResetQueryPool or vkResetQueryPool). Not affected: command buffers whose
- * only query command is vkCmdResetQueryPool, rendering in a different command buffer from the query,
- * and render pass instances of a VkRenderPass (vkCmdBeginRenderPass, vkCmdBeginRenderPass2).
+ * The Mali-G2 driver (r56p0) keeps ~420 bytes of host memory for every vkCmdBeginRendering recorded
+ * into command pool memory that has held a query (vkCmdWriteTimestamp, vkCmdWriteTimestamp2,
+ * vkCmdBeginQuery of any kind, in a primary or a secondary command buffer, inside or outside the
+ * rendering) since the pool last released its memory, independent of the draws and of the number and
+ * kind of queries. Resets with flags 0 keep the pool's memory and with it the query's mark: a command
+ * buffer that wrote one timestamp once leaks for every later vkCmdBeginRendering, and the memory moves
+ * between the pool's command buffers (begin them in a different order and a buffer that never wrote a
+ * query leaks for another's: bionic probes on the device, README; tests/frame_leak_test.c
+ * FL_QUERY_EVERY=0 shows the first). Only a
+ * reset of the pool with RELEASE_RESOURCES, vkTrimCommandPool or destroying the pool give it back and
+ * clear the mark; after a vkResetCommandPool with flags 0 neither vkResetCommandBuffer with
+ * RELEASE_RESOURCES nor freeing the buffer does. Clients that only reset single command buffers get it
+ * back with vkResetCommandBuffer(RELEASE_RESOURCES); the implicit reset of vkBeginCommandBuffer never
+ * does. Not affected: vkCmdResetQueryPool and vkCmdCopyQueryPoolResults alone, and render pass
+ * instances of a VkRenderPass (vkCmdBeginRenderPass, vkCmdBeginRenderPass2).
  *
- * So per command buffer the current recording counts its vkCmdBeginRendering and whether it wrote a
- * query; at vkEndCommandBuffer, if it did both, renderings x CMDMEM_RENDERING_BYTES is added to the
- * buffer's and its pool's estimate. A reset releases when its pool's estimate reaches `perPool`
- * bytes, or when the estimate over all pools reaches `total` and this pool (command buffer) holds at
- * least min(perPool, total) / CMDMEM_TOTAL_MIN_DIV (pools that sit idle with an estimate, such as
- * DXVK's recycled command lists, would otherwise make every other pool release at every reset): a
- * releasing pool reset clears the pool, a releasing command buffer reset clears that buffer's share.
- * Every pool reset, releasing or not, bumps the pool's generation number, which makes its buffers'
- * shares stale: after a vkResetCommandPool with flags 0 the memory belongs to the pool, and neither a
- * vkResetCommandBuffer with RELEASE_RESOURCES nor freeing the buffer gives it back (bionic probe on
- * the device), only a releasing pool reset, vkTrimCommandPool or destroying the pool. A pool that
- * never had a query with rendering never releases.
- * Backstop for leaks the estimate does not know about: a pool or command buffer whose recordings
- * combined a query with a vkCmdBeginRenderPass(2) releases at its CMDMEM_BACKSTOP_RESETS-th reset.
+ * So a pool is `tainted` once any of its command buffers records a query, until the pool releases;
+ * per command buffer the current recording counts its vkCmdBeginRendering, and at vkEndCommandBuffer,
+ * if its pool is tainted (or the recording wrote a query), renderings x CMDMEM_RENDERING_BYTES is
+ * added to the buffer's and its pool's estimate. (Counting only recordings that wrote a query, as
+ * before, missed DXVK's HUD frame-time timestamp in the init command buffer: ~2 KB a frame on the
+ * device, 13 MB a minute.) A reset releases when its pool's estimate reaches `perPool` bytes, or when
+ * the estimate over all pools reaches `total` and this pool (command buffer) holds at least
+ * min(perPool, total) / CMDMEM_TOTAL_MIN_DIV (pools that sit idle with an estimate, such as DXVK's
+ * recycled command lists, would otherwise make every other pool release at every reset): a releasing
+ * pool reset clears the pool and its mark, a releasing command buffer reset clears that buffer's
+ * share. Every pool reset, releasing or not, bumps the pool's generation number, which makes its
+ * buffers' shares stale (after a flags-0 pool reset the memory belongs to the pool). A pool that never
+ * had a query never releases.
+ * Backstops for leaks the estimate does not know about: a tainted pool (command buffer) releases at
+ * least at its CMDMEM_TAINT_BACKSTOP_RESETS-th reset, and one whose recordings combined a query with a
+ * vkCmdBeginRenderPass(2) at its CMDMEM_BACKSTOP_RESETS-th.
  *
  * Tables: open addressing on the handle, fixed size, at most CMDMEM_PROBES probes. Lookups take no
  * lock (keys are read atomically, and a reused slot's key goes from CMDMEM_GONE straight to the new
@@ -50,6 +58,7 @@
 #define CMDMEM_BUFFER_BITS 13
 #define CMDMEM_PROBES 64
 #define CMDMEM_BACKSTOP_RESETS 1024u
+#define CMDMEM_TAINT_BACKSTOP_RESETS 4096u
 #define CMDMEM_FALLBACK_EVERY 32u
 #define CMDMEM_DEFAULT_PER_POOL (16ull << 20)
 #define CMDMEM_DEFAULT_TOTAL(perPool) ((perPool) > CMDMEM_MAX_BYTES / 2 ? CMDMEM_MAX_BYTES : (perPool) * 2)
@@ -62,9 +71,12 @@ typedef struct CmdMemPool {
     uint64_t key;        /* VkCommandPool; CMDMEM_EMPTY / CMDMEM_GONE */
     uint64_t device;
     uint64_t retained;   /* estimated bytes the driver keeps for the pool's command buffers */
-    uint32_t generation; /* bumped by every release of the whole pool */
+    uint32_t generation; /* bumped by every reset of the whole pool */
     uint32_t resets;     /* pool resets since the last release */
+    uint32_t taintedResets; /* pool resets since it got `tainted` (backstop) */
     bool resetBuffer;    /* created with VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT */
+    bool tainted;        /* a command buffer of the pool recorded a query since the pool last released */
+    bool poolReset;      /* vkResetCommandPool was used: releasing single command buffers gives nothing back */
     bool suspect;        /* a recording combined a query with a VkRenderPass instance (backstop) */
 } CmdMemPool;
 
@@ -77,6 +89,7 @@ typedef struct CmdMemBuffer {
     uint32_t resets;     /* resets of this buffer since it last released (backstop) */
     bool query;          /* the current recording wrote a query */
     bool renderPass;     /* the current recording began a VkRenderPass instance */
+    bool holds;          /* begun since its allocation or last vkResetCommandBuffer: a begin resets it implicitly */
     bool suspect;
 } CmdMemBuffer;
 
@@ -210,9 +223,9 @@ static inline void cmdmem_pool_created(CmdMem* m, uint64_t device, uint64_t pool
         slot->device = device;
         slot->retained = 0;
         slot->generation++; /* stale buffers of an earlier pool here stay stale */
-        slot->resets = 0;
+        slot->resets = slot->taintedResets = 0;
         slot->resetBuffer = resetBuffer;
-        slot->suspect = false;
+        slot->tainted = slot->suspect = slot->poolReset = false;
         __atomic_store_n(&slot->key, pool, __ATOMIC_RELEASE);
     }
     else cmdmem_overflow(m, "command pool");
@@ -260,7 +273,7 @@ static inline void cmdmem_buffers_allocated(CmdMem* m, uint64_t pool, uint32_t c
         slot->pool = (uint32_t)(p - m->pools);
         slot->generation = p->generation;
         slot->renderings = slot->resets = 0;
-        slot->query = slot->renderPass = slot->suspect = false;
+        slot->query = slot->renderPass = slot->suspect = slot->holds = false;
         __atomic_store_n(&slot->key, key, __ATOMIC_RELEASE);
     }
     pthread_mutex_unlock(&m->lock);
@@ -283,6 +296,7 @@ static inline void cmdmem_recorded(CmdMem* m, uint64_t buffer, uint32_t renderin
     b->renderings += renderings;
     b->query |= query;
     b->renderPass |= renderPass;
+    if (query) m->pools[b->pool].tainted = true;
 }
 
 static inline void cmdmem_log_release(CmdMem* m, const char* what, uint64_t handle, uint64_t bytes, uint32_t resets) {
@@ -303,7 +317,8 @@ static inline bool cmdmem_buffer_release_due(CmdMem* m, CmdMemBuffer* b) {
     uint64_t share = cmdmem_share(m, b);
     if (share && (p->retained >= m->perPool || (share >= m->totalMin && __atomic_load_n(&m->retained, __ATOMIC_RELAXED) >= m->total)))
         return true;
-    return b->suspect && b->resets >= CMDMEM_BACKSTOP_RESETS;
+    if (p->poolReset) return false; /* the backstops: a single buffer's release frees nothing then */
+    return (b->suspect && b->resets >= CMDMEM_BACKSTOP_RESETS) || (p->tainted && b->resets >= CMDMEM_TAINT_BACKSTOP_RESETS);
 }
 
 static inline void cmdmem_buffer_released(CmdMem* m, CmdMemBuffer* b, uint64_t handle) {
@@ -320,14 +335,18 @@ static inline void cmdmem_buffer_released(CmdMem* m, CmdMemBuffer* b, uint64_t h
 }
 
 /* vkBeginCommandBuffer: whether the caller first resets `buffer` with RELEASE_RESOURCES (the implicit
- * reset would keep the memory; only for pools that allow single resets). The current recording starts
- * empty either way. */
+ * reset would keep the memory; only for pools that allow single resets). Not after an explicit
+ * vkResetCommandBuffer (or for a new buffer): that reset already counted, and it handed the memory to
+ * the pool, so a release now would free nothing (frame_leak_test FL_CB_RESET=1 on the device). The
+ * current recording starts empty either way. */
 static inline bool cmdmem_begin(CmdMem* m, uint64_t buffer) {
     CmdMemBuffer* b = m ? cmdmem_buffer(m, buffer) : NULL;
     if (!b) return false;
     b->renderings = 0;
     b->query = b->renderPass = false;
-    if (!m->pools[b->pool].resetBuffer) return false;
+    bool implicitReset = b->holds;
+    b->holds = true;
+    if (!implicitReset || !m->pools[b->pool].resetBuffer) return false;
     b->resets++;
     if (__atomic_load_n(&m->full, __ATOMIC_RELAXED)) return b->resets % CMDMEM_FALLBACK_EVERY == 0;
     if (!cmdmem_buffer_release_due(m, b)) return false;
@@ -338,8 +357,9 @@ static inline bool cmdmem_begin(CmdMem* m, uint64_t buffer) {
 /* vkEndCommandBuffer: what the recording leaves in the driver. */
 static inline void cmdmem_end(CmdMem* m, uint64_t buffer) {
     CmdMemBuffer* b = m ? cmdmem_buffer(m, buffer) : NULL;
-    if (!b || !b->query) return;
+    if (!b) return;
     CmdMemPool* p = &m->pools[b->pool];
+    if (!b->query && !p->tainted) return;
     if (b->renderPass) b->suspect = p->suspect = true;
     if (!b->renderings) return;
     uint64_t bytes = (uint64_t)b->renderings * CMDMEM_RENDERING_BYTES;
@@ -358,20 +378,22 @@ static inline bool cmdmem_pool_reset(CmdMem* m, uint64_t pool) {
     CmdMemPool* p = cmdmem_pool(m, pool);
     if (!p) return cmdmem_fallback(m);
     p->generation++; /* the buffers' memory is the pool's now, released or not (see the top) */
+    p->poolReset = true;
     p->resets++;
+    if (p->tainted) p->taintedResets++;
     bool release;
     if (__atomic_load_n(&m->full, __ATOMIC_RELAXED)) release = p->resets >= CMDMEM_FALLBACK_EVERY;
     else
         release = (p->retained && (p->retained >= m->perPool ||
                                    (p->retained >= m->totalMin && __atomic_load_n(&m->retained, __ATOMIC_RELAXED) >= m->total))) ||
-                  (p->suspect && p->resets >= CMDMEM_BACKSTOP_RESETS);
+                  (p->suspect && p->resets >= CMDMEM_BACKSTOP_RESETS) || (p->tainted && p->taintedResets >= CMDMEM_TAINT_BACKSTOP_RESETS);
     if (!release) return false;
     uint64_t bytes = p->retained;
     uint32_t resets = p->resets;
     __atomic_sub_fetch(&m->retained, bytes, __ATOMIC_RELAXED);
     p->retained = 0;
-    p->resets = 0;
-    p->suspect = false;
+    p->resets = p->taintedResets = 0;
+    p->tainted = p->suspect = false;
     cmdmem_log_release(m, "command pool", pool, bytes, resets);
     return true;
 }
@@ -382,6 +404,7 @@ static inline bool cmdmem_buffer_reset(CmdMem* m, uint64_t buffer) {
     if (!b) return cmdmem_fallback(m);
     b->renderings = 0;
     b->query = b->renderPass = false;
+    b->holds = false;
     b->resets++;
     if (__atomic_load_n(&m->full, __ATOMIC_RELAXED)) return b->resets % CMDMEM_FALLBACK_EVERY == 0;
     if (!cmdmem_buffer_release_due(m, b)) return false;

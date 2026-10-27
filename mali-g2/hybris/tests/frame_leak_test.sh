@@ -13,6 +13,9 @@
 #                8 MiB) and release at most 1000/32/8 = 3.9 times per 1000 frames
 #   pool-total   FL_INFLIGHT=4 pools, *_BYTES=8m, *_TOTAL_BYTES=8m: the limit over all pools (peak at
 #                most 24 MiB above the first report)
+#   once-*       FL_QUERY_EVERY=0: the timestamps only in the first frame of each pool; the driver keeps
+#                the memory of every later vkCmdBeginRendering of the pool anyway (once-off grows), so
+#                the estimate must count them (the pool stays marked until it releases)
 #   noquery      no query in the frame: no release at all
 #   renderpass   VkRenderPass instances with the query (they keep nothing): the backstop releases
 #                every 1024th reset
@@ -67,6 +70,9 @@ run cmdbuf-off grow DROIDDECK_HYBRIS_CMD_RELEASE_EVERY=0 FL_STEPS=$CB FL_CB_RESE
 run cmdbuf-adaptive bounded $A FL_STEPS=$CB FL_CB_RESET=1
 run implicit-off grow DROIDDECK_HYBRIS_CMD_RELEASE_EVERY=0 FL_STEPS=$CB
 run implicit-adaptive bounded $A FL_STEPS=$CB
+run once-off grow DROIDDECK_HYBRIS_CMD_RELEASE_EVERY=0 FL_STEPS=$POOL FL_QUERY_EVERY=0
+run once-pool bounded $A FL_STEPS=$POOL FL_QUERY_EVERY=0
+run once-cmdbuf bounded $A FL_STEPS=$CB FL_CB_RESET=1 FL_QUERY_EVERY=0
 run noquery flat $A FL_STEPS=timeline,submit2,draw,poolreset
 run renderpass flat $A FL_STEPS=$POOL FL_RENDERPASS=1
 }

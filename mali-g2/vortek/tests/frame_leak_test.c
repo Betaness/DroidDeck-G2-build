@@ -28,7 +28,10 @@
  * FL_QUERY_COUNT (default 1) such queries per frame; FL_QUERY_READ=0 skips
  * vkGetQueryPoolResults; FL_QUERY_WHERE=top|bottom writes only the timestamp at the start of the
  * first command buffer or only the queries of the last one; FL_QUERY_HOSTRESET=1 resets with
- * vkResetQueryPool instead of vkCmdResetQueryPool.
+ * vkResetQueryPool instead of vkCmdResetQueryPool. FL_QUERY_EVERY=N records the queries only at every
+ * Nth use of a slot's command pool (0: only at the first; reads are then skipped): the driver keeps
+ * the memory for every vkCmdBeginRendering recorded into pool memory that ever held a query, until a
+ * release, so FL_QUERY_EVERY=0 leaks as much as 1 (the query taints the pool's memory, not the recording).
  * FL_PASSES (default 1): the draws split over that many vkCmdBeginRendering/vkCmdEndRendering
  * (occl/inrp queries need FL_QUERY_COUNT a multiple of it). FL_RENDERPASS=1/2 records them as
  * render pass instances of a VkRenderPass with vkCmdBeginRenderPass / vkCmdBeginRenderPass2 instead.
@@ -166,7 +169,7 @@ int main(void) {
     bool occl = strcmp(queryKind, "occl") == 0, ts2 = strcmp(queryKind, "ts2") == 0, inrp = strcmp(queryKind, "inrp") == 0;
     bool resetOnly = strcmp(queryKind, "reset") == 0;
     if (resetOnly) queryRead = 0, queryTop = queryBottom = false;
-    int queryCount = envInt("FL_QUERY_COUNT", 1);
+    int queryCount = envInt("FL_QUERY_COUNT", 1), queryEvery = envInt("FL_QUERY_EVERY", 1);
     if (queryCount < 1) queryCount = 1;
     if (queryCount > QUERIES_PER_SLOT - 1) queryCount = QUERIES_PER_SLOT - 1;
     if (inflight < 1) inflight = 1;
@@ -178,7 +181,7 @@ int main(void) {
 #ifdef __ANDROID__
     usePresent = false;
 #endif
-    if (useQuery) printf("FL queries: %s x%d, where %s, read %d, host reset %d\n", queryKind, queryCount, queryWhere, queryRead, queryHostReset);
+    if (useQuery) printf("FL queries: %s x%d, where %s, read %d, host reset %d, every %d\n", queryKind, queryCount, queryWhere, queryRead, queryHostReset, queryEvery);
     printf("FL steps:%s%s%s%s%s%s%s%s; %d frames, %d in flight, %d draws, %d command buffers\n",
            useTimeline ? " timeline" : "", useSubmit2 ? " submit2" : "", useDraw ? " draw" : "", useDesc ? " desc" : "",
            useQuery ? " query" : "", useCounter ? " counter" : "", usePresent ? " present" : "", usePoolReset ? " poolreset" : "",
@@ -426,13 +429,15 @@ int main(void) {
             CK(vkResetFences(dev, 1, &fences[slot]));
         }
         int qbase = slot * QUERIES_PER_SLOT;
-        if (useQuery && queryRead && f >= inflight && !(recreate > 0 && f % recreate < (unsigned)inflight)) {
+        /* FL_QUERY_EVERY: queries only at every Nth use of the slot (0: only the first) */
+        bool queryNow = useQuery && (queryEvery <= 0 ? f < inflight : (f / inflight) % queryEvery == 0);
+        if (useQuery && queryRead && queryEvery == 1 && f >= inflight && !(recreate > 0 && f % recreate < (unsigned)inflight)) {
             uint64_t ts[QUERIES_PER_SLOT];
             if (queryTop) vkGetQueryPoolResults(dev, queryPool, qbase, 1, sizeof(uint64_t), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
             if (queryBottom)
                 vkGetQueryPoolResults(dev, lastPool, qbase + 1, queryCount, queryCount * sizeof(uint64_t), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
         }
-        if (useQuery && queryHostReset) {
+        if (queryNow && queryHostReset) {
             vkResetQueryPool(dev, queryPool, qbase, QUERIES_PER_SLOT);
             vkResetQueryPool(dev, occlPool, qbase, QUERIES_PER_SLOT);
         }
@@ -478,7 +483,7 @@ int main(void) {
             if (cbReset) CK(vkResetCommandBuffer(cb, cbReset == 2 ? VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT : 0));
             CK(vkBeginCommandBuffer(cb, &bi));
             bool last = c == ncb - 1;
-            if (c == 0 && useQuery) {
+            if (c == 0 && queryNow) {
                 if (!queryHostReset) {
                     vkCmdResetQueryPool(cb, queryPool, qbase, QUERIES_PER_SLOT);
                     vkCmdResetQueryPool(cb, occlPool, qbase, QUERIES_PER_SLOT);
@@ -500,7 +505,7 @@ int main(void) {
                     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, 0, 0, {{0, 0}, extent}, 1, 0, 1, &att};
                     VkViewport vp = {0, 0, extent.width, extent.height, 0, 1};
                     VkRect2D sc = {{0, 0}, extent};
-                    bool rpQueries = useQuery && queryBottom && (occl || inrp);
+                    bool rpQueries = queryNow && queryBottom && (occl || inrp);
                     for (int d = 0; d < draws; d++) {
                       if (d % ((draws + passes - 1) / passes) == 0) {
                         if (d > 0) {
@@ -554,7 +559,7 @@ int main(void) {
                 b.oldLayout = b.newLayout;
                 b.newLayout = usePresent ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_GENERAL;
                 vkCmdPipelineBarrier2(cb, &dep);
-                if (useQuery && queryBottom && !occl && !inrp) {
+                if (queryNow && queryBottom && !occl && !inrp) {
                     for (int q = 0; q < queryCount; q++) {
                         if (ts2) vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, queryPool, qbase + 1 + q);
                         else vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, qbase + 1 + q);

@@ -15,9 +15,10 @@
  *     Without them DXVK finds no adapter ("Device does not support required feature
  *     'fillModeNonSolid'").
  *   - Command pool and command buffer resets add RELEASE_RESOURCES as the Vortek server's do
- *     (winlator-0018): the Mali keeps ~420 bytes of host heap per vkCmdBeginRendering in a command
- *     buffer that also writes a query until it is reset with RELEASE_RESOURCES, and DXVK resets its
- *     pools with flags 0, so the game process grows by tens of MB a minute
+ *     (winlator-0018): the Mali keeps ~420 bytes of host heap per vkCmdBeginRendering recorded into
+ *     command pool memory that has held a query, until the pool (or, for clients that reset single
+ *     buffers, the buffer) is reset with RELEASE_RESOURCES, and DXVK resets its pools with flags 0,
+ *     so the game process grows by tens of MB a minute
  *     (vortek/tests/frame_leak_test.c). By default a reset releases when the estimate of what the
  *     driver keeps (vortek/src/cmd_memory.h, from the vkCmdBeginRendering and query commands
  *     recorded here) reaches DROIDDECK_HYBRIS_CMD_RELEASE_BYTES (else VORTEK_CMD_RELEASE_BYTES,
