@@ -15,14 +15,21 @@
  * So per command buffer the current recording counts its vkCmdBeginRendering and whether it wrote a
  * query; at vkEndCommandBuffer, if it did both, renderings x CMDMEM_RENDERING_BYTES is added to the
  * buffer's and its pool's estimate. A reset releases when its pool's estimate reaches `perPool`
- * bytes, or when the estimate over all pools reaches `total` and this pool (command buffer) holds
- * some: a pool reset clears the pool (a generation number makes its buffers' shares stale), a command
- * buffer reset clears that buffer's share. A pool that never had a query with rendering never releases.
+ * bytes, or when the estimate over all pools reaches `total` and this pool (command buffer) holds at
+ * least min(perPool, total) / CMDMEM_TOTAL_MIN_DIV (pools that sit idle with an estimate, such as
+ * DXVK's recycled command lists, would otherwise make every other pool release at every reset): a
+ * releasing pool reset clears the pool, a releasing command buffer reset clears that buffer's share.
+ * Every pool reset, releasing or not, bumps the pool's generation number, which makes its buffers'
+ * shares stale: after a vkResetCommandPool with flags 0 the memory belongs to the pool, and neither a
+ * vkResetCommandBuffer with RELEASE_RESOURCES nor freeing the buffer gives it back (bionic probe on
+ * the device), only a releasing pool reset, vkTrimCommandPool or destroying the pool. A pool that
+ * never had a query with rendering never releases.
  * Backstop for leaks the estimate does not know about: a pool or command buffer whose recordings
  * combined a query with a vkCmdBeginRenderPass(2) releases at its CMDMEM_BACKSTOP_RESETS-th reset.
  *
  * Tables: open addressing on the handle, fixed size, at most CMDMEM_PROBES probes. Lookups take no
- * lock (keys are read atomically; an entry's fields are only touched under the external
+ * lock (keys are read atomically, and a reused slot's key goes from CMDMEM_GONE straight to the new
+ * handle, never through CMDMEM_EMPTY, which would end other keys' probes; an entry's fields are only touched under the external
  * synchronization Vulkan requires for the command pool: recording into, beginning, ending, resetting
  * and freeing its command buffers, resetting and destroying it); inserts and removals take `lock`.
  * The sum over pools is atomic. When a table is full, everything falls back to releasing every
@@ -45,7 +52,9 @@
 #define CMDMEM_BACKSTOP_RESETS 1024u
 #define CMDMEM_FALLBACK_EVERY 32u
 #define CMDMEM_DEFAULT_PER_POOL (16ull << 20)
-#define CMDMEM_DEFAULT_TOTAL(perPool) ((perPool) * 2)
+#define CMDMEM_DEFAULT_TOTAL(perPool) ((perPool) > CMDMEM_MAX_BYTES / 2 ? CMDMEM_MAX_BYTES : (perPool) * 2)
+#define CMDMEM_MAX_BYTES (1ull << 50)
+#define CMDMEM_TOTAL_MIN_DIV 16u
 #define CMDMEM_EMPTY 0ull
 #define CMDMEM_GONE UINT64_MAX
 
@@ -74,6 +83,7 @@ typedef struct CmdMemBuffer {
 typedef struct CmdMem {
     pthread_mutex_t lock; /* inserts and removals */
     uint64_t perPool, total;
+    uint64_t totalMin;    /* least estimate of a pool (buffer) that releases for the total */
     uint64_t retained;    /* atomic: sum of the pools' estimates */
     uint64_t releases, releasedBytes; /* atomic, for the log */
     uint32_t fallbackResets;          /* atomic */
@@ -83,19 +93,34 @@ typedef struct CmdMem {
     CmdMemBuffer buffers[1u << CMDMEM_BUFFER_BITS];
 } CmdMem;
 
-/* "16m", "512k", "1048576"; NULL or empty: `fallback` */
+/* "16m", "512k", "1.5M", "16MiB", "64kb", "1048576"; NULL, empty or anything else (a negative or
+ * non-finite number, an unknown suffix): `fallback`. At most CMDMEM_MAX_BYTES. */
 static inline uint64_t cmdmem_parse_bytes(const char* text, uint64_t fallback) {
     if (!text || !*text) return fallback;
     char* end = NULL;
     double value = strtod(text, &end);
-    if (end == text || value < 0) return fallback;
+    if (end == text || !(value >= 0) || value > (double)CMDMEM_MAX_BYTES) return fallback; /* also NaN */
     switch (*end) {
     case 'g': case 'G': value *= 1024.0;  /* fall through */
     case 'm': case 'M': value *= 1024.0;  /* fall through */
-    case 'k': case 'K': value *= 1024.0; break;
+    case 'k': case 'K': value *= 1024.0; end++;
+        if (*end == 'i' || *end == 'I') end++;
+        break;
     default: break;
     }
-    return (uint64_t)value;
+    if (*end == 'b' || *end == 'B') end++;
+    if (*end) return fallback;
+    return value > (double)CMDMEM_MAX_BYTES ? CMDMEM_MAX_BYTES : (uint64_t)value;
+}
+
+/* *_CMD_RELEASE_EVERY: a whole number, negative ones mean 0 (never); -1 when unset, empty or not a
+ * number ("auto", "32x"), which means: release by the estimate. */
+static inline int cmdmem_parse_every(const char* text) {
+    if (!text || !*text) return -1;
+    char* end = NULL;
+    long value = strtol(text, &end, 10);
+    if (end == text || *end) return -1;
+    return value < 0 ? 0 : value > 0x7fffffff ? 0x7fffffff : (int)value;
 }
 
 static inline CmdMem* cmdmem_create(uint64_t perPool, uint64_t total, int logEvery) {
@@ -104,6 +129,7 @@ static inline CmdMem* cmdmem_create(uint64_t perPool, uint64_t total, int logEve
     pthread_mutex_init(&m->lock, NULL);
     m->perPool = perPool;
     m->total = total;
+    m->totalMin = (perPool < total ? perPool : total) / CMDMEM_TOTAL_MIN_DIV;
     m->logEvery = logEvery;
     return m;
 }
@@ -180,12 +206,13 @@ static inline void cmdmem_pool_created(CmdMem* m, uint64_t device, uint64_t pool
     CmdMemPool* slot = NULL;
     for (int probe = 0; probe < CMDMEM_PROBES && !slot; probe++, i = (i + 1) & mask)
         if (m->pools[i].key == CMDMEM_EMPTY || m->pools[i].key == CMDMEM_GONE) slot = &m->pools[i];
-    if (slot) {
-        uint32_t generation = slot->generation + 1; /* stale buffers of an earlier pool here stay stale */
-        memset(slot, 0, sizeof(*slot));
+    if (slot) { /* every field but the key (see Tables above) */
         slot->device = device;
-        slot->generation = generation;
+        slot->retained = 0;
+        slot->generation++; /* stale buffers of an earlier pool here stay stale */
+        slot->resets = 0;
         slot->resetBuffer = resetBuffer;
+        slot->suspect = false;
         __atomic_store_n(&slot->key, pool, __ATOMIC_RELEASE);
     }
     else cmdmem_overflow(m, "command pool");
@@ -228,9 +255,12 @@ static inline void cmdmem_buffers_allocated(CmdMem* m, uint64_t pool, uint32_t c
             cmdmem_overflow(m, "command buffer");
             break;
         }
-        memset(slot, 0, sizeof(*slot));
+        /* every field but the key (see Tables above) */
+        slot->retained = 0;
         slot->pool = (uint32_t)(p - m->pools);
         slot->generation = p->generation;
+        slot->renderings = slot->resets = 0;
+        slot->query = slot->renderPass = slot->suspect = false;
         __atomic_store_n(&slot->key, key, __ATOMIC_RELEASE);
     }
     pthread_mutex_unlock(&m->lock);
@@ -271,7 +301,8 @@ static inline bool cmdmem_fallback(CmdMem* m) {
 static inline bool cmdmem_buffer_release_due(CmdMem* m, CmdMemBuffer* b) {
     CmdMemPool* p = &m->pools[b->pool];
     uint64_t share = cmdmem_share(m, b);
-    if (share && (p->retained >= m->perPool || __atomic_load_n(&m->retained, __ATOMIC_RELAXED) >= m->total)) return true;
+    if (share && (p->retained >= m->perPool || (share >= m->totalMin && __atomic_load_n(&m->retained, __ATOMIC_RELAXED) >= m->total)))
+        return true;
     return b->suspect && b->resets >= CMDMEM_BACKSTOP_RESETS;
 }
 
@@ -326,18 +357,19 @@ static inline void cmdmem_end(CmdMem* m, uint64_t buffer) {
 static inline bool cmdmem_pool_reset(CmdMem* m, uint64_t pool) {
     CmdMemPool* p = cmdmem_pool(m, pool);
     if (!p) return cmdmem_fallback(m);
+    p->generation++; /* the buffers' memory is the pool's now, released or not (see the top) */
     p->resets++;
     bool release;
     if (__atomic_load_n(&m->full, __ATOMIC_RELAXED)) release = p->resets >= CMDMEM_FALLBACK_EVERY;
     else
-        release = (p->retained && (p->retained >= m->perPool || __atomic_load_n(&m->retained, __ATOMIC_RELAXED) >= m->total)) ||
+        release = (p->retained && (p->retained >= m->perPool ||
+                                   (p->retained >= m->totalMin && __atomic_load_n(&m->retained, __ATOMIC_RELAXED) >= m->total))) ||
                   (p->suspect && p->resets >= CMDMEM_BACKSTOP_RESETS);
     if (!release) return false;
     uint64_t bytes = p->retained;
     uint32_t resets = p->resets;
     __atomic_sub_fetch(&m->retained, bytes, __ATOMIC_RELAXED);
     p->retained = 0;
-    p->generation++;
     p->resets = 0;
     p->suspect = false;
     cmdmem_log_release(m, "command pool", pool, bytes, resets);

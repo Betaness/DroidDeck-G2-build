@@ -15,11 +15,15 @@ vkCmdBeginRendering and query writes, and at vkEndCommandBuffer a recording with
 per vkCmdBeginRendering to its buffer and pool. A vkResetCommandPool / vkResetCommandBuffer adds
 RELEASE_RESOURCES when the pool's estimate reaches VORTEK_CMD_RELEASE_BYTES (default 16m) or the
 connection's reaches VORTEK_CMD_RELEASE_TOTAL_BYTES (default 2 x that) and the pool (buffer) holds
-some; vkBeginCommandBuffer of a buffer due for release in a pool that allows single resets resets it
-with RELEASE_RESOURCES first. Pools without queries never release. VORTEK_CMD_RELEASE_LOG=1 logs
-every release (otherwise the first four and every 64th). With VORTEK_CMD_RELEASE_EVERY set, every
-Nth reset of the same pool or command buffer releases as before (1 = always, 0 = never; a 64-entry
-table per connection, a new or colliding handle releases) and nothing is counted. The estimate's
+at least 1/16 of the smaller limit (idle pools, such as DXVK's recycled command lists, would
+otherwise make the active ones release at every reset); after a vkResetCommandPool with flags 0 the
+memory is the pool's (releasing or freeing single buffers then gives nothing back), so the pool's
+buffers no longer carry shares of it; vkBeginCommandBuffer of a buffer due for release in a pool
+that allows single resets resets it with RELEASE_RESOURCES first. Pools without queries never
+release. VORTEK_CMD_RELEASE_LOG=1 logs every release (otherwise the first four and every 64th). With
+VORTEK_CMD_RELEASE_EVERY set to a number, every Nth reset of the same pool or command buffer releases
+as before (1 = always, 0 = never; a 64-entry table per connection, a new or colliding handle
+releases) and nothing is counted; any other value is ignored (logged). The estimate's
 tables have fixed sizes; when one is full, the server falls back to every 32nd reset.
 Tests: tests/frame_leak_test.c, tests/frame_leak_test.sh.
 
@@ -56,7 +60,7 @@ index 5364368..a63c582 100644
      /* [mali-g2] owned by the connection before the client can see (and destroy) them (winlator-0015) */
      for (int i = 0; i < pipelineCreateRequest->pipelineCount; i++) {
 diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
-index 9b27820..29c3a29 100644
+index 9b27820..7a06bb0 100644
 --- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
 +++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
 @@ -2,6 +2,8 @@
@@ -87,13 +91,14 @@ index 9b27820..29c3a29 100644
 + * malloc failed. Resets add RELEASE_RESOURCES:
 + *   - by default when the estimate of what the driver keeps (cmd_memory.h) reaches
 + *     VORTEK_CMD_RELEASE_BYTES for the pool (default 16m) or VORTEK_CMD_RELEASE_TOTAL_BYTES over all
-+ *     pools of the connection (default 2 x VORTEK_CMD_RELEASE_BYTES); pools without queries never
-+ *     release. Implicit resets by vkBeginCommandBuffer are covered for pools that allow single resets
-+ *     (an explicit releasing vkResetCommandBuffer first). VORTEK_CMD_RELEASE_LOG=1 logs every release
-+ *     (otherwise the first four and every 64th).
-+ *   - with VORTEK_CMD_RELEASE_EVERY set: every VORTEK_CMD_RELEASE_EVERY-th reset of the same pool or
-+ *     command buffer (1 = every reset, 0 = never; a 64-entry table per connection, a new or colliding
-+ *     handle releases), the policy before the estimate. */
++ *     pools of the connection (default 2 x VORTEK_CMD_RELEASE_BYTES) and the pool (buffer) holds at
++ *     least 1/16 of the smaller limit; pools without queries never release. Implicit resets by
++ *     vkBeginCommandBuffer are covered for pools that allow single resets (an explicit releasing
++ *     vkResetCommandBuffer first). VORTEK_CMD_RELEASE_LOG=1 logs every release (otherwise the first
++ *     four and every 64th).
++ *   - with VORTEK_CMD_RELEASE_EVERY set to a number: every VORTEK_CMD_RELEASE_EVERY-th reset of the
++ *     same pool or command buffer (1 = every reset, 0 = never; a 64-entry table per connection, a new
++ *     or colliding handle releases), the policy before the estimate. Not a number: the estimate. */
 +typedef struct CommandReleaseConfig {
 +    int every;               /* -1: by the estimate */
 +    uint64_t perPool, total;
@@ -104,13 +109,12 @@ index 9b27820..29c3a29 100644
 +
 +static void readCommandReleaseConfig(void) {
 +    const char* value = getenv("VORTEK_CMD_RELEASE_EVERY");
-+    if (value && *value) {
-+        int parsed = atoi(value);
-+        commandRelease.every = parsed < 0 ? 0 : parsed;
++    commandRelease.every = cmdmem_parse_every(value);
++    if (commandRelease.every >= 0) {
 +        println("vortek: VORTEK_CMD_RELEASE_EVERY=%d", commandRelease.every);
 +        return;
 +    }
-+    commandRelease.every = -1;
++    if (value && *value) println("vortek: VORTEK_CMD_RELEASE_EVERY=%s is not a number, releasing by the estimate", value);
 +    commandRelease.perPool = cmdmem_parse_bytes(getenv("VORTEK_CMD_RELEASE_BYTES"), CMDMEM_DEFAULT_PER_POOL);
 +    commandRelease.total = cmdmem_parse_bytes(getenv("VORTEK_CMD_RELEASE_TOTAL_BYTES"), CMDMEM_DEFAULT_TOTAL(commandRelease.perPool));
 +    const char* log = getenv("VORTEK_CMD_RELEASE_LOG");

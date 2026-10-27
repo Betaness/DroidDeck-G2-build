@@ -44,6 +44,14 @@ int main(void) {
     CHECK(cmdmem_parse_bytes("1G", 0) == 1024 * MIB);
     CHECK(cmdmem_parse_bytes("4096", 0) == 4096);
     CHECK(cmdmem_parse_bytes("", 7) == 7 && cmdmem_parse_bytes(NULL, 7) == 7 && cmdmem_parse_bytes("x", 7) == 7);
+    CHECK(cmdmem_parse_bytes("16MiB", 0) == 16 * MIB && cmdmem_parse_bytes("64kb", 0) == 64 * KIB && cmdmem_parse_bytes("1.5m", 0) == 3 * MIB / 2);
+    /* typos, negative, non-finite and absurd values: the fallback, not something else */
+    CHECK(cmdmem_parse_bytes("16x", 7) == 7 && cmdmem_parse_bytes("16 m", 7) == 7 && cmdmem_parse_bytes("-1m", 7) == 7);
+    CHECK(cmdmem_parse_bytes("inf", 7) == 7 && cmdmem_parse_bytes("nan", 7) == 7 && cmdmem_parse_bytes("1e30", 7) == 7);
+    CHECK(cmdmem_parse_every(NULL) == -1 && cmdmem_parse_every("") == -1 && cmdmem_parse_every("auto") == -1);
+    CHECK(cmdmem_parse_every("32x") == -1 && cmdmem_parse_every("32") == 32 && cmdmem_parse_every("0") == 0);
+    CHECK(cmdmem_parse_every("-1") == 0 && cmdmem_parse_every("1") == 1);
+    CHECK(cmdmem_parse_bytes("1048576g", 7) == CMDMEM_MAX_BYTES && CMDMEM_DEFAULT_TOTAL(CMDMEM_MAX_BYTES) == CMDMEM_MAX_BYTES);
 
     /* per-pool limit: 1 MiB = 2497 renderings of 420 bytes */
     CmdMem* m = cmdmem_create(1 * MIB, 64 * MIB, 1);
@@ -104,7 +112,9 @@ int main(void) {
         uint64_t now = __atomic_load_n(&m->retained, __ATOMIC_RELAXED);
         if (now > peak) peak = now;
     }
-    CHECK(peak <= 1 * MIB + 16 * 420);
+    /* a pool releases for the total only with min(perPool, total) / 16 of its own, so the sum can go
+     * a few frames over */
+    CHECK(peak <= 1 * MIB + 4 * m->totalMin);
     /* each release frees about a quarter of the limit */
     printf("total limit: %d releases, peak %.0f KiB\n", released, peak / 1024.0);
     CHECK(released >= (int)(40000ull * 16 * 420 * 3 / MIB) && released <= (int)(40000ull * 16 * 420 * 6 / MIB));
@@ -143,6 +153,63 @@ int main(void) {
     cmdmem_device_destroyed(m, 1);
     CHECK(!cmdmem_pool(m, pool) && !cmdmem_pool(m, pool2) && !cmdmem_buffer(m, cb));
     CHECK(__atomic_load_n(&m->retained, __ATOMIC_RELAXED) == 0);
+    cmdmem_destroy(m);
+
+    /* a pool reset with flags 0 hands the buffers' memory to the pool: releasing single buffers (or
+     * freeing them) afterwards gives nothing back on the device, so they do not release or count */
+    m = cmdmem_create(1 * MIB, 64 * MIB, 1);
+    cmdmem_pool_created(m, 1, pool, true);
+    uint64_t three[3] = {0x6001, 0x6002, 0x6003};
+    cmdmem_buffers_allocated(m, pool, 3, three);
+    int poolReleases = 0, wasted = 0;
+    uint64_t real = 0, realPeak = 0;
+    for (int f = 0; f < 20000; f++) {
+        if (cmdmem_pool_reset(m, pool)) {
+            poolReleases++;
+            real = 0;
+        }
+        for (int c = 0; c < 3; c++) {
+            wasted += cmdmem_begin(m, three[c]);
+            if (c == 2 && f % 3 == 0) wasted += cmdmem_buffer_reset(m, three[c]), cmdmem_begin(m, three[c]);
+            cmdmem_recorded(m, three[c], c ? 1 : 40, true, false);
+            cmdmem_end(m, three[c]);
+            real += (c ? 1 : 40) * 420;
+            if (real > realPeak) realPeak = real;
+        }
+    }
+    CHECK(wasted == 0);
+    CHECK(poolReleases >= (int)(20000ull * 42 * 420 / (MIB + 42 * 420)));
+    CHECK(realPeak <= 1 * MIB + 2 * 42 * 420);
+    CHECK(cmdmem_pool(m, pool)->retained == real && __atomic_load_n(&m->retained, __ATOMIC_RELAXED) == real);
+    cmdmem_destroy(m);
+
+    /* idle pools holding most of the total (DXVK's recycled command lists) do not make the active
+     * pool release at every reset: it needs min(perPool, total) / 16 of its own */
+    m = cmdmem_create(16 * MIB, 32 * MIB, 0);
+    uint64_t idle[4] = {0x7100, 0x7200, 0x7300, 0x7400};
+    for (int p = 0; p < 4; p++) {
+        uint64_t c = idle[p] + 1;
+        cmdmem_pool_created(m, 1, idle[p], false);
+        cmdmem_buffers_allocated(m, idle[p], 1, &c);
+    }
+    for (int p = 0; p < 3; p++)
+        for (int f = 0; f < 1900; f++) { /* 7.6 MiB each, below the per-pool limit */
+            CHECK(!cmdmem_pool_reset(m, idle[p]));
+            record(m, idle[p] + 1, 10, true);
+        }
+    CHECK(__atomic_load_n(&m->retained, __ATOMIC_RELAXED) == 3 * 1900 * 4200ull);
+    /* more recordings bring the sum to just below the total, then they sit idle */
+    for (int f = 0; __atomic_load_n(&m->retained, __ATOMIC_RELAXED) + 4200 < 32 * MIB && f < 100000; f++) {
+        CHECK(!cmdmem_pool_reset(m, idle[f % 3]));
+        record(m, idle[f % 3] + 1, 10, true);
+    }
+    int active = 0;
+    for (int f = 0; f < 10000; f++) {
+        active += cmdmem_pool_reset(m, idle[3]);
+        record(m, idle[3] + 1, 1, true);
+    }
+    CHECK(active <= 10000 / (int)(1 * MIB / 420) + 1);
+    CHECK(active >= 1);
     cmdmem_destroy(m);
 
     /* a full table falls back to every 32nd reset */

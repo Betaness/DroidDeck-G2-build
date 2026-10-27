@@ -26,7 +26,7 @@
  *     first when its pool allows single resets. *_CMD_RELEASE_LOG=1 logs every release. With
  *     DROIDDECK_HYBRIS_CMD_RELEASE_EVERY (else VORTEK_CMD_RELEASE_EVERY) set, every Nth reset of the
  *     same pool or command buffer releases instead (1 = every reset, 0 = never) and nothing is
- *     counted: only the two reset calls are wrapped then.
+ *     counted: only the two reset calls are wrapped then (a value that is not a number is ignored).
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
@@ -225,12 +225,13 @@ static pthread_once_t releaseOnce = PTHREAD_ONCE_INIT;
 static void readReleaseConfig(void) {
     const char* name;
     const char* text = releaseEnv("EVERY", &name);
-    if (text) {
-        int value = atoi(text);
-        releaseEvery_ = value < 0 ? 0 : value;
+    int every = cmdmem_parse_every(text);
+    if (every >= 0) {
+        releaseEvery_ = every;
         fprintf(stderr, "hybris-icd: %s=%d\n", name, releaseEvery_);
         return;
     }
+    if (text) fprintf(stderr, "hybris-icd: %s=%s is not a number, releasing by the estimate\n", name, text);
     uint64_t perPool = cmdmem_parse_bytes(releaseEnv("BYTES", NULL), CMDMEM_DEFAULT_PER_POOL);
     uint64_t total = cmdmem_parse_bytes(releaseEnv("TOTAL_BYTES", NULL), CMDMEM_DEFAULT_TOTAL(perPool));
     const char* log = releaseEnv("LOG", NULL);
