@@ -326,9 +326,11 @@ def pack_extras(pack):
 
 
 def same_release(pack, tool):
-    """Whether the tool is the release the pack was made from (epoch and token of the version line)."""
-    made = (pack.get("version_line") or "").split()[:2]
-    return len(made) == 2 and made == version_line(tool).split()[:2]
+    """Whether the tool is the release the pack was made from: the version token (second field of the version line).
+    Not the epoch: a Valve depot build stamps its own (Proton Experimental 20261014 on Steam says 1791989191, the tag
+    the pack was built from 1791970419)."""
+    made = version_token(pack.get("version_line") or "")
+    return bool(made) and made == version_token(version_line(tool))
 
 
 def fitted(pack, tool):
