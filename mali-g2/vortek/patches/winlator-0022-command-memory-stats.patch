@@ -1,0 +1,109 @@
+[mali-g2] Command memory statistics: what the release estimate sees, per command pool.
+
+VORTEK_CMD_RELEASE_STATS=<seconds> (or VORTEK_CMD_RELEASE_LOG=2: every 30 s), with the estimate
+(VORTEK_CMD_RELEASE_MODE=adaptive): every period, one line per command pool of the connection that was
+used, released or holds an estimate (pool and command buffer resets, begins and implicit resets, ends,
+vkCmdBeginRendering seen and counted, recordings with a query, releases, the estimate, live command
+buffers), a summary with the lookups that found no pool or command buffer, and the process's heap:
+Scudo's allocated bytes and its scudo:secondary mappings (the 72 KB blocks the Mali's retained command
+memory shows up as). For finding what the estimate misses on a real client (cmd_memory.h).
+
+diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+index 6f7661a..60c868c 100644
+--- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
++++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+@@ -9,6 +9,7 @@
+ 
+ #ifdef VORTEK_STANDALONE
+ #include <sys/eventfd.h>
++#include <malloc.h>
+ #endif
+ 
+ void vt_handle_vkCreateInstance(VkContext* context) {
+@@ -1374,6 +1375,7 @@ typedef struct CommandReleaseConfig {
+     int every;               /* -1: by the estimate */
+     uint64_t perPool, total;
+     int log;
++    int statsEvery;          /* seconds between statistics reports (VORTEK_CMD_RELEASE_LOG=2: 30), 0 = none */
+ } CommandReleaseConfig;
+ 
+ static CommandReleaseConfig commandRelease;
+@@ -1396,6 +1398,11 @@ static void readCommandReleaseConfig(void) {
+     commandRelease.total = cmdmem_parse_bytes(totalBytes, CMDMEM_DEFAULT_TOTAL(commandRelease.perPool));
+     const char* log = getenv("VORTEK_CMD_RELEASE_LOG");
+     commandRelease.log = log && *log && *log != '0';
++    /* [mali-g2] statistics per pool for finding what the estimate misses (winlator-0022) */
++    const char* stats = getenv("VORTEK_CMD_RELEASE_STATS");
++    commandRelease.statsEvery = stats && *stats ? atoi(stats) : log && atoi(log) >= 2 ? 30 : 0;
++    if (commandRelease.statsEvery < 0) commandRelease.statsEvery = 0;
++    if (commandRelease.statsEvery) println("vortek: command memory statistics every %d s", commandRelease.statsEvery);
+     println("vortek: command memory released by estimate: %.1f MiB per pool, %.1f MiB in all", commandRelease.perPool / 1048576.0,
+             commandRelease.total / 1048576.0);
+ }
+@@ -1410,10 +1417,41 @@ static const CommandReleaseConfig* commandReleaseConfig(void) {
+ static CmdMem* commandMemoryOf(VkContext* context) {
+     const CommandReleaseConfig* config = commandReleaseConfig();
+     if (config->every >= 0) return NULL;
+-    if (!context->commandMemory) context->commandMemory = cmdmem_create(config->perPool, config->total, config->log);
++    if (!context->commandMemory) {
++        context->commandMemory = cmdmem_create(config->perPool, config->total, config->log);
++        if (context->commandMemory) context->commandMemory->statsEvery = config->statsEvery;
++    }
+     return context->commandMemory;
+ }
+ 
++/* [mali-g2] VORTEK_CMD_RELEASE_STATS / _LOG=2 (winlator-0022): the connection's pools, then the
++ * process's heap: Scudo's allocated bytes and its secondary (large block) mappings. */
++static void commandMemoryStats(VkContext* context) {
++    CmdMem* m = context->commandMemory;
++    if (!m || !m->statsEvery || !cmdmem_stats_due(m)) return;
++    char tag[32];
++    snprintf(tag, sizeof(tag), "conn %p", (void*)context);
++    cmdmem_log_stats(m, tag);
++    struct mallinfo mi = mallinfo();
++    unsigned secondary = 0, maps = 0;
++    unsigned long secondaryKb = 0;
++    FILE* f = fopen("/proc/self/maps", "r");
++    if (f) {
++        char line[512];
++        while (fgets(line, sizeof(line), f)) {
++            maps++;
++            unsigned long start, end;
++            if (strstr(line, "scudo:secondary") && sscanf(line, "%lx-%lx", &start, &end) == 2) {
++                secondary++;
++                secondaryKb += (end - start) >> 10;
++            }
++        }
++        fclose(f);
++    }
++    println("vortek: command memory stats %s: heap %.1f MiB allocated, %u scudo:secondary maps (%.1f MiB), %u maps", tag,
++            mi.uordblks / 1048576.0, secondary, secondaryKb / 1024.0, maps);
++}
++
+ static bool releaseCommandMemory(VkContext* context, uint64_t handle) {
+     int every = commandReleaseConfig()->every;
+     if (every < 0) every = CMDMEM_FALLBACK_EVERY; /* the estimate could not be allocated */
+@@ -1474,6 +1512,7 @@ void vt_handle_vkResetCommandPool(VkContext* context) {
+     if (context->commandMemory ? cmdmem_pool_reset(context->commandMemory, commandPoolId) : releaseCommandMemory(context, commandPoolId))
+         flags |= VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT;
+     vulkanWrapper.vkResetCommandPool(device, commandPool, flags);
++    commandMemoryStats(context);
+ }
+ 
+ void vt_handle_vkAllocateCommandBuffers(VkContext* context) {
+@@ -1589,6 +1628,7 @@ void vt_handle_vkEndCommandBuffer(VkContext* context) {
+     if (commandBuffer) {
+         vulkanWrapper.vkEndCommandBuffer(commandBuffer);
+         cmdmem_end(context->commandMemory, (uint64_t)commandBuffer);
++        commandMemoryStats(context);
+     }
+ }
+ 
+@@ -1614,6 +1654,7 @@ void vt_handle_vkResetCommandBuffer(VkContext* context) {
+     if (context->commandMemory ? cmdmem_buffer_reset(context->commandMemory, commandBufferId) : releaseCommandMemory(context, commandBufferId))
+         flags |= VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT;
+     vulkanWrapper.vkResetCommandBuffer(commandBuffer, flags);
++    commandMemoryStats(context);
+ }
+ 
+ void vt_handle_vkCmdBindPipeline(VkContext* context) {

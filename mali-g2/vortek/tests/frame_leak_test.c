@@ -42,6 +42,13 @@
  * and every FL frame line by "FL window N reset_us R rec_us C", the means over that report window. FL_RECREATE=N: every N frames, after
  * vkDeviceWaitIdle, destroys and recreates FL_RECREATE_WHAT (cmdpool, querypool or both).
  * FL_CB_RESET=1/2: vkResetCommandBuffer before each begin, with flags 0 / RELEASE_RESOURCES.
+ * FL_SECONDARY=1: DXVK 3.x on a tiler (perfHints().preferRenderPassOps, every Mali): each of the
+ * FL_PASSES render passes is recorded into a secondary command buffer of the slot's pool (begun with
+ * RENDER_PASS_CONTINUE and VkCommandBufferInheritanceRenderingInfo, holding the draws and the
+ * occl/inrp queries), ended, and then the primary records vkCmdBeginRendering with
+ * VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT, vkCmdExecuteCommands and vkCmdEndRendering.
+ * Through Vortek the server records each secondary at its End before any command of the primary (the
+ * client sends vkBeginCommandBuffer at once and the commands at vkEndCommandBuffer).
  * FL_SERVER_PID: the Vortek server's pid; every FL frame line then also carries the server's malloc
  * heap ("srvheap", kB of resident Scudo/malloc mappings from /proc/<pid>/smaps). FL_SERVER_PID=self
  * measures this process (the in-process Mali path, ../../hybris/tests/frame_leak_test.sh), counting
@@ -69,6 +76,7 @@
 #define CK(x) do { VkResult r_ = (x); if (r_ < 0) { printf("FAIL %s = %d (line %d)\n", #x, r_, __LINE__); exit(1); } } while (0)
 #define MAX_INFLIGHT 4
 #define MAX_CMDBUFS 4
+#define MAX_PASSES 64
 #define SETS_PER_FRAME 16
 #define QUERIES_PER_SLOT 64
 
@@ -159,9 +167,11 @@ int main(void) {
     if (selfHeap) serverPid = getpid();
 #endif
     int passes = envInt("FL_PASSES", 1), poolRelease = envInt("FL_POOL_RELEASE", 0), recreate = envInt("FL_RECREATE", 0);
-    int renderPassKind = envInt("FL_RENDERPASS", 0), timing = envInt("FL_TIMING", 0);
+    int renderPassKind = envInt("FL_RENDERPASS", 0), timing = envInt("FL_TIMING", 0), secondary = envInt("FL_SECONDARY", 0);
     const char* recreateWhat = getenv("FL_RECREATE_WHAT") && *getenv("FL_RECREATE_WHAT") ? getenv("FL_RECREATE_WHAT") : "both";
     if (passes < 1) passes = 1;
+    if (passes > MAX_PASSES) passes = MAX_PASSES;
+    if (secondary) renderPassKind = 0;
     int queryRead = envInt("FL_QUERY_READ", 1), queryHostReset = envInt("FL_QUERY_HOSTRESET", 0);
     const char* queryWhere = getenv("FL_QUERY_WHERE") ? getenv("FL_QUERY_WHERE") : "both";
     bool queryTop = strcmp(queryWhere, "bottom") != 0, queryBottom = strcmp(queryWhere, "top") != 0;
@@ -182,10 +192,10 @@ int main(void) {
     usePresent = false;
 #endif
     if (useQuery) printf("FL queries: %s x%d, where %s, read %d, host reset %d, every %d\n", queryKind, queryCount, queryWhere, queryRead, queryHostReset, queryEvery);
-    printf("FL steps:%s%s%s%s%s%s%s%s; %d frames, %d in flight, %d draws, %d command buffers\n",
+    printf("FL steps:%s%s%s%s%s%s%s%s; %d frames, %d in flight, %d draws, %d command buffers%s\n",
            useTimeline ? " timeline" : "", useSubmit2 ? " submit2" : "", useDraw ? " draw" : "", useDesc ? " desc" : "",
            useQuery ? " query" : "", useCounter ? " counter" : "", usePresent ? " present" : "", usePoolReset ? " poolreset" : "",
-           frames, inflight, draws, ncb);
+           frames, inflight, draws, ncb, secondary ? ", passes in secondaries" : "");
 
 #ifndef __ANDROID__
     Display* dpy = NULL;
@@ -361,6 +371,7 @@ int main(void) {
 
     VkCommandPool pools[MAX_INFLIGHT];
     VkCommandBuffer cbs_[MAX_INFLIGHT][MAX_CMDBUFS];
+    static VkCommandBuffer secs[MAX_INFLIGHT][MAX_PASSES]; /* FL_SECONDARY */
     VkFence fences[MAX_INFLIGHT];
     VkSemaphore acquireSem[MAX_INFLIGHT], presentSem[MAX_INFLIGHT];
     VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, 0,
@@ -369,6 +380,10 @@ int main(void) {
         CK(vkCreateCommandPool(dev, &cpi, 0, &pools[i]));
         VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, 0, pools[i], VK_COMMAND_BUFFER_LEVEL_PRIMARY, ncb};
         CK(vkAllocateCommandBuffers(dev, &cai, cbs_[i]));
+        if (secondary) {
+            VkCommandBufferAllocateInfo sai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, 0, pools[i], VK_COMMAND_BUFFER_LEVEL_SECONDARY, passes};
+            CK(vkAllocateCommandBuffers(dev, &sai, secs[i]));
+        }
         VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, 0, VK_FENCE_CREATE_SIGNALED_BIT};
         CK(vkCreateFence(dev, &fci, 0, &fences[i]));
         VkSemaphoreCreateInfo semi = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -396,6 +411,10 @@ int main(void) {
                     CK(vkCreateCommandPool(dev, &cpi, 0, &pools[i]));
                     VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, 0, pools[i], VK_COMMAND_BUFFER_LEVEL_PRIMARY, ncb};
                     CK(vkAllocateCommandBuffers(dev, &cai, cbs_[i]));
+                    if (secondary) {
+                        VkCommandBufferAllocateInfo sai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, 0, pools[i], VK_COMMAND_BUFFER_LEVEL_SECONDARY, passes};
+                        CK(vkAllocateCommandBuffers(dev, &sai, secs[i]));
+                    }
                 }
             }
             if (strcmp(recreateWhat, "cmdpool") != 0) {
@@ -506,6 +525,43 @@ int main(void) {
                     VkViewport vp = {0, 0, extent.width, extent.height, 0, 1};
                     VkRect2D sc = {{0, 0}, extent};
                     bool rpQueries = queryNow && queryBottom && (occl || inrp);
+                    if (secondary) {
+                        /* DXVK on a tiler: the pass in a secondary, then BeginRendering + ExecuteCommands */
+                        int per = (draws + passes - 1) / passes;
+                        if (per < 1) per = 1;
+                        for (int pass = 0; pass < passes && (pass * per < draws || pass == 0); pass++) {
+                            VkCommandBuffer sec = secs[slot][pass];
+                            VkCommandBufferInheritanceRenderingInfo iri = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO, 0, 0, 0, 1,
+                                                                            &format, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED, VK_SAMPLE_COUNT_1_BIT};
+                            VkCommandBufferInheritanceInfo inh = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, &iri};
+                            VkCommandBufferBeginInfo sbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, 0,
+                                VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT, &inh};
+                            CK(vkBeginCommandBuffer(sec, &sbi));
+                            vkCmdSetViewport(sec, 0, 1, &vp);
+                            vkCmdSetScissor(sec, 0, 1, &sc);
+                            vkCmdBindPipeline(sec, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                            for (int d = pass * per; d < draws && d < (pass + 1) * per; d++) {
+                                int q = d * queryCount / (draws ? draws : 1);
+                                bool queryHere = rpQueries && (d == 0 || q != (d - 1) * queryCount / draws);
+                                if (queryHere && occl) vkCmdBeginQuery(sec, occlPool, qbase + 1 + q, 0);
+                                if (queryHere && inrp) vkCmdWriteTimestamp(sec, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, qbase + 1 + q);
+                                if (useDesc) vkCmdBindDescriptorSets(sec, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &sets[d % SETS_PER_FRAME], 0, NULL);
+                                float x = (d % 8) / 4.0f - 1, y = (d / 8 % 8) / 4.0f - 1;
+                                Push p = {{x, y, x + 0.25f, y + 0.25f}, {(f & 0xff) / 255.0f, d / (float)draws, 0.5f, 1}};
+                                vkCmdPushConstants(sec, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(p), &p);
+                                vkCmdDraw(sec, 6, 1, 0, 0);
+                                bool queryEnds = d == draws - 1 || (d + 1) * queryCount / draws != q;
+                                if (rpQueries && occl && queryEnds) vkCmdEndQuery(sec, occlPool, qbase + 1 + q);
+                            }
+                            CK(vkEndCommandBuffer(sec));
+                            att.loadOp = pass ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+                            ri.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+                            vkCmdBeginRendering(cb, &ri);
+                            vkCmdExecuteCommands(cb, 1, &sec);
+                            vkCmdEndRendering(cb);
+                        }
+                    }
+                    else {
                     for (int d = 0; d < draws; d++) {
                       if (d % ((draws + passes - 1) / passes) == 0) {
                         if (d > 0) {
@@ -547,6 +603,7 @@ int main(void) {
                     }
                     else if (renderPassKind) vkCmdEndRenderPass(cb);
                     else vkCmdEndRendering(cb);
+                    }
                 }
                 else {
                     VkClearColorValue color = {.float32 = {(f & 0xff) / 255.0f, 0.2f, 0.6f, 1}};
