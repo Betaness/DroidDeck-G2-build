@@ -4,12 +4,14 @@ VORTEK_CMD_RELEASE_STATS=<seconds> (or VORTEK_CMD_RELEASE_LOG=2: every 30 s), wi
 (VORTEK_CMD_RELEASE_MODE=adaptive): every period, one line per command pool of the connection that was
 used, released or holds an estimate (pool and command buffer resets, begins and implicit resets, ends,
 vkCmdBeginRendering seen and counted, recordings with a query, releases, the estimate, live command
-buffers), a summary with the lookups that found no pool or command buffer, and the process's heap:
+buffers, where the query commands are: timestamps and begun queries in primaries outside or inside
+rendering and in secondaries, timestamps outside rendering before, between or after the other commands),
+a summary with the lookups that found no pool or command buffer, and the process's heap:
 Scudo's allocated bytes and its scudo:secondary mappings (the 72 KB blocks the Mali's retained command
 memory shows up as). For finding what the estimate misses on a real client (cmd_memory.h).
 
 diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
-index 6f7661a..60c868c 100644
+index 6f7661a..c34698e 100644
 --- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
 +++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
 @@ -9,6 +9,7 @@
@@ -91,7 +93,58 @@ index 6f7661a..60c868c 100644
  }
  
  void vt_handle_vkAllocateCommandBuffers(VkContext* context) {
-@@ -1589,6 +1628,7 @@ void vt_handle_vkEndCommandBuffer(VkContext* context) {
+@@ -1485,9 +1524,12 @@ void vt_handle_vkAllocateCommandBuffers(VkContext* context) {
+ 
+     VkCommandBuffer commandBuffers[allocateInfo.commandBufferCount];
+     VkResult result = vulkanWrapper.vkAllocateCommandBuffers(device, &allocateInfo, commandBuffers);
+-    if (result == VK_SUCCESS)
++    if (result == VK_SUCCESS) {
+         cmdmem_buffers_allocated(context->commandMemory, (uint64_t)allocateInfo.commandPool, allocateInfo.commandBufferCount,
+                                  (const uint64_t*)commandBuffers);
++        if (allocateInfo.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) /* statistics (winlator-0022) */
++            cmdmem_set_secondary(context->commandMemory, allocateInfo.commandBufferCount, (const uint64_t*)commandBuffers);
++    }
+ 
+     VT_SERIALIZE_CMD(vkAllocateCommandBuffers, VK_NULL_HANDLE, &allocateInfo, commandBuffers);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -1549,6 +1591,8 @@ static VkCommandBuffer replayCommands(VkContext* context) {
+     CmdMem* commandMemory = context->commandMemory;
+     uint32_t renderings = 0;
+     bool query = false, renderPass = false;
++    /* [mali-g2] statistics: where the query commands are (winlator-0022) */
++    CmdMemBuffer* statsBuffer = commandMemory && commandMemory->statsEvery ? cmdmem_buffer(commandMemory, commandBufferId) : NULL;
+ 
+     while (position + HEADER_SIZE <= inputBufferSize) {
+         int requestCode = *(int*)(inputBuffer + position + 0);
+@@ -1565,6 +1609,27 @@ static VkCommandBuffer replayCommands(VkContext* context) {
+             case REQUEST_CODE_VK_CMD_BEGIN_RENDER_PASS2: renderPass = true; break;
+             default: break;
+             }
++            if (statsBuffer) {
++                int kind;
++                switch (requestCode) {
++                case REQUEST_CODE_VK_CMD_WRITE_TIMESTAMP:
++                case REQUEST_CODE_VK_CMD_WRITE_TIMESTAMP2: kind = CMDMEM_CMD_TIMESTAMP; break;
++                case REQUEST_CODE_VK_CMD_BEGIN_QUERY:
++                case REQUEST_CODE_VK_CMD_BEGIN_QUERY_INDEXED_EXT: kind = CMDMEM_CMD_BEGIN_QUERY; break;
++                case REQUEST_CODE_VK_CMD_END_QUERY:
++                case REQUEST_CODE_VK_CMD_END_QUERY_INDEXED_EXT:
++                case REQUEST_CODE_VK_CMD_RESET_QUERY_POOL:
++                case REQUEST_CODE_VK_CMD_COPY_QUERY_POOL_RESULTS: kind = CMDMEM_CMD_QUERY_OTHER; break;
++                case REQUEST_CODE_VK_CMD_BEGIN_RENDERING:
++                case REQUEST_CODE_VK_CMD_BEGIN_RENDER_PASS:
++                case REQUEST_CODE_VK_CMD_BEGIN_RENDER_PASS2: kind = CMDMEM_CMD_RENDER_BEGIN; break;
++                case REQUEST_CODE_VK_CMD_END_RENDERING:
++                case REQUEST_CODE_VK_CMD_END_RENDER_PASS:
++                case REQUEST_CODE_VK_CMD_END_RENDER_PASS2: kind = CMDMEM_CMD_RENDER_END; break;
++                default: kind = CMDMEM_CMD_OTHER; break;
++                }
++                cmdmem_classify(commandMemory, statsBuffer, kind);
++            }
+         }
+ 
+         context->inputBuffer = inputBuffer + position + HEADER_SIZE;
+@@ -1589,6 +1654,7 @@ void vt_handle_vkEndCommandBuffer(VkContext* context) {
      if (commandBuffer) {
          vulkanWrapper.vkEndCommandBuffer(commandBuffer);
          cmdmem_end(context->commandMemory, (uint64_t)commandBuffer);
@@ -99,7 +152,7 @@ index 6f7661a..60c868c 100644
      }
  }
  
-@@ -1614,6 +1654,7 @@ void vt_handle_vkResetCommandBuffer(VkContext* context) {
+@@ -1614,6 +1680,7 @@ void vt_handle_vkResetCommandBuffer(VkContext* context) {
      if (context->commandMemory ? cmdmem_buffer_reset(context->commandMemory, commandBufferId) : releaseCommandMemory(context, commandBufferId))
          flags |= VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT;
      vulkanWrapper.vkResetCommandBuffer(commandBuffer, flags);
