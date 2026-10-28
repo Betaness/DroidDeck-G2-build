@@ -45,7 +45,7 @@ rc=$?
 
 kill $spid 2>/dev/null; wait $spid 2>/dev/null
 kill $mpid $xpid 2>/dev/null; wait $mpid $xpid 2>/dev/null
-grep -E "^FL (frame|done)|FAIL" $tmp/client.log
+grep -E "^FL (frame|done|query)|FAIL" $tmp/client.log
 grep -E "VORTEK_CMD_RELEASE_|released by estimate|command memory: (rel|.*full)|abort|Scudo" $tmp/server.log | head -6
 verdict="server $(awk -v expect="${FL_EXPECT:-bounded}" -v max="${FL_MAX_GROWTH:-64}" -v maxpeak="${FL_MAX_PEAK_KB:-}" \
   -v maxrel="${FL_MAX_RELEASES:-}" -f "$(dirname "$0")/frame_leak_report.awk" $tmp/client.log $tmp/server.log)"
@@ -54,5 +54,6 @@ echo "$verdict"
 rm -f $dir/$id-mock $dir/$id-srv
 rm -rf $tmp
 case $verdict in *": PASS"*) ;; *) rc=1 ;; esac
+grep -qE "^FL query check: [0-9]+ frames ok, [1-9]" $tmp/client.log && rc=1
 if [ $rc -ne 0 ]; then echo FRAMELEAK-FAIL; exit 1; fi
 echo FRAMELEAK-PASS

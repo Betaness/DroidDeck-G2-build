@@ -12,7 +12,8 @@
  * query leaks for another's: bionic probes on the device, README; tests/frame_leak_test.c
  * FL_QUERY_EVERY=0 shows the first). Only a
  * reset of the pool with RELEASE_RESOURCES, vkTrimCommandPool or destroying the pool give it back and
- * clear the mark; after a vkResetCommandPool with flags 0 neither vkResetCommandBuffer with
+ * clear the mark (back to a cache of the device that later recordings reuse, not to malloc: a release
+ * stops the growth, it does not shrink the heap; query_split.h keeps pools from being marked at all); after a vkResetCommandPool with flags 0 neither vkResetCommandBuffer with
  * RELEASE_RESOURCES nor freeing the buffer does. Clients that only reset single command buffers get it
  * back with vkResetCommandBuffer(RELEASE_RESOURCES); the implicit reset of vkBeginCommandBuffer never
  * does. Not affected: vkCmdResetQueryPool and vkCmdCopyQueryPoolResults alone, and render pass
