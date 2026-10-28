@@ -1,0 +1,433 @@
+[mali-g2] Query commands out of the application's command pools (VORTEK_QUERY_SPLIT=1, prototype, off by default).
+
+The Mali-G2 keeps ~420 bytes for every vkCmdBeginRendering recorded into command pool memory that has
+held a query, and keeps it in a cache of the device even after the pool releases, trims or is
+destroyed (reused, never given back to malloc): releasing the pool's memory only bounds the peak. With
+VORTEK_QUERY_SPLIT=1 the server records vkCmdWriteTimestamp(2), vkCmdResetQueryPool and
+vkCmdCopyQueryPoolResults that come before the first or after the last other command of a primary
+command buffer into a command buffer of a pool of its own (one per application pool, created on first
+use, reset with it, destroyed with it or its device) and submits it right before or after the
+application's in vkQueueSubmit / vkQueueSubmit2. Submission order is execution order across the
+command buffers of a batch, so the queries mean what they did, and the application's pool never holds
+a query. Queries between other commands, inside rendering, begun queries and queries in secondary
+command buffers stay (cmd_memory.h's estimate covers them). Device group submits are not expanded
+(logged once). Duckov through DXVK 3.1 has only leading timestamps and command buffers of nothing but
+timestamps (winlator-0022's statistics on the device). src/query_split.h; tests: frame_leak_test.sh
+with VORTEK_QUERY_SPLIT=1 (no release needed: VORTEK_CMD_RELEASE_EVERY=0 stays flat),
+FL_QUERY_CHECK=1 (timestamp order), FL_TS_PATTERN (Duckov's pattern).
+
+diff --git a/app/src/main/cpp/vortekrenderer/include/vk_context.h b/app/src/main/cpp/vortekrenderer/include/vk_context.h
+index d13ad28..9605d71 100644
+--- a/app/src/main/cpp/vortekrenderer/include/vk_context.h
++++ b/app/src/main/cpp/vortekrenderer/include/vk_context.h
+@@ -59,6 +59,7 @@ typedef struct VkContext {
+      * (VORTEK_CMD_RELEASE_EVERY), or the estimate of the Mali's retained command memory (cmd_memory.h) */
+     struct { uint64_t handle; uint32_t resets; } commandResets[64];
+     struct CmdMem* commandMemory;
++    struct QuerySplit* querySplit; /* [mali-g2] VORTEK_QUERY_SPLIT (winlator-0023) */
+     int untrackedLogged;
+ } VkContext;
+ 
+diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+index c34698e..dc0a5c0 100644
+--- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
++++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+@@ -4,6 +4,8 @@
+ #include "sysvshared_memory.h"
+ #define CMDMEM_LOG(...) println("vortek: " __VA_ARGS__)
+ #include "cmd_memory.h"
++#include "query_split.h"
++static const VkCommandBuffer* querySplitExpand(VkContext* context, uint32_t count, const VkCommandBuffer* buffers, uint32_t* outCount);
+ 
+ #define MSG_DEBUG_UNIMPLEMENTED_FUNC "%s not implemented yet\n"
+ 
+@@ -252,6 +254,16 @@ void vt_handle_vkDestroyDevice(VkContext* context) {
+     /* [mali-g2] with what the client left on it, the texture decoder and the pipeline library
+      * references; a device this connection does not own is left alone (winlator-0015) */
+     cmdmem_device_destroyed(context->commandMemory, deviceId);
++    if (context->querySplit) /* winlator-0023: the side pools go with the device's tracked objects */
++        for (uint32_t i = 0; i < (1u << QS_POOL_BITS); i++) {
++            QsPool* p = &context->querySplit->pools[i];
++            if (p->key != QS_EMPTY && p->key != QS_GONE && p->device == deviceId) {
++                p->side = 0; /* VkContext_destroyDevice destroys it */
++                for (uint32_t j = 0; j < (1u << QS_BUFFER_BITS); j++)
++                    if (context->querySplit->buffers[j].key != QS_EMPTY && context->querySplit->buffers[j].pool == i) context->querySplit->buffers[j].key = QS_GONE;
++                p->key = QS_GONE;
++            }
++        }
+     VkContext_destroyDevice(context, device);
+ }
+ 
+@@ -335,6 +347,17 @@ void vt_handle_vkQueueSubmit(VkContext* context) {
+ 
+     VkSubmitInfo submits[submitCount ? submitCount : 1]; /* [mali-g2] no zero-length VLA for fence-only submits */
+     vt_unserialize_vkQueueSubmit(VK_NULL_HANDLE, NULL, submits, VK_NULL_HANDLE, context->inputBuffer, &context->memoryPool);
++    for (uint32_t i = 0; context->querySplit && i < submitCount; i++) { /* winlator-0023: the side buffers around theirs */
++        bool deviceGroup = false;
++        for (const VkBaseInStructure* next = submits[i].pNext; next; next = next->pNext)
++            deviceGroup |= next->sType == VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO;
++        if (deviceGroup) {
++            static bool warned = false;
++            if (!warned && (warned = true)) println("vortek: query split: a device group submit, its command buffers' side buffers are not submitted");
++            continue;
++        }
++        submits[i].pCommandBuffers = querySplitExpand(context, submits[i].commandBufferCount, submits[i].pCommandBuffers, &submits[i].commandBufferCount);
++    }
+ 
+     bool clientWaiting = RingBuffer_hasStatus(context->clientRing, RING_STATUS_WAIT);
+     if (context->textureDecoder) {
+@@ -1467,6 +1490,138 @@ static bool releaseCommandMemory(VkContext* context, uint64_t handle) {
+     return true;
+ }
+ 
++/* [mali-g2] VORTEK_QUERY_SPLIT=1 (winlator-0023, src/query_split.h): timestamps, query resets and query
++ * copies that come before the first or after the last other command of a primary command buffer are
++ * recorded into a command buffer of the server's own pool and submitted right before or after it, so
++ * that the application's pool never holds a query (the Mali then keeps nothing for its renderings).
++ * VORTEK_QUERY_SPLIT_LOG=1 logs the side pools and every 4096th split recording. */
++static int querySplitEnabled(void) {
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char* value = getenv("VORTEK_QUERY_SPLIT");
++        enabled = value && *value == '1';
++        if (enabled) println("vortek: query commands at the start and end of command buffers go to command buffers of their own (VORTEK_QUERY_SPLIT=1)");
++    }
++    return enabled;
++}
++
++static QuerySplit* querySplitOf(VkContext* context) {
++    if (!querySplitEnabled()) return NULL;
++    if (!context->querySplit) {
++        context->querySplit = calloc(1, sizeof(QuerySplit));
++        if (context->querySplit) {
++            const char* log = getenv("VORTEK_QUERY_SPLIT_LOG");
++            context->querySplit->log = log && *log == '1';
++        }
++    }
++    return context->querySplit;
++}
++
++static void querySplitDropPool(VkContext* context, QuerySplit* q, QsPool* p) {
++    uint32_t index = (uint32_t)(p - q->pools);
++    for (uint32_t i = 0; i < (1u << QS_BUFFER_BITS); i++)
++        if (q->buffers[i].key != QS_EMPTY && q->buffers[i].key != QS_GONE && q->buffers[i].pool == index) q->buffers[i].key = QS_GONE;
++    VkDevice device = VkObject_fromId(p->device);
++    VkCommandPool side = (VkCommandPool)p->side;
++    if (side && VkContext_untrack(context, device, OWNED_COMMAND_POOL, side)) vulkanWrapper.vkDestroyCommandPool(device, side, NULL);
++    p->key = QS_GONE;
++    p->side = 0;
++}
++
++/* The side command buffer `which` of `b`, begun for its current recording; NULL if it cannot be had. */
++static VkCommandBuffer querySplitSide(VkContext* context, QuerySplit* q, QsBuffer* b, int which) {
++    QsPool* p = &q->pools[b->pool];
++    VkDevice device = VkObject_fromId(p->device);
++    if (p->failed) return VK_NULL_HANDLE;
++    if (!p->side) {
++        VkCommandPoolCreateInfo info = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, p->family};
++        VkCommandPool side;
++        if (vulkanWrapper.vkCreateCommandPool(device, &info, NULL, &side) != VK_SUCCESS) {
++            p->failed = true;
++            println("vortek: query split: no side command pool for 0x%llx, its queries stay", (unsigned long long)p->key);
++            return VK_NULL_HANDLE;
++        }
++        VkContext_track(context, device, OWNED_COMMAND_POOL, side); /* destroyed with the device if the client goes */
++        p->side = (uint64_t)side;
++        if (q->log) println("vortek: query split: side command pool 0x%llx for 0x%llx", (unsigned long long)p->side, (unsigned long long)p->key);
++    }
++    if (!b->side[which]) {
++        VkCommandBufferAllocateInfo info = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, (VkCommandPool)p->side, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
++        VkCommandBuffer side;
++        if (vulkanWrapper.vkAllocateCommandBuffers(device, &info, &side) != VK_SUCCESS) return VK_NULL_HANDLE;
++        b->side[which] = (uint64_t)side;
++        b->sideOpen[which] = false;
++        b->sideRecording[which] = b->recording - 1;
++    }
++    VkCommandBuffer side = (VkCommandBuffer)b->side[which];
++    if (!qs_side_live(q, b, which) || !b->sideOpen[which]) {
++        if (qs_side_live(q, b, which)) return VK_NULL_HANDLE; /* ended already (a chunk after End cannot happen) */
++        VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
++                                          b->usage & (VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT)};
++        if (vulkanWrapper.vkBeginCommandBuffer(side, &begin) != VK_SUCCESS) return VK_NULL_HANDLE; /* implicit reset */
++        b->sideRecording[which] = b->recording;
++        b->sideGeneration[which] = p->generation;
++        b->sideOpen[which] = true;
++        q->recordings[which]++;
++        if (q->log && q->recordings[which] % 4096 == 1)
++            println("vortek: query split: %llu %s recordings, %llu commands moved, %llu submits expanded", (unsigned long long)q->recordings[which],
++                    which == QS_LEAD ? "leading" : "trailing", (unsigned long long)q->moved[which], (unsigned long long)q->submitsExpanded);
++    }
++    return side;
++}
++
++/* Replays one movable query command (header at `command`) into a side command buffer: the serialized
++ * arguments start with a presence byte and the command buffer's id, which is swapped for the side one. */
++static bool querySplitRecord(VkContext* context, QuerySplit* q, QsBuffer* b, int which, int requestCode, char* command, int size) {
++    uint64_t id = 0;
++    if (size < 1 + VK_HANDLE_BYTE_COUNT || !command[HEADER_SIZE]) return false;
++    memcpy(&id, command + HEADER_SIZE + 1, sizeof(id));
++    if (id != b->key) return false;
++    VkCommandBuffer side = querySplitSide(context, q, b, which);
++    if (!side) return false;
++    char* args = vt_alloc(&context->memoryPool, size);
++    memcpy(args, command + HEADER_SIZE, size);
++    id = (uint64_t)side;
++    memcpy(args + 1, &id, sizeof(id));
++    HandleRequestFunc handleRequestFunc = getHandleRequestFunc(requestCode);
++    char* saved = context->inputBuffer;
++    context->inputBuffer = args;
++    if (handleRequestFunc) handleRequestFunc(context);
++    context->inputBuffer = saved;
++    q->moved[which]++;
++    return true;
++}
++
++static bool querySplitMovable(int requestCode) {
++    return qs_movable(requestCode, REQUEST_CODE_VK_CMD_WRITE_TIMESTAMP, REQUEST_CODE_VK_CMD_WRITE_TIMESTAMP2, REQUEST_CODE_VK_CMD_RESET_QUERY_POOL,
++                      REQUEST_CODE_VK_CMD_COPY_QUERY_POOL_RESULTS);
++}
++
++/* The command buffers to submit for `count` application ones: each with its live side buffers around
++ * it. Returns `buffers` itself when nothing is added, else an array in the request's memory pool. */
++static const VkCommandBuffer* querySplitExpand(VkContext* context, uint32_t count, const VkCommandBuffer* buffers, uint32_t* outCount) {
++    QuerySplit* q = context->querySplit;
++    *outCount = count;
++    if (!q || !count) return buffers;
++    uint32_t extra = 0;
++    for (uint32_t i = 0; i < count; i++) {
++        QsBuffer* b = qs_buffer(q, (uint64_t)buffers[i]);
++        if (b) extra += qs_side_live(q, b, QS_LEAD) + qs_side_live(q, b, QS_TRAIL);
++    }
++    if (!extra) return buffers;
++    VkCommandBuffer* out = vt_alloc(&context->memoryPool, (count + extra) * sizeof(VkCommandBuffer));
++    uint32_t n = 0;
++    for (uint32_t i = 0; i < count; i++) {
++        QsBuffer* b = qs_buffer(q, (uint64_t)buffers[i]);
++        if (b && qs_side_live(q, b, QS_LEAD)) out[n++] = (VkCommandBuffer)b->side[QS_LEAD];
++        out[n++] = buffers[i];
++        if (b && qs_side_live(q, b, QS_TRAIL)) out[n++] = (VkCommandBuffer)b->side[QS_TRAIL];
++    }
++    q->submitsExpanded++;
++    *outCount = n;
++    return out;
++}
++
+ void vt_handle_vkCreateCommandPool(VkContext* context) {
+     uint64_t deviceId;
+     VkCommandPoolCreateInfo createInfo = {0};
+@@ -1480,6 +1635,16 @@ void vt_handle_vkCreateCommandPool(VkContext* context) {
+         VkContext_track(context, device, OWNED_COMMAND_POOL, commandPool);
+         cmdmem_pool_created(commandMemoryOf(context), deviceId, (uint64_t)commandPool,
+                             createInfo.flags & VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
++        QuerySplit* q = querySplitOf(context); /* winlator-0023 */
++        if (q) {
++            QsPool* stale = qs_pool(q, (uint64_t)commandPool);
++            if (stale) querySplitDropPool(context, q, stale);
++            QsPool* p = qs_pool_insert(q, (uint64_t)commandPool);
++            if (p) {
++                p->device = deviceId;
++                p->family = createInfo.queueFamilyIndex;
++            }
++        }
+     }
+ 
+     VT_SERIALIZE_CMD(VkCommandPool, commandPool);
+@@ -1496,6 +1661,8 @@ void vt_handle_vkDestroyCommandPool(VkContext* context) {
+ 
+     if (VkContext_untrack(context, device, OWNED_COMMAND_POOL, commandPool)) {
+         cmdmem_pool_destroyed(context->commandMemory, commandPoolId);
++        QsPool* split = qs_pool(context->querySplit, commandPoolId); /* winlator-0023 */
++        if (split) querySplitDropPool(context, context->querySplit, split);
+         vulkanWrapper.vkDestroyCommandPool(device, commandPool, NULL);
+     }
+ }
+@@ -1512,6 +1679,11 @@ void vt_handle_vkResetCommandPool(VkContext* context) {
+     if (context->commandMemory ? cmdmem_pool_reset(context->commandMemory, commandPoolId) : releaseCommandMemory(context, commandPoolId))
+         flags |= VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT;
+     vulkanWrapper.vkResetCommandPool(device, commandPool, flags);
++    QsPool* split = qs_pool(context->querySplit, commandPoolId); /* winlator-0023: its side buffers are reset with it */
++    if (split) {
++        split->generation++;
++        if (split->side) vulkanWrapper.vkResetCommandPool(device, (VkCommandPool)split->side, flags & VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT);
++    }
+     commandMemoryStats(context);
+ }
+ 
+@@ -1529,6 +1701,18 @@ void vt_handle_vkAllocateCommandBuffers(VkContext* context) {
+                                  (const uint64_t*)commandBuffers);
+         if (allocateInfo.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) /* statistics (winlator-0022) */
+             cmdmem_set_secondary(context->commandMemory, allocateInfo.commandBufferCount, (const uint64_t*)commandBuffers);
++        QsPool* split = qs_pool(context->querySplit, (uint64_t)allocateInfo.commandPool); /* winlator-0023 */
++        for (uint32_t i = 0; split && i < allocateInfo.commandBufferCount; i++) {
++            QsBuffer* stale = qs_buffer(context->querySplit, (uint64_t)commandBuffers[i]);
++            if (stale) stale->key = QS_GONE; /* a handle the driver reused: its side buffers went with their pool's reset or destroy */
++            QsBuffer* b = qs_buffer_insert(context->querySplit, (uint64_t)commandBuffers[i]);
++            if (!b) {
++                if (!context->querySplit->fullLogged++) println("vortek: query split: command buffer table full, new command buffers keep their queries");
++                break;
++            }
++            b->pool = (uint32_t)(split - context->querySplit->pools);
++            b->primary = allocateInfo.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++        }
+     }
+ 
+     VT_SERIALIZE_CMD(vkAllocateCommandBuffers, VK_NULL_HANDLE, &allocateInfo, commandBuffers);
+@@ -1547,6 +1731,14 @@ void vt_handle_vkFreeCommandBuffers(VkContext* context) {
+     VkCommandBuffer commandBuffers[commandBufferCount];
+     vt_unserialize_vkFreeCommandBuffers(VK_NULL_HANDLE, VK_NULL_HANDLE, NULL, commandBuffers, context->inputBuffer, &context->memoryPool);
+     cmdmem_buffers_freed(context->commandMemory, commandBufferCount, (const uint64_t*)commandBuffers);
++    for (uint32_t i = 0; context->querySplit && i < commandBufferCount; i++) { /* winlator-0023 */
++        QsBuffer* b = qs_buffer(context->querySplit, (uint64_t)commandBuffers[i]);
++        if (!b) continue;
++        QsPool* p = &context->querySplit->pools[b->pool];
++        for (int which = 0; which < 2; which++)
++            if (b->side[which] && p->side) vulkanWrapper.vkFreeCommandBuffers(device, (VkCommandPool)p->side, 1, (VkCommandBuffer*)&b->side[which]);
++        b->key = QS_GONE;
++    }
+ 
+     vulkanWrapper.vkFreeCommandBuffers(device, commandPool, commandBufferCount, commandBuffers);
+ }
+@@ -1561,6 +1753,17 @@ void vt_handle_vkBeginCommandBuffer(VkContext* context) {
+     if (cmdmem_begin(context->commandMemory, commandBufferId))
+         vulkanWrapper.vkResetCommandBuffer(commandBuffer, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+     vulkanWrapper.vkBeginCommandBuffer(commandBuffer, &beginInfo);
++    QsBuffer* split = qs_buffer(context->querySplit, commandBufferId); /* winlator-0023: a new recording */
++    if (split) {
++        for (int which = 0; which < 2; which++)
++            if (split->sideOpen[which] && qs_side_live(context->querySplit, split, which)) { /* never ended: cannot be begun again */
++                vulkanWrapper.vkResetCommandBuffer((VkCommandBuffer)split->side[which], 0);
++            }
++        split->recording++;
++        split->seenOther = false;
++        split->usage = beginInfo.flags;
++        split->sideOpen[QS_LEAD] = split->sideOpen[QS_TRAIL] = false;
++    }
+ }
+ 
+ /* [mali-g2] Replays a batch of recorded commands (uint64 command buffer id, then the commands, each
+@@ -1578,7 +1781,7 @@ void vt_handle_vkBeginCommandBuffer(VkContext* context) {
+  * reaches that queue when its chunk is replayed rather than at End, so it can be uploaded before
+  * this command buffer is ended or submitted, or even if it is reset or freed and never submitted.
+  * Set VORTEK_CMD_CHUNK=0 on devices where the decoder is active. */
+-static VkCommandBuffer replayCommands(VkContext* context) {
++static VkCommandBuffer replayCommands(VkContext* context, bool final) {
+     int position = 0;
+     char* inputBuffer = context->inputBuffer;
+     int inputBufferSize = context->inputBufferSize;
+@@ -1593,11 +1796,34 @@ static VkCommandBuffer replayCommands(VkContext* context) {
+     bool query = false, renderPass = false;
+     /* [mali-g2] statistics: where the query commands are (winlator-0022) */
+     CmdMemBuffer* statsBuffer = commandMemory && commandMemory->statsEvery ? cmdmem_buffer(commandMemory, commandBufferId) : NULL;
++    /* [mali-g2] query commands before the first or after the last other command go to side command
++     * buffers (VORTEK_QUERY_SPLIT, winlator-0023); `lastOther`: where the last other command of the
++     * recording starts, known in its last batch only */
++    QsBuffer* split = qs_buffer(context->querySplit, commandBufferId);
++    if (split && !split->primary) split = NULL;
++    int lastOther = inputBufferSize;
++    if (split && final) {
++        lastOther = -1;
++        for (int at = position; at + HEADER_SIZE <= inputBufferSize;) {
++            int code = *(int*)(inputBuffer + at), length = *(int*)(inputBuffer + at + 4);
++            if (length < 0 || at + HEADER_SIZE + length > inputBufferSize) break;
++            if (!querySplitMovable(code)) lastOther = at;
++            at += HEADER_SIZE + length;
++        }
++    }
+ 
+     while (position + HEADER_SIZE <= inputBufferSize) {
+         int requestCode = *(int*)(inputBuffer + position + 0);
+         int size = *(int*)(inputBuffer + position + 4);
+         if (size < 0 || position + HEADER_SIZE + size > inputBufferSize) break;
++        if (split) {
++            if (!querySplitMovable(requestCode)) split->seenOther = true;
++            else if ((!split->seenOther || position > lastOther) &&
++                     querySplitRecord(context, context->querySplit, split, split->seenOther ? QS_TRAIL : QS_LEAD, requestCode, inputBuffer + position, size)) {
++                position += size + HEADER_SIZE; /* not in the application's pool: no mark, no statistics */
++                continue;
++            }
++        }
+         if (commandMemory) {
+             switch (requestCode) {
+             case REQUEST_CODE_VK_CMD_BEGIN_RENDERING: renderings++; break;
+@@ -1650,9 +1876,15 @@ static VkCommandBuffer replayCommands(VkContext* context) {
+ }
+ 
+ void vt_handle_vkEndCommandBuffer(VkContext* context) {
+-    VkCommandBuffer commandBuffer = replayCommands(context);
++    VkCommandBuffer commandBuffer = replayCommands(context, true);
+     if (commandBuffer) {
+         vulkanWrapper.vkEndCommandBuffer(commandBuffer);
++        QsBuffer* split = qs_buffer(context->querySplit, (uint64_t)commandBuffer); /* winlator-0023 */
++        for (int which = 0; split && which < 2; which++)
++            if (split->sideOpen[which]) {
++                vulkanWrapper.vkEndCommandBuffer((VkCommandBuffer)split->side[which]);
++                split->sideOpen[which] = false;
++            }
+         cmdmem_end(context->commandMemory, (uint64_t)commandBuffer);
+         commandMemoryStats(context);
+     }
+@@ -1666,7 +1898,7 @@ static void droiddeck_handleCmdChunk(VkContext* context) {
+         warnedTextureDecoder = true;
+         println("vortek: texture decoder active: BC copies in command chunks are queued before End (client VORTEK_CMD_CHUNK=0 avoids this)");
+     }
+-    replayCommands(context);
++    replayCommands(context, false);
+ }
+ #endif
+ 
+@@ -1680,6 +1912,15 @@ void vt_handle_vkResetCommandBuffer(VkContext* context) {
+     if (context->commandMemory ? cmdmem_buffer_reset(context->commandMemory, commandBufferId) : releaseCommandMemory(context, commandBufferId))
+         flags |= VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT;
+     vulkanWrapper.vkResetCommandBuffer(commandBuffer, flags);
++    QsBuffer* split = qs_buffer(context->querySplit, commandBufferId); /* winlator-0023: the side buffers no longer count */
++    if (split) {
++        split->recording++;
++        for (int which = 0; which < 2; which++)
++            if (split->sideOpen[which]) { /* reset while recording: so is its side buffer */
++                vulkanWrapper.vkResetCommandBuffer((VkCommandBuffer)split->side[which], 0);
++                split->sideOpen[which] = false;
++            }
++    }
+     commandMemoryStats(context);
+ }
+ 
+@@ -3885,6 +4126,27 @@ void vt_handle_vkQueueSubmit2(VkContext* context) {
+ 
+     VkSubmitInfo2 submits[submitCount ? submitCount : 1]; /* [mali-g2] no zero-length VLA for fence-only submits */
+     vt_unserialize_vkQueueSubmit2(VK_NULL_HANDLE, NULL, submits, VK_NULL_HANDLE, context->inputBuffer, &context->memoryPool);
++    for (uint32_t i = 0; context->querySplit && i < submitCount; i++) { /* winlator-0023: the side buffers around theirs */
++        QuerySplit* q = context->querySplit;
++        uint32_t count = submits[i].commandBufferInfoCount, extra = 0;
++        for (uint32_t c = 0; c < count; c++) {
++            QsBuffer* b = qs_buffer(q, (uint64_t)submits[i].pCommandBufferInfos[c].commandBuffer);
++            if (b) extra += qs_side_live(q, b, QS_LEAD) + qs_side_live(q, b, QS_TRAIL);
++        }
++        if (!extra) continue;
++        VkCommandBufferSubmitInfo* infos = vt_alloc(&context->memoryPool, (count + extra) * sizeof(VkCommandBufferSubmitInfo));
++        uint32_t n = 0;
++        for (uint32_t c = 0; c < count; c++) {
++            const VkCommandBufferSubmitInfo* info = &submits[i].pCommandBufferInfos[c];
++            QsBuffer* b = qs_buffer(q, (uint64_t)info->commandBuffer);
++            if (b && qs_side_live(q, b, QS_LEAD)) { infos[n] = *info; infos[n].pNext = NULL; infos[n++].commandBuffer = (VkCommandBuffer)b->side[QS_LEAD]; }
++            infos[n++] = *info;
++            if (b && qs_side_live(q, b, QS_TRAIL)) { infos[n] = *info; infos[n].pNext = NULL; infos[n++].commandBuffer = (VkCommandBuffer)b->side[QS_TRAIL]; }
++        }
++        submits[i].pCommandBufferInfos = infos;
++        submits[i].commandBufferInfoCount = n;
++        q->submitsExpanded++;
++    }
+ 
+     VkResult result = vulkanWrapper.vkQueueSubmit2(queue, submitCount, submits, fence);
+     if (result == VK_ERROR_DEVICE_LOST) context->status = result;
+diff --git a/app/src/main/cpp/vortekrenderer/src/vk_context.c b/app/src/main/cpp/vortekrenderer/src/vk_context.c
+index 0f3973c..c37e457 100644
+--- a/app/src/main/cpp/vortekrenderer/src/vk_context.c
++++ b/app/src/main/cpp/vortekrenderer/src/vk_context.c
+@@ -666,6 +666,7 @@ void destroyVkContext(JNIEnv* env, VkContext* context) {
+ static void freeVkContext(VkContext* context) {
+     context->graphicsQueueIndex = 0;
+     cmdmem_destroy(context->commandMemory); /* [mali-g2] winlator-0018 */
++    free(context->querySplit); /* [mali-g2] winlator-0023: its side pools went with their devices */
+ 
+     if (context->textureDecoder) {
+         TextureDecoder_destroy(context->textureDecoder);

@@ -5,8 +5,8 @@
 #   frame_leak_test.sh <libvortekserver.so> <client-dir> <frame_leak_test> <zc_mock_compositor>
 # <client-dir> is a build-client.sh output. FL_* pass through to the test (default here: a DXVK-like
 # frame with 16 render passes and a timestamp query, FL_STEPS=timeline,submit2,draw,query,present,poolreset
-# FL_PASSES=16 FL_FRAMES=12000), VORTEK_* to the server (VORTEK_CMD_RELEASE_LOG=1 is set: every
-# release is counted). FL_EXPECT (default bounded) and FL_MAX_GROWTH (default 64 bytes per frame) as
+# FL_PASSES=16 FL_FRAMES=12000), VORTEK_* to the server (VORTEK_CMD_RELEASE_LOG defaults to 1: every
+# release is counted; 2 adds the per-pool statistics). FL_SERVER_LOG=<file> keeps the server's log. FL_EXPECT (default bounded) and FL_MAX_GROWTH (default 64 bytes per frame) as
 # in frame_leak_report.awk: bounded = no growth over the last half of the reports, the default
 # (every 32nd reset), VORTEK_CMD_RELEASE_EVERY=N >= 1 and VORTEK_CMD_RELEASE_MODE=adaptive (release by
 # the estimate, cmd_memory.h) pass; flat = no growth at all (the default does); FL_MAX_PEAK_KB and
@@ -33,7 +33,7 @@ cp "$mock" $dir/$id-mock && chmod 700 $dir/$id-mock
 $dir/$id-mock $psock >$tmp/mock.log 2>&1 &
 mpid=$!
 cp "$srv" $dir/$id-srv && chmod 700 $dir/$id-srv
-VORTEK_CMD_RELEASE_LOG=1 VORTEK_PRESENT_SOCKET=$psock $dir/$id-srv $sock >$tmp/server.log 2>&1 &
+VORTEK_CMD_RELEASE_LOG=${VORTEK_CMD_RELEASE_LOG:-1} VORTEK_PRESENT_SOCKET=$psock $dir/$id-srv $sock >$tmp/server.log 2>&1 &
 spid=$!
 
 i=0
@@ -45,13 +45,15 @@ rc=$?
 
 kill $spid 2>/dev/null; wait $spid 2>/dev/null
 kill $mpid $xpid 2>/dev/null; wait $mpid $xpid 2>/dev/null
-grep -E "^FL (frame|done)|FAIL" $tmp/client.log
+grep -E "^FL (frame|done|query)|FAIL" $tmp/client.log
 grep -E "VORTEK_CMD_RELEASE_|released by estimate|command memory: (rel|.*full)|abort|Scudo" $tmp/server.log | head -6
 verdict="server $(awk -v expect="${FL_EXPECT:-bounded}" -v max="${FL_MAX_GROWTH:-64}" -v maxpeak="${FL_MAX_PEAK_KB:-}" \
   -v maxrel="${FL_MAX_RELEASES:-}" -f "$(dirname "$0")/frame_leak_report.awk" $tmp/client.log $tmp/server.log)"
 echo "$verdict"
+[ -n "${FL_SERVER_LOG:-}" ] && cp $tmp/server.log "$FL_SERVER_LOG"
 rm -f $dir/$id-mock $dir/$id-srv
 rm -rf $tmp
 case $verdict in *": PASS"*) ;; *) rc=1 ;; esac
+grep -qE "^FL query check: [0-9]+ frames ok, [1-9]" $tmp/client.log && rc=1
 if [ $rc -ne 0 ]; then echo FRAMELEAK-FAIL; exit 1; fi
 echo FRAMELEAK-PASS

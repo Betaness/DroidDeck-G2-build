@@ -12,7 +12,8 @@
  * query leaks for another's: bionic probes on the device, README; tests/frame_leak_test.c
  * FL_QUERY_EVERY=0 shows the first). Only a
  * reset of the pool with RELEASE_RESOURCES, vkTrimCommandPool or destroying the pool give it back and
- * clear the mark; after a vkResetCommandPool with flags 0 neither vkResetCommandBuffer with
+ * clear the mark (back to a cache of the device that later recordings reuse, not to malloc: a release
+ * stops the growth, it does not shrink the heap; query_split.h keeps pools from being marked at all); after a vkResetCommandPool with flags 0 neither vkResetCommandBuffer with
  * RELEASE_RESOURCES nor freeing the buffer does. Clients that only reset single command buffers get it
  * back with vkResetCommandBuffer(RELEASE_RESOURCES); the implicit reset of vkBeginCommandBuffer never
  * does. Not affected: vkCmdResetQueryPool and vkCmdCopyQueryPoolResults alone, and render pass
@@ -43,6 +44,12 @@
  * The sum over pools is atomic. When a table is full, everything falls back to releasing every
  * CMDMEM_FALLBACK_EVERY-th reset (the previous fixed policy), logged once.
  *
+ * Statistics (cmdmem_stats_due / cmdmem_log_stats, *_CMD_RELEASE_LOG=2 or *_CMD_RELEASE_STATS=<seconds>):
+ * per pool, what happened since the last report (resets, begins, implicit resets, ends, every
+ * vkCmdBeginRendering and those counted into the estimate, recordings with a query, releases), its
+ * state (marked, estimate, live buffers), and per table the lookups that found nothing (a recording or
+ * reset the estimate never saw). For finding what an estimate misses on a real client; off by default.
+ *
  * The includer defines CMDMEM_LOG(fmt, ...) (one line, no newline). */
 #ifndef DROIDDECK_CMD_MEMORY_H
 #define DROIDDECK_CMD_MEMORY_H
@@ -53,6 +60,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #define CMDMEM_RENDERING_BYTES 420u
 #define CMDMEM_POOL_BITS 10
@@ -79,6 +87,15 @@ typedef struct CmdMemPool {
     bool tainted;        /* a command buffer of the pool recorded a query since the pool last released */
     bool poolReset;      /* vkResetCommandPool was used: releasing single command buffers gives nothing back */
     bool suspect;        /* a recording combined a query with a VkRenderPass instance (backstop) */
+    /* statistics since the last report (cmdmem_log_stats), plain counters under the pool's external sync */
+    uint32_t buffers;    /* live command buffers */
+    uint32_t wResets, wBufferResets, wBegins, wImplicit, wEnds, wRenderings, wCounted, wQueries, wReleases;
+    uint64_t wReleasedBytes;
+    /* query commands by place (cmdmem_classify): timestamps / begin queries in a primary outside or inside
+     * rendering, or in a secondary; timestamps of primaries outside rendering by position in the recording:
+     * before any other command, between others, after the last other one, or in a recording of nothing else */
+    uint32_t wTsOut, wTsIn, wTsSec, wBqOut, wBqIn, wBqSec, wLead, wMid, wTrail, wAlone;
+    uint64_t totalRenderings; /* every vkCmdBeginRendering ended in the pool since its creation */
 } CmdMemPool;
 
 typedef struct CmdMemBuffer {
@@ -88,6 +105,12 @@ typedef struct CmdMemBuffer {
     uint32_t generation;
     uint32_t renderings; /* vkCmdBeginRendering in the current recording */
     uint32_t resets;     /* resets of this buffer since it last released (backstop) */
+    uint32_t beganGeneration; /* the pool's generation at the last begin (statistics: implicit resets) */
+    /* statistics (cmdmem_classify): where the recording's query commands are */
+    uint16_t pendingLead, pendingMid; /* timestamps outside rendering not yet followed by another command */
+    uint8_t depth;       /* rendering / render pass instances open */
+    bool seenOther;      /* the recording has a command that is not a query command */
+    bool secondary;      /* allocated as a secondary command buffer */
     bool query;          /* the current recording wrote a query */
     bool renderPass;     /* the current recording began a VkRenderPass instance */
     bool holds;          /* begun since its allocation or last vkResetCommandBuffer: a begin resets it implicitly */
@@ -103,6 +126,10 @@ typedef struct CmdMem {
     uint32_t fallbackResets;          /* atomic */
     int full;                         /* atomic: a table overflowed, every pool releases every 32nd reset */
     int logEvery;                     /* log every release (1), the first ones and then every 64th (0) */
+    int statsEvery;                   /* seconds between cmdmem_log_stats reports, 0 = none */
+    uint64_t nextStats;               /* atomic: CLOCK_MONOTONIC second of the next report */
+    uint64_t misses, poolMisses;      /* atomic: buffer / pool lookups that found nothing */
+    uint64_t statsSeq;
     CmdMemPool pools[1u << CMDMEM_POOL_BITS];
     CmdMemBuffer buffers[1u << CMDMEM_BUFFER_BITS];
 } CmdMem;
@@ -216,6 +243,13 @@ static inline CmdMemBuffer* cmdmem_buffer(CmdMem* m, uint64_t key) {
     return NULL;
 }
 
+/* A lookup at an entry point that found nothing: a handle the estimate never saw (statistics). */
+static inline CmdMemBuffer* cmdmem_buffer_counted(CmdMem* m, uint64_t key) {
+    CmdMemBuffer* b = cmdmem_buffer(m, key);
+    if (!b && m->statsEvery) __atomic_add_fetch(&m->misses, 1, __ATOMIC_RELAXED);
+    return b;
+}
+
 static inline void cmdmem_overflow(CmdMem* m, const char* what) {
     if (!__atomic_exchange_n(&m->full, 1, __ATOMIC_RELAXED))
         CMDMEM_LOG("command memory: %s table full, releasing every %uth reset from now on", what, CMDMEM_FALLBACK_EVERY);
@@ -228,6 +262,7 @@ static inline uint64_t cmdmem_share(CmdMem* m, CmdMemBuffer* b) {
 
 static inline void cmdmem_drop_buffer_locked(CmdMem* m, CmdMemBuffer* b) {
     CmdMemPool* p = &m->pools[b->pool];
+    if (p->buffers) p->buffers--;
     uint64_t share = cmdmem_share(m, b);
     if (share) {
         p->retained -= share;
@@ -265,6 +300,12 @@ static inline void cmdmem_pool_created(CmdMem* m, uint64_t device, uint64_t pool
         slot->resets = slot->taintedResets = 0;
         slot->resetBuffer = resetBuffer;
         slot->tainted = slot->suspect = slot->poolReset = false;
+        slot->buffers = 0;
+        slot->wResets = slot->wBufferResets = slot->wBegins = slot->wImplicit = slot->wEnds = 0;
+        slot->wRenderings = slot->wCounted = slot->wQueries = slot->wReleases = 0;
+        slot->wReleasedBytes = slot->totalRenderings = 0;
+        slot->wTsOut = slot->wTsIn = slot->wTsSec = slot->wBqOut = slot->wBqIn = slot->wBqSec = 0;
+        slot->wLead = slot->wMid = slot->wTrail = slot->wAlone = 0;
         __atomic_store_n(&slot->key, pool, __ATOMIC_RELEASE);
     }
     else cmdmem_overflow(m, "command pool");
@@ -313,6 +354,10 @@ static inline void cmdmem_buffers_allocated(CmdMem* m, uint64_t pool, uint32_t c
         slot->generation = p->generation;
         slot->renderings = slot->resets = 0;
         slot->query = slot->renderPass = slot->suspect = slot->holds = false;
+        slot->secondary = slot->seenOther = false;
+        slot->depth = 0;
+        slot->pendingLead = slot->pendingMid = 0;
+        p->buffers++;
         __atomic_store_n(&slot->key, key, __ATOMIC_RELEASE);
     }
     pthread_mutex_unlock(&m->lock);
@@ -330,7 +375,7 @@ static inline void cmdmem_buffers_freed(CmdMem* m, uint32_t count, const uint64_
 
 /* Commands recorded (the Vortek server counts a replayed batch at once). */
 static inline void cmdmem_recorded(CmdMem* m, uint64_t buffer, uint32_t renderings, bool query, bool renderPass) {
-    CmdMemBuffer* b = m ? cmdmem_buffer(m, buffer) : NULL;
+    CmdMemBuffer* b = m ? cmdmem_buffer_counted(m, buffer) : NULL;
     if (!b) return;
     b->renderings += renderings;
     b->query |= query;
@@ -366,6 +411,8 @@ static inline void cmdmem_buffer_released(CmdMem* m, CmdMemBuffer* b, uint64_t h
     p->retained -= share;
     __atomic_sub_fetch(&m->retained, share, __ATOMIC_RELAXED);
     uint32_t resets = b->resets;
+    p->wReleases++;
+    p->wReleasedBytes += share;
     b->retained = 0;
     b->generation = p->generation;
     b->resets = 0;
@@ -379,12 +426,18 @@ static inline void cmdmem_buffer_released(CmdMem* m, CmdMemBuffer* b, uint64_t h
  * the pool, so a release now would free nothing (frame_leak_test FL_CB_RESET=1 on the device). The
  * current recording starts empty either way. */
 static inline bool cmdmem_begin(CmdMem* m, uint64_t buffer) {
-    CmdMemBuffer* b = m ? cmdmem_buffer(m, buffer) : NULL;
+    CmdMemBuffer* b = m ? cmdmem_buffer_counted(m, buffer) : NULL;
     if (!b) return false;
     b->renderings = 0;
     b->query = b->renderPass = false;
     bool implicitReset = b->holds;
     b->holds = true;
+    b->depth = 0;
+    b->seenOther = false;
+    b->pendingLead = b->pendingMid = 0;
+    m->pools[b->pool].wBegins++;
+    if (implicitReset && b->beganGeneration == m->pools[b->pool].generation) m->pools[b->pool].wImplicit++;
+    b->beganGeneration = m->pools[b->pool].generation;
     if (!implicitReset || !m->pools[b->pool].resetBuffer) return false;
     b->resets++;
     if (__atomic_load_n(&m->full, __ATOMIC_RELAXED)) return b->resets % CMDMEM_FALLBACK_EVERY == 0;
@@ -395,10 +448,20 @@ static inline bool cmdmem_begin(CmdMem* m, uint64_t buffer) {
 
 /* vkEndCommandBuffer: what the recording leaves in the driver. */
 static inline void cmdmem_end(CmdMem* m, uint64_t buffer) {
-    CmdMemBuffer* b = m ? cmdmem_buffer(m, buffer) : NULL;
+    CmdMemBuffer* b = m ? cmdmem_buffer_counted(m, buffer) : NULL;
     if (!b) return;
     CmdMemPool* p = &m->pools[b->pool];
-    if (!b->query && !p->tainted) return;
+    p->wEnds++;
+    if (b->seenOther) p->wTrail += b->pendingLead + b->pendingMid;
+    else p->wAlone += b->pendingLead;
+    b->pendingLead = b->pendingMid = 0;
+    p->wRenderings += b->renderings;
+    p->totalRenderings += b->renderings;
+    if (b->query) p->wQueries++;
+    if (!b->query && !p->tainted) {
+        b->renderings = 0;
+        return;
+    }
     if (b->renderPass) b->suspect = p->suspect = true;
     if (!b->renderings) return;
     uint64_t bytes = (uint64_t)b->renderings * CMDMEM_RENDERING_BYTES;
@@ -408,6 +471,7 @@ static inline void cmdmem_end(CmdMem* m, uint64_t buffer) {
     }
     b->retained += bytes;
     p->retained += bytes;
+    p->wCounted += b->renderings;
     __atomic_add_fetch(&m->retained, bytes, __ATOMIC_RELAXED);
     b->renderings = 0;
 }
@@ -415,7 +479,9 @@ static inline void cmdmem_end(CmdMem* m, uint64_t buffer) {
 /* vkResetCommandPool: whether to add RELEASE_RESOURCES. */
 static inline bool cmdmem_pool_reset(CmdMem* m, uint64_t pool) {
     CmdMemPool* p = cmdmem_pool(m, pool);
+    if (!p && m->statsEvery) __atomic_add_fetch(&m->poolMisses, 1, __ATOMIC_RELAXED);
     if (!p) return cmdmem_fallback(m);
+    p->wResets++;
     p->generation++; /* the buffers' memory is the pool's now, released or not (see the top) */
     p->poolReset = true;
     p->resets++;
@@ -433,14 +499,17 @@ static inline bool cmdmem_pool_reset(CmdMem* m, uint64_t pool) {
     p->retained = 0;
     p->resets = p->taintedResets = 0;
     p->tainted = p->suspect = false;
+    p->wReleases++;
+    p->wReleasedBytes += bytes;
     cmdmem_log_release(m, "command pool", pool, bytes, resets);
     return true;
 }
 
 /* vkResetCommandBuffer: whether to add RELEASE_RESOURCES. */
 static inline bool cmdmem_buffer_reset(CmdMem* m, uint64_t buffer) {
-    CmdMemBuffer* b = cmdmem_buffer(m, buffer);
+    CmdMemBuffer* b = cmdmem_buffer_counted(m, buffer);
     if (!b) return cmdmem_fallback(m);
+    m->pools[b->pool].wBufferResets++;
     b->renderings = 0;
     b->query = b->renderPass = false;
     b->holds = false;
@@ -449,6 +518,101 @@ static inline bool cmdmem_buffer_reset(CmdMem* m, uint64_t buffer) {
     if (!cmdmem_buffer_release_due(m, b)) return false;
     cmdmem_buffer_released(m, b, buffer);
     return true;
+}
+
+/* Statistics: the level of newly allocated command buffers (cmdmem_classify tells primaries from secondaries). */
+static inline void cmdmem_set_secondary(CmdMem* m, uint32_t count, const uint64_t* buffers) {
+    if (!m || !m->statsEvery) return;
+    for (uint32_t n = 0; n < count; n++) {
+        CmdMemBuffer* b = buffers[n] ? cmdmem_buffer(m, buffers[n]) : NULL;
+        if (b) b->secondary = true;
+    }
+}
+
+enum { CMDMEM_CMD_OTHER, CMDMEM_CMD_TIMESTAMP, CMDMEM_CMD_BEGIN_QUERY, CMDMEM_CMD_QUERY_OTHER, CMDMEM_CMD_RENDER_BEGIN, CMDMEM_CMD_RENDER_END };
+
+/* Statistics: one recorded command of `b` (CMDMEM_CMD_*; QUERY_OTHER: end, reset or copy of queries, which
+ * neither count nor end a run of timestamps). */
+static inline void cmdmem_classify(CmdMem* m, CmdMemBuffer* b, int kind) {
+    if (!m || !b) return;
+    CmdMemPool* p = &m->pools[b->pool];
+    switch (kind) {
+    case CMDMEM_CMD_TIMESTAMP:
+        if (b->secondary) p->wTsSec++;
+        else if (b->depth) p->wTsIn++;
+        else {
+            p->wTsOut++;
+            if (b->seenOther) b->pendingMid++;
+            else b->pendingLead++;
+        }
+        return;
+    case CMDMEM_CMD_BEGIN_QUERY:
+        if (b->secondary) p->wBqSec++;
+        else if (b->depth) p->wBqIn++;
+        else p->wBqOut++;
+        break;
+    case CMDMEM_CMD_QUERY_OTHER: return;
+    case CMDMEM_CMD_RENDER_BEGIN: b->depth++; break;
+    case CMDMEM_CMD_RENDER_END: if (b->depth) b->depth--; break;
+    default: break;
+    }
+    /* anything but a timestamp ends the pending run */
+    p->wLead += b->pendingLead;
+    p->wMid += b->pendingMid;
+    b->pendingLead = b->pendingMid = 0;
+    b->seenOther = true;
+}
+
+/* Whether a statistics report is due (at most one caller per period gets true). */
+static inline bool cmdmem_stats_due(CmdMem* m) {
+    if (!m || m->statsEvery <= 0) return false;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec, next = __atomic_load_n(&m->nextStats, __ATOMIC_RELAXED);
+    if (!next) { /* the first call starts the clock */
+        __atomic_compare_exchange_n(&m->nextStats, &next, now + (uint64_t)m->statsEvery, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+        return false;
+    }
+    if (now < next) return false;
+    return __atomic_compare_exchange_n(&m->nextStats, &next, now + (uint64_t)m->statsEvery, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+
+/* One summary line and a line per pool that was used, released or holds an estimate since the last
+ * report; clears the window counters. The pools' fields are read without their external sync, so a
+ * line can be off by the commands of a recording in progress (diagnostics only). */
+static inline void cmdmem_log_stats(CmdMem* m, const char* tag) {
+    if (!m) return;
+    uint64_t seq = __atomic_add_fetch(&m->statsSeq, 1, __ATOMIC_RELAXED);
+    uint32_t live = 0, tainted = 0, listed = 0;
+    for (uint32_t i = 0; i < (1u << CMDMEM_POOL_BITS); i++) {
+        CmdMemPool* p = &m->pools[i];
+        uint64_t k = __atomic_load_n(&p->key, __ATOMIC_ACQUIRE);
+        if (k == CMDMEM_EMPTY || k == CMDMEM_GONE) continue;
+        live++;
+        if (p->tainted) tainted++;
+        if (!p->wResets && !p->wBufferResets && !p->wBegins && !p->wReleases && !p->retained) continue;
+        listed++;
+        CMDMEM_LOG("command memory stats %s #%llu pool 0x%llx%s%s: resets %u buf %u, begins %u (implicit %u), ends %u, renderings %u "
+                   "(counted %u, %llu since created), query recordings %u, releases %u (%.1f KiB), estimate %.1f KiB after %u resets, "
+                   "%u buffers; timestamps out %u (lead %u mid %u trail %u alone %u) in %u sec %u, begin queries out %u in %u sec %u",
+                   tag, (unsigned long long)seq, (unsigned long long)k, p->tainted ? " marked" : "", p->resetBuffer ? " resetcb" : "",
+                   p->wResets, p->wBufferResets, p->wBegins, p->wImplicit, p->wEnds, p->wRenderings, p->wCounted,
+                   (unsigned long long)p->totalRenderings, p->wQueries, p->wReleases, p->wReleasedBytes / 1024.0, p->retained / 1024.0,
+                   p->resets, p->buffers, p->wTsOut, p->wLead, p->wMid, p->wTrail, p->wAlone, p->wTsIn, p->wTsSec, p->wBqOut,
+                   p->wBqIn, p->wBqSec);
+        p->wResets = p->wBufferResets = p->wBegins = p->wImplicit = p->wEnds = 0;
+        p->wRenderings = p->wCounted = p->wQueries = p->wReleases = 0;
+        p->wReleasedBytes = 0;
+        p->wTsOut = p->wTsIn = p->wTsSec = p->wBqOut = p->wBqIn = p->wBqSec = 0;
+        p->wLead = p->wMid = p->wTrail = p->wAlone = 0;
+    }
+    CMDMEM_LOG("command memory stats %s #%llu: %u pools (%u marked, %u listed), estimate %.1f KiB, %llu releases (%.1f MiB), "
+               "lookups missed: %llu command buffer, %llu command pool%s",
+               tag, (unsigned long long)seq, live, tainted, listed, __atomic_load_n(&m->retained, __ATOMIC_RELAXED) / 1024.0,
+               (unsigned long long)__atomic_load_n(&m->releases, __ATOMIC_RELAXED),
+               __atomic_load_n(&m->releasedBytes, __ATOMIC_RELAXED) / 1048576.0,
+               (unsigned long long)__atomic_load_n(&m->misses, __ATOMIC_RELAXED),
+               (unsigned long long)__atomic_load_n(&m->poolMisses, __ATOMIC_RELAXED), m->full ? ", table full" : "");
 }
 
 #endif
