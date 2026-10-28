@@ -327,6 +327,41 @@ class ShadowTest(SyncTestCase):
         with self.assertRaises(SYNC["PackDamaged"]):
             SYNC["ensure_dist"](root, tool, pack)
 
+    def test_extras_stay_stock_on_another_release(self):
+        root = self.store()
+        tool = make_tool(self.tools, "Proton Experimental (ARM64)")
+        (tool / WINEX11).write_bytes(b"stock winex11")
+        pack_id = "valve-experimental-r3"
+        pack = make_pack(root, tool, pack_id, extras={WINEX11: hashlib.sha256(b"patched winex11").hexdigest()})
+        (root / "packs" / pack_id / WINEX11).write_bytes(b"patched winex11")
+        dist = Path(SYNC["ensure_dist"](root, tool, pack))
+        self.assertEqual((dist / WINEX11).read_bytes(), b"patched winex11")
+        # a later release with the same ntdll.so and wineserver still matches exactly, but its winex11.so may differ
+        (tool / "version").write_text("1799000000 experimental-11.0-20261101-arm64\n")
+        (tool / WINEX11).write_bytes(b"newer stock winex11")
+        measured = SYNC["measure"](tool)
+        self.assertEqual(SYNC["match_kind"](pack, measured), "exact")
+        self.assertEqual(Path(SYNC["ensure_dist"](root, tool, pack)), dist)
+        self.assertEqual(os.readlink(dist / WINEX11), str(tool / WINEX11))
+        self.assertEqual((dist / NTDLL).read_bytes(), (root / "packs" / pack_id / NTDLL).read_bytes())
+        other = Path(SYNC["build_shadow"](tool, root / "packs" / pack_id, self.tmp / "shadow"))
+        self.assertEqual(os.readlink(other / WINEX11), str(tool / WINEX11))
+        # the same epoch with another token, or a pack without a version line, is another release too
+        (tool / "version").write_text(VALVE_LINE.split()[0] + " experimental-11.0-hotfix-arm64\n")
+        self.assertFalse(SYNC["same_release"](pack, tool))
+        self.assertFalse(SYNC["same_release"](dict(pack, version_line=""), tool))
+        # the same token with another epoch is the same release (the depot build stamps its own epoch)
+        (tool / "version").write_text("1799999999 " + VALVE_LINE.split()[1] + "\n")
+        self.assertTrue(SYNC["same_release"](pack, tool))
+        (tool / WINEX11).write_bytes(b"stock winex11")
+        self.assertEqual(Path(SYNC["ensure_dist"](root, tool, pack)), dist)
+        self.assertEqual((dist / WINEX11).read_bytes(), b"patched winex11")
+        (tool / "version").write_text(VALVE_LINE + "\n")
+        (tool / WINEX11).write_bytes(b"stock winex11")
+        self.assertEqual(Path(SYNC["ensure_dist"](root, tool, pack)), dist)
+        self.assertFalse((dist / WINEX11).is_symlink())
+        self.assertEqual((dist / WINEX11).read_bytes(), b"patched winex11")
+
     def test_packs_without_extras_keep_stock_winex11(self):
         root = self.store()
         tool = make_tool(self.tools, "Proton Experimental (ARM64)")
