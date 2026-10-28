@@ -3,6 +3,7 @@ package com.droiddeck.launcher.core
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.SystemClock
 import android.util.Log
 import com.droiddeck.launcher.R
 import com.flyfishxu.kadb.Kadb
@@ -26,10 +27,16 @@ object WirelessAdbFix {
     const val LOOPBACK = "127.0.0.1"
     /** Ports from a loopback scan given a connection, at most; adbd has one. */
     private const val SCANNED_ATTEMPTS = 3
-    /** Callers that come together at a session's start look for a new port one at a time. */
-    private val discovery = Any()
+    /** How long a port lookup that found nothing answers for the same saved connection. */
+    private const val FAILED_LOOKUP_MS = 60_000L
 
     private data class SavedConnection(val host: String, val port: Int?)
+
+    /**
+     * Callers that come together at a session's start look for a new port one at a time, and share a lookup that
+     * found nothing for [FAILED_LOOKUP_MS].
+     */
+    private val lookups = PortLookupGate<SavedConnection>(FAILED_LOOKUP_MS) { SystemClock.elapsedRealtime() }
 
     @Synchronized
     private fun loadOrCreateIdentity(context: Context) {
@@ -58,6 +65,7 @@ object WirelessAdbFix {
         Kadb.pair(host, port, pairingCode, "DroidDeck")
         writeAtomically(context, File(context.noBackupFilesDir, HOST_FILE), host.toByteArray())
         writeAtomically(context, File(context.noBackupFilesDir, CONNECTION_FILE), ByteArray(0))
+        lookups.clear()
     }
 
     private fun savedConnection(context: Context): SavedConnection? {
@@ -82,6 +90,7 @@ object WirelessAdbFix {
             File(context.applicationContext.noBackupFilesDir, CONNECTION_FILE),
             "$host\n$port".toByteArray(),
         )
+        lookups.clear()
     }
 
     fun isLocalAddress(address: InetAddress): Boolean = runCatching {
@@ -163,6 +172,10 @@ object WirelessAdbFix {
         try {
             manager.discoverServices("_adb-tls-connect._tcp.", NsdManager.PROTOCOL_DNS_SD, discoveryListener)
             latch.await(timeoutSeconds, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            // Kept, so the caller stops rather than going on to a scan, and the lookup is not taken as failed.
+            Thread.currentThread().interrupt()
+            return null
         } catch (_: Exception) {
             return null
         } finally {
@@ -236,28 +249,40 @@ object WirelessAdbFix {
      * A shell-user connection to this device through the saved pairing (the cached port, else the one
      * announced over mDNS, else one found by a loopback scan), or null without a pairing or when wireless
      * debugging is off. The caller closes it. Blocks for up to about 20 s when the cached port is stale.
+     *
+     * Callers that come during a lookup wait for it; when it found nothing, they and any caller in the next
+     * [FAILED_LOOKUP_MS] for the same saved connection get null at once, after trying only the cached port.
      */
     fun connectUsingSavedPairing(context: Context): Kadb? {
         val appContext = context.applicationContext
         val first = savedConnection(appContext) ?: return null
         loadOrCreateIdentity(appContext)
-        first.port?.let { port -> attempt(first.host, port)?.let { return it } }
-        synchronized(discovery) {
+        first.port?.let { port ->
+            attempt(first.host, port)?.let { adb ->
+                lookups.clear()
+                return adb
+            }
+        }
+        return lookups.run(
+            key = { savedConnection(appContext) },
+            onSkipped = { age ->
+                Log.i(TAG, "no wireless debugging port found through the saved pairing ${age / 1000} s ago: not looked up again")
+            },
+        ) lookup@{ saved ->
             val tried = mutableSetOf<Int>()
             first.port?.let { tried += it }
             // Another caller may have found the new port meanwhile.
-            val saved = savedConnection(appContext) ?: return null
             saved.port?.takeIf { saved != first }?.let { port ->
                 tried += port
-                attempt(saved.host, port)?.let { return it }
+                attempt(saved.host, port)?.let { return@lookup it }
             }
             findConnectPort(appContext, saved.host)?.takeIf { tried.add(it) }?.let { port ->
                 attempt(saved.host, port)?.let { adb ->
                     saveConnection(appContext, saved.host, port)
-                    return adb
+                    return@lookup adb
                 }
             }
-            return scanLoopback(appContext, tried)?.second
+            if (Thread.currentThread().isInterrupted) null else scanLoopback(appContext, tried)?.second
         }
     }
 
@@ -269,20 +294,20 @@ object WirelessAdbFix {
         val cachedResult = cachedPort?.let { port ->
             runCatching { setChildProcessLimit(appContext, saved.host, port, enabled) }.also { if (it.isSuccess) return }
         }
-        synchronized(discovery) {
+        // Asked for by the user: looked up even when a lookup just found nothing.
+        val done = lookups.exclusive {
             val discoveredPort = findConnectPort(appContext, saved.host)
             if (discoveredPort != null && discoveredPort != cachedPort) {
                 setChildProcessLimit(appContext, saved.host, discoveredPort, enabled)
-                return
+                return@exclusive true
             }
             loadOrCreateIdentity(appContext)
-            val scanned = scanLoopback(appContext, setOfNotNull(cachedPort))
-            if (scanned != null) {
-                scanned.second.close()
-                setChildProcessLimit(appContext, LOOPBACK, scanned.first, enabled)
-                return
-            }
+            val scanned = scanLoopback(appContext, setOfNotNull(cachedPort)) ?: return@exclusive false
+            scanned.second.close()
+            setChildProcessLimit(appContext, LOOPBACK, scanned.first, enabled)
+            true
         }
+        if (done) return
         cachedResult?.getOrThrow()
         error(appContext.getString(R.string.adbfix_enter_address))
     }
