@@ -325,6 +325,21 @@ def pack_extras(pack):
     return pack.get("extras") or {}
 
 
+def same_release(pack, tool):
+    """Whether the tool is the release the pack was made from (epoch and token of the version line)."""
+    made = (pack.get("version_line") or "").split()[:2]
+    return len(made) == 2 and made == version_line(tool).split()[:2]
+
+
+def fitted(pack, tool):
+    """The pack as used for this tool. Its extras (winex11.so) are built from the source of the release it was made
+    for and must fit that release's stock win32u.so; a pack also matches later releases whose ntdll.so and wineserver
+    did not change, and there the extras stay stock."""
+    if not pack_extras(pack) or same_release(pack, tool):
+        return pack
+    return dict(pack, extras={})
+
+
 def is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -598,7 +613,7 @@ def place(temp, out):
 def build_shadow(tool_dir, pack_dir, out_dir, cache=None):
     tool = absolute(tool_dir)
     out = absolute(out_dir)
-    pack = read_pack(pack_dir)
+    pack = fitted(read_pack(pack_dir), tool)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     place(build_tree(tool, tool, pack, os.fspath(pack_dir), out, cache if cache is not None else HashCache(None)), out)
     return out
@@ -608,6 +623,7 @@ def ensure_dist(root, tool_dir, pack, cache=None):
     root = os.fspath(root)
     cache = cache if cache is not None else HashCache(root)
     tool = absolute(tool_dir)
+    pack = fitted(pack, tool)
     stock = os.path.realpath(tool)
     folder = os.path.join(root, "dist")
     os.makedirs(folder, exist_ok=True)
@@ -962,6 +978,9 @@ def choose(root, command, env, tool, stock):
     say("droiddeck-esync: pack %s for %s (%s, %s match); droiddeck-ntsync %s, droiddeck-esync %s, fds %s/%s"
         % (pack["id"], name, measured["version_line"], match_kind(pack, measured), "on" if env.get("BL_SYNC") == "1" else "off",
            "on" if truthy(env["WINEESYNC"]) else "off", limit(soft), limit(hard)))
+    if pack_extras(pack) and not pack_extras(fitted(pack, tool)):
+        say("droiddeck-esync: pack %s was made for %s; %s stay stock"
+            % (pack["id"], pack.get("version_line") or "another release", ", ".join(sorted(os.path.basename(rel) for rel in pack_extras(pack)))))
     log_launch(root, command, env, tool, pack["id"])
     return command, env
 
