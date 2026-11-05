@@ -100,9 +100,22 @@ public final class LinuxRuntimeInstaller {
         return CATALOG_URL;
     }
 
+    /**
+     * [mali-g2] raw.githubusercontent.com does not connect from some networks (mainland China) and a catalog
+     * never comes through a mirror, so there the runtime could neither update nor be repaired. This is the
+     * catalog's release this build was tested with; the digest is signed with the APK, so the archive
+     * itself may come from a mirror.
+     */
+    static final Release PINNED = new Release("ubuntu-r1-rc4",
+            "https://github.com/Droid-Deck/DroidDeck-Components/releases/download/ubuntu-r1-rc4/ubuntu-r1-rc4.tar.zst",
+            "a90882efc4b0fc308887f8719c21825f0d17d51698296cd3047b6da2491c4396", 291531733L);
+
     public static Release fetchRelease() {
         String body = Downloader.downloadString(catalogUrl());
-        if (body == null || body.isEmpty()) return null;
+        if (body == null || body.isEmpty()) {
+            Log.i(TAG, "catalog unreachable: using the pinned " + PINNED.version);
+            return PINNED;
+        }
         try {
             JSONObject json = new JSONObject(body);
             String version = json.optString("version", "");

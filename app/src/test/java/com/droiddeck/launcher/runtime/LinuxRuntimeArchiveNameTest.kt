@@ -10,6 +10,14 @@ class LinuxRuntimeArchiveNameTest {
     private fun release(version: String, sha: String) =
         LinuxRuntimeInstaller.Release(version, "https://example.invalid/runtime.tar.zst", sha, 1L)
 
+    @Test fun thePinnedReleaseIsWhatTheDownloaderAccepts() {
+        val pinned = LinuxRuntimeInstaller.PINNED
+        assertTrue(pinned.sha256.matches(Regex("[0-9a-f]{64}")))
+        assertTrue(pinned.url.startsWith("https://github.com/"))
+        assertTrue(pinned.size > 0)
+        assertTrue(LinuxRuntimeInstaller.archiveName(pinned).startsWith("linuxfs-${pinned.version}-"))
+    }
+
     @Test fun sameReleaseKeepsTheSameName() {
         val a = LinuxRuntimeInstaller.archiveName(release("r9", "ab".repeat(32)))
         val b = LinuxRuntimeInstaller.archiveName(release("r9", "ab".repeat(32)))
