@@ -87,9 +87,21 @@ public final class LinuxRuntimeInstaller {
         return v == null ? null : v.trim();
     }
 
+    /**
+     * [mali-g2] raw.githubusercontent.com does not connect from some networks (mainland China) and a catalog
+     * never comes through a mirror. This is the release this build runs on; the digest is signed with the
+     * APK, so the archive itself may come from a mirror.
+     */
+    static final Release PINNED = new Release("r9",
+            "https://github.com/Droid-Deck/DroidDeck-Components/releases/download/linuxfs-r9/linuxfs.tar.zst",
+            "d3240c1531531615b0dd06b6ad56e92db9015a8641eb18c3a613835ae45992e7", 790907606L);
+
     public static Release fetchRelease() {
         String body = Downloader.downloadString(CATALOG_URL);
-        if (body == null || body.isEmpty()) return null;
+        if (body == null || body.isEmpty()) {
+            Log.i(TAG, "catalog unreachable: using the pinned " + PINNED.version);
+            return PINNED;
+        }
         try {
             JSONObject json = new JSONObject(body);
             String version = json.optString("version", "");
@@ -306,6 +318,10 @@ public final class LinuxRuntimeInstaller {
 
             try {
                 RuntimeFileTree.carryHome(old, staging);
+                // Steam ties its saved login to the machine: going back from another runtime keeps the id.
+                File id = new File(old, "etc/machine-id");
+                if (id.isFile() && id.length() > 0)
+                    Files.copy(id.toPath(), new File(staging, "etc/machine-id").toPath(), StandardCopyOption.REPLACE_EXISTING);
             } catch (IOException e) {
                 Log.w(TAG, "could not carry root across the update; rolling back", e);
                 old.renameTo(root);
