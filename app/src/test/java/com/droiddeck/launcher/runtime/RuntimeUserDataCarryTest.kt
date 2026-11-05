@@ -54,6 +54,18 @@ class RuntimeUserDataCarryTest {
         assertFalse("only DroidDeck's own menu entries are user data", File(staging, "usr/local/share/applications/other.desktop").exists())
     }
 
+    @Test fun anUpdateKeepsTheMachineId() {
+        val old = tmp.newFolder("old").also { put(it, "root/save.dat", "mine"); put(it, "etc/machine-id", "4ec5ec12") }
+        Files.createDirectories(File(old, "var/lib/dbus").toPath())
+        Files.createSymbolicLink(File(old, "var/lib/dbus/machine-id").toPath(), java.nio.file.Paths.get("/etc/machine-id"))
+        val staging = tmp.newFolder("new").also { put(it, "root/.bashrc", "shipped"); put(it, "etc/machine-id", "") }
+
+        RuntimeFileTree.carryUserData(old, staging, false, RuntimeFileTree.existingUserPaths(old, staging))
+
+        assertEquals("4ec5ec12", File(staging, "etc/machine-id").readText())
+        assertEquals("/etc/machine-id", Files.readSymbolicLink(File(staging, "var/lib/dbus/machine-id").toPath()).toString())
+    }
+
     @Test fun aMenuEntryTheNewRuntimeShipsIsNotCarried() {
         val old = tmp.newFolder("old").also {
             put(it, "root/save.dat", "mine")

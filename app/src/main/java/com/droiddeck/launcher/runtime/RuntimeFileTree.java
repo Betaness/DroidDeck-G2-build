@@ -77,10 +77,11 @@ public final class RuntimeFileTree {
     /**
      * Paths in a runtime tree that belong to the user: the home folder, imported AppImages and script apps, and catalog
      * AppImages with their menu entries and markers. Tar-kind catalog packages (the desktop) unpack over /usr and cannot
-     * be carried.
+     * be carried. The machine id goes too: Steam ties its saved login to the machine, and the Ubuntu image ships it empty.
      */
     static java.util.List<String> userPaths(File tree) throws IOException {
-        java.util.List<String> paths = new java.util.ArrayList<>(java.util.Arrays.asList("root", "opt/appimages/user", "opt/droiddeck-apps", "opt/droiddeck/wincomponents"));
+        java.util.List<String> paths = new java.util.ArrayList<>(java.util.Arrays.asList("root", "opt/appimages/user", "opt/droiddeck-apps", "opt/droiddeck/wincomponents",
+                "etc/machine-id", "var/lib/dbus/machine-id"));
         for (String n : children(new File(tree, "usr/local/share/applications"))) {
             if (n.endsWith(".desktop") && (n.startsWith("droiddeck-app-") || n.startsWith("droiddeck-appimage-")))
                 paths.add("usr/local/share/applications/" + n);
