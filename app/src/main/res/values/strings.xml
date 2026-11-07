@@ -2638,6 +2638,8 @@
     <string name="setup_needs_you">When something needs you</string>
     <string name="setup_group_look">Look</string>
     <string name="setup_group_device">This device</string>
+    <string name="setup_cooler_mode">Water cooler mode</string>
+    <string name="setup_cooler_mode_hint">With a cooler attached: steadier frame rates in long sessions, by holding the GPU clock up and leaving the CPU boost off. Needs the wireless debugging pairing; stops by itself when the device gets too hot. Applies from the next session.</string>
     <string name="setup_group_art">Library art</string>
     <string name="setup_group_download">Downloads</string>
     <string name="setup_download_source">Source</string>

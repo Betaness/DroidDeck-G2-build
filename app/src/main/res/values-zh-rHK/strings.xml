@@ -2451,6 +2451,8 @@
     <string name="setup_needs_you">需要你處理時</string>
     <string name="setup_group_look">外觀</string>
     <string name="setup_group_device">此裝置</string>
+    <string name="setup_cooler_mode">水冷模式</string>
+    <string name="setup_cooler_mode_hint">接上散熱器時開啟：拉住 GPU 頻率、不用 CPU 提頻，長時間遊戲幀率更穩。需要無線偵錯配對，裝置過熱時自動暫停。下次啟動工作階段生效。</string>
     <string name="setup_group_art">收藏庫圖片</string>
     <string name="setup_group_download">下載</string>
     <string name="setup_download_source">來源</string>

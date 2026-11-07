@@ -2460,6 +2460,8 @@
     <string name="setup_needs_you">需要你处理</string>
     <string name="setup_group_look">外观</string>
     <string name="setup_group_device">此设备</string>
+    <string name="setup_cooler_mode">水冷模式</string>
+    <string name="setup_cooler_mode_hint">接上散热器时打开：拉住 GPU 频率、不要 CPU 提频，长时间游戏帧率更稳。需要无线调试配对，设备过热时自动暂停。下次启动会话生效。</string>
     <string name="setup_group_art">游戏库美术图</string>
     <string name="flathub_eyebrow">LINUX 应用</string>
     <string name="flathub_name">Flathub</string>

@@ -416,6 +416,9 @@ internal fun SetupPanel(
                                 if (s.homeScreenEnabled) {
                                     ActionRow(stringResource(R.string.setup_default_home), s.defaultHomeLabel ?: stringResource(R.string.setup_choose_home), stringResource(R.string.setup_choose), a.onHomeApp)
                                 }
+                                if (com.droiddeck.launcher.session.CoolerFloor.available) {
+                                    ToggleRow(host, "cooler-mode", stringResource(R.string.setup_cooler_mode), stringResource(R.string.setup_cooler_mode_hint), s.coolerMode, onChange = a.onCoolerMode)
+                                }
                                 ChoiceRow(
                                     host, "launcher-orientation", stringResource(R.string.setup_launcher_orientation), null,
                                     com.droiddeck.launcher.core.AppUiPrefs.orientationOptions.map { (value, label) -> value to stringResource(label) },

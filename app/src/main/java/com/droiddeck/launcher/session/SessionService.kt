@@ -514,6 +514,7 @@ class SessionService : Service() {
         Log.i(TAG, journal.fact("schedfeed", FrameSchedFeed.start(this)))
         Log.i(TAG, journal.fact("joyose", HyperOsGameMode.start(this)))
         Log.i(TAG, journal.fact("mibridge", MiBridgeBoost.start(this)))
+        Log.i(TAG, journal.fact("cooler", CoolerFloor.start(this)))
         Log.i(TAG, journal.fact("colocation", WineServerColocation.start(this)))
 
         val size = SessionState.outputSize
@@ -1904,6 +1905,7 @@ class SessionService : Service() {
         FrameSchedFeed.stop()
         HyperOsGameMode.stop()
         MiBridgeBoost.stop()
+        CoolerFloor.stop()
         WineServerColocation.stop()
         suspendOperationPending = false
         freezePending = false
@@ -1988,6 +1990,7 @@ class SessionService : Service() {
         FrameSchedFeed.stop()
         HyperOsGameMode.stop()
         MiBridgeBoost.stop()
+        CoolerFloor.stop()
         WineServerColocation.stop()
         if (screenReceiverRegistered) {
             unregisterReceiver(screenReceiver)

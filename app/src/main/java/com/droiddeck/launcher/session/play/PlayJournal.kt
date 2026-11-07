@@ -19,6 +19,7 @@ import com.droiddeck.launcher.runtime.LinuxRuntime
 import com.droiddeck.launcher.session.BatteryComponent
 import com.droiddeck.launcher.session.FrameSchedOptOut
 import com.droiddeck.launcher.session.HyperOsGameMode
+import com.droiddeck.launcher.session.CoolerFloor
 import com.droiddeck.launcher.session.MiBridgeBoost
 import com.droiddeck.launcher.session.SessionPrefs
 import com.droiddeck.launcher.session.SessionService
@@ -287,6 +288,7 @@ object PlayJournal {
         if (!running) return
         val now = System.currentTimeMillis()
         track(now)
+        CoolerFloor.gameOpen = open.isNotEmpty()
         if (open.isEmpty()) {
             lastHist = FrameTimes.snapshot()
             ShellProbe.wanted = false
@@ -422,7 +424,7 @@ object PlayJournal {
 
     private fun settings(ctx: Context?): Map<String, Any?> {
         val out = LinkedHashMap<String, Any?>()
-        for (k in listOf("gpuclock", "threads", "schedfeed", "joyose", "mibridge", "colocation")) facts[k]?.let { out[k] = it }
+        for (k in listOf("gpuclock", "threads", "schedfeed", "joyose", "mibridge", "cooler", "colocation")) facts[k]?.let { out[k] = it }
         out["regulator"] = HyperOsGameMode.launchCheck.value.name
         out["joyoseWatch"] = HyperOsGameMode.joyoseWatch
         out["frameSchedOptOut"] = FrameSchedOptOut.outcome

@@ -641,7 +641,15 @@ object SessionPrefs {
      * Unset, the Xring O3 asks for [MiBridgeBoost.DEFAULT_SPEC] and other SoCs for nothing.
      */
     fun miBridgeBoost(context: Context): String =
-        MiBridgeBoost.spec(prefs(context).getString("miBridgeBoost", null), Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL == "O3")
+        if (coolerMode(context) && CoolerFloor.available) CoolerFloor.MIBRIDGE_SPEC
+        else MiBridgeBoost.spec(prefs(context).getString("miBridgeBoost", null), Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL == "O3")
+
+    /** [mali-g2] Water cooler mode (CoolerFloor); off by default, it is only safe with a cooler attached. */
+    fun coolerMode(context: Context): Boolean = prefs(context).getBoolean("coolerMode", false)
+
+    fun setCoolerMode(context: Context, on: Boolean) {
+        prefs(context).edit().putBoolean("coolerMode", on).apply()
+    }
 
     /** [mali-g2] Whether the session sees the Android system tree (/system, /vendor, /apex...), for libhybris. */
     fun androidSystemBinds(context: Context): Boolean = prefs(context).getBoolean("androidSystemBinds", false)

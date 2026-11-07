@@ -191,6 +191,7 @@ class FrontEndActivity : ComponentActivity() {
     private var animationsEnabled by mutableStateOf(true)
     private var launcherIcon by mutableStateOf(LauncherIcon.DARK)
     private var gameStoresEnabled by mutableStateOf(true)
+    private var coolerMode by mutableStateOf(false)
     private var gameStoresSpeedTier by mutableStateOf("fast")
     private var navRequest by mutableStateOf<String?>(null)
     private var storesShowMature by mutableStateOf(false)
@@ -1011,6 +1012,7 @@ class FrontEndActivity : ComponentActivity() {
         LauncherIcon.repair(this, intent?.component)
         launcherIcon = LauncherIcon.current(this)
         gameStoresEnabled = SessionPrefs.gameStoresEnabled(this)
+        coolerMode = SessionPrefs.coolerMode(this)
         gameStoresSpeedTier = SessionPrefs.gameStoresSpeedTier(this)
         storesShowMature = SessionPrefs.storesShowMature(this)
         storesSort = SessionPrefs.storesSort(this)
@@ -1093,6 +1095,7 @@ class FrontEndActivity : ComponentActivity() {
                         animationsEnabled = animationsEnabled,
                         launcherIcon = launcherIcon,
                         gameStoresEnabled = gameStoresEnabled,
+                        coolerMode = coolerMode,
                         gameStoresSpeedTier = gameStoresSpeedTier,
                         navigate = navRequest,
                         addedGamesArt = addedGamesArt,
@@ -1265,6 +1268,7 @@ class FrontEndActivity : ComponentActivity() {
                         },
                         onPageBack = { showPerformance = false; showComponents = false; showMapping = false },
                         onGameStoresEnabled = { on -> SessionPrefs.setGameStoresEnabled(this, on); gameStoresEnabled = on },
+                        onCoolerMode = { on -> SessionPrefs.setCoolerMode(this, on); coolerMode = on },
                         onTheme = { id -> SessionPrefs.setTheme(this, id); theme = id },
                         onLauncherIcon = { style -> switchLauncherIcon(style) },
                         onLanguage = { tag ->
