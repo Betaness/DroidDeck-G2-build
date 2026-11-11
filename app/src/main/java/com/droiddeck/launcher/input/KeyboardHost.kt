@@ -103,13 +103,30 @@ class KeyboardHost(
         clearFocus()
     }
 
+    // Whole, so ASCII in it keeps its place: the compositor types it into X programs too.
+    fun type(text: CharSequence?) {
+        if (text.isNullOrEmpty()) return
+        val events = map.getEvents(text.toString().toCharArray())
+        if (events != null) {
+            for (event in events) sendKeyEvent(event)
+        } else if (CompositorHost.isStarted) {
+            WaylandCompositor.textInputCommit(text.toString())
+        }
+    }
+
+    fun tap(keyCode: Int) {
+        val t = System.currentTimeMillis()
+        sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, keyCode, 0))
+        sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, keyCode, 0))
+    }
+
     private inner class KeyConnection : BaseInputConnection(this, false) {
         // Composing text stays in the IME's candidate bar; programs get it once committed.
         private var composing = ""
 
         override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
             composing = ""
-            if (!text.isNullOrEmpty()) type(text.toString())
+            type(text)
             return true
         }
 
@@ -121,18 +138,8 @@ class KeyboardHost(
         override fun finishComposingText(): Boolean {
             val text = composing
             composing = ""
-            if (text.isNotEmpty()) type(text)
+            type(text)
             return true
-        }
-
-        // Whole, so ASCII in it keeps its place: the compositor types it into X programs too.
-        private fun type(text: String) {
-            val events = map.getEvents(text.toCharArray())
-            if (events != null) {
-                for (event in events) sendKeyEvent(event)
-            } else if (CompositorHost.isStarted) {
-                WaylandCompositor.textInputCommit(text)
-            }
         }
 
         override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
@@ -146,12 +153,6 @@ class KeyboardHost(
         override fun performEditorAction(actionCode: Int): Boolean {
             tap(KeyEvent.KEYCODE_ENTER)
             return true
-        }
-
-        private fun tap(keyCode: Int) {
-            val t = System.currentTimeMillis()
-            sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, keyCode, 0))
-            sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, keyCode, 0))
         }
 
         override fun getTextBeforeCursor(n: Int, flags: Int): CharSequence = ""

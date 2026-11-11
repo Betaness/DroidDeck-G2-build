@@ -15,6 +15,7 @@
       "tools/linuxfs/fonts",
       "tools/pipewire",
       "tools/vr",
+      "tools/gpuload",
       "app/src/main/cpp/waylandcomp/generated",
       "app/src/main/cpp/waylandcomp/src/headpose_shm.h",
       "app/src/main/cpp/waylandcomp/src/spatialpose_shm.h",
@@ -23,7 +24,9 @@
     "outputs": [
       "app/src/main/assets/linuxfs/usr/local/bin/gamescope",
       "app/src/main/assets/linuxfs/usr/local/lib/droiddeck-vr/droiddeck/bin/linuxarm64/driver_droiddeck.so",
-      "app/src/main/assets/linuxfs/usr/share/fonts/misc/wqy-microhei.ttc"
+      "app/src/main/assets/linuxfs/usr/share/fonts/misc/wqy-microhei.ttc",
+      "app/src/main/assets/linuxfs/usr/local/lib/droiddeck-gpuload/libVkLayer_droiddeck_gpuload.so",
+      "app/src/main/assets/linuxfs/usr/local/lib/droiddeck-gpuload/libVkLayer_droiddeck_vramcap.so"
     ],
     "ndk": true,
     "packages": [
@@ -138,6 +141,9 @@
       "app/src/main/jniLibs/arm64-v8a/libproot.so",
       "app/src/main/jniLibs/arm64-v8a/libproot-loader.so"
     ],
+    "packages": [
+      "gawk"
+    ],
     "ndk": true
   },
   "comet": {
@@ -223,6 +229,36 @@
       "protobuf-compiler",
       "cmake",
       "xz-utils"
+    ]
+  },
+  "vkbridge": {
+    "script": "tools/components/recipes/vkbridge.sh",
+    "inputs": [
+      "external/MaliBridge",
+      "tools/components/recipes/vkbridge.sh"
+    ],
+    "outputs": [
+      "app/src/main/assets/linuxfs/usr/local/lib/vkbridge/libvulkan_droidbridge.so",
+      "app/src/main/assets/linuxfs/usr/local/share/vkbridge/droidbridge_icd.json",
+      "app/src/main/assets/linuxfs/usr/local/bin/droiddeck-vkbridge-smoke"
+    ],
+    "packages": [
+      "gcc-aarch64-linux-gnu"
+    ]
+  },
+  "dirt-ws2": {
+    "script": "tools/components/recipes/dirt-ws2.sh",
+    "inputs": [
+      "tools/dirt-ws2",
+      "tools/components/recipes/dirt-ws2.sh"
+    ],
+    "outputs": [
+      "app/src/main/assets/linuxfs/usr/local/lib/droiddeck-dirt/ws2_32.dll"
+    ],
+    "packages": [
+      "clang",
+      "lld",
+      "llvm"
     ]
   }
 }

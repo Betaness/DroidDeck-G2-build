@@ -19,6 +19,9 @@ int vkp_effects_scaling(int *sharp_pct, int *cas_on);
 enum { VKP_SHADER_UPSCALE_VERT, VKP_SHADER_SGSR, VKP_SHADER_SGSR_HQ, VKP_SHADER_EASU, VKP_SHADER_RCAS };
 const uint32_t *vkp_effects_shader(int which, size_t *size);
 
+int vkp_effects_upscaling(void);
+int vkp_effects_postprocessing(void);
+
 VkFilter vkp_effects_blit_filter(void);
 
 VkImage vkp_effects_run(VkCommandBuffer cmd, VkImage scene, int scene_w, int scene_h,

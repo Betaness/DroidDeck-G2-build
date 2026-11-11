@@ -52,10 +52,10 @@ object GameThreadHints {
     private const val TAG = "GameThreadHints"
     private const val TARGET_NS = 10_000_000L
     private const val REPORT_MS = 50L
-    private const val SCAN_EVERY = 20 // reports, so once a second
+    private const val SCAN_EVERY = 20
     private const val ENTER = 0.6
-    private const val LEAVE = 0.15 // a capped game's main thread idles to ~30% on a prime core; under 0.3 it hopped back and forth
-    private const val MAX_THREADS = 2 // one per prime core; a third would be sped up in place instead
+    private const val LEAVE = 0.15
+    private const val MAX_THREADS = 2
     private const val TOP_PROCESSES = 3
     private const val PACE_WINDOW_S = 3
     private const val PACE_LEAVE_S = 10
@@ -65,14 +65,12 @@ object GameThreadHints {
     /** The update rate AOSP's example power HAL reports; one that acts on hints reports its own. */
     private const val EXAMPLE_HAL_RATE_NS = 1_000_000L
 
-    /** Busy, but not the game: the app itself and the Steam client, whose UI would otherwise hold the prime cores. */
     private val NOT_GAMES = setOf("steam", "steamwebhelper")
 
     private var worker: Thread? = null
     /** The worker stop() interrupted, which may still be undoing its QoS levels and affinities. */
     private var retired: Thread? = null
 
-    /** At a session's start. The line is for the log. */
     @Synchronized
     fun start(context: Context): String {
         if (!SessionPrefs.gameThreadHints(context)) return "game thread hints: off"
@@ -121,7 +119,6 @@ object GameThreadHints {
         run(hm, pm, qos, steer)
     }
 
-    /** At a session's end. */
     @Synchronized
     fun stop() {
         worker?.interrupt()
@@ -237,10 +234,6 @@ object GameThreadHints {
     internal fun holdsPace(fps: Double, refreshHz: Double, fpsLimit: Int = 0): Boolean =
         fps >= 10 && listOf(refreshHz, fpsLimit.toDouble()).any { rate -> rate > 0 && abs(fps - rate) < PACE_TOLERANCE * rate }
 
-    /**
-     * The threads to boost next: those already boosted that are still above [LEAVE], then new ones
-     * above [ENTER], busiest first, at most [MAX_THREADS].
-     */
     internal fun pick(boosted: Set<Int>, busy: Map<Int, Double>): Set<Int> =
         busy.entries
             .filter { (tid, share) -> share >= if (tid in boosted) LEAVE else ENTER }
@@ -251,7 +244,6 @@ object GameThreadHints {
 
     private fun readName(path: String) = try { File(path).readText().trim() } catch (_: Exception) { "?" }
 
-    /** Busy shares of this UID's threads since the last sample: /proc shows an app only its own processes. */
     private class Scanner {
         private val self = Process.myPid()
         private val hz = Os.sysconf(OsConstants._SC_CLK_TCK).toDouble()
@@ -302,7 +294,6 @@ object GameThreadHints {
             return busy
         }
 
-        /** utime + stime of a /proc stat line; fields counted after the command's closing parenthesis. */
         private fun cpuTicks(path: String): Long? = try {
             val line = File(path).readText()
             val fields = line.substring(line.lastIndexOf(')') + 2).split(' ')

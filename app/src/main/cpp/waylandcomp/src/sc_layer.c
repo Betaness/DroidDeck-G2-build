@@ -1210,7 +1210,7 @@ void sc_layer_hide_overlay(void) {
 }
 
 void sc_layer_window_gone(void) {
-    base_hide(1); /* the backdrop belongs to the old window, just like GAME and OVERLAY */
+    base_hide(1);
     if (api.state != 1) return;
     layers_init();
     vku_idle(); /* its passes may still be writing pool buffers */

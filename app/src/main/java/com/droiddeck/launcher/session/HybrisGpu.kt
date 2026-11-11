@@ -9,7 +9,8 @@ import java.io.File
  * driver themselves through libhybris and show their frames on the compositor's zero-copy layers,
  * instead of forwarding every call to [VortekServerComponent]; the Steam client stays on Vortek.
  *
- * Session pref gpuPath = "hybris" turns it on, "vortek" off; unset, it is on where it was measured, the Xring O3
+ * Session pref gpuPath = "hybris" turns it on, "vortek" off ("upstream" leaves the session to upstream's own Mali
+ * routes, see DeviceSupport.ownMaliPath); unset, it is on where it was measured, the Xring O3
  * (half-resolution Duckov title 82.1 instead of 75.8 fps at the same heat; 32-bit games under WoW64 such as A.V.A.
  * get their low mappings from mali-g2/hybris/src/placed.c). The session then sees the Android system tree (the
  * driver, Android's libvulkan and libnativewindow come from it) and gets [ENV];
@@ -18,6 +19,8 @@ import java.io.File
  */
 object HybrisGpu {
     const val PATH = "hybris"
+    /** gpuPath value that turns this build's Mali path off altogether: upstream's Mali bridge, Venus or driver pair run instead. */
+    const val UPSTREAM = "upstream"
     const val ENV = "DROIDDECK_GPU_PATH"
     const val GUEST_DIR = "/usr/local/lib/droiddeck-hybris"
     const val GUEST_ICD = "$GUEST_DIR/droiddeck_hybris_icd.aarch64.json"

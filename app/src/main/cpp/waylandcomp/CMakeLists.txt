@@ -14,6 +14,7 @@ add_library(droiddeckwayland SHARED
         src/gpu_clock_pin.c
         src/droiddeck_ext.c
         src/wl_dmabuf.c
+        src/wl_android_buffer.c
         src/wl_clipboard.c
         src/wl_text_input.c
         src/wl_x11_type.c
@@ -22,9 +23,11 @@ add_library(droiddeckwayland SHARED
         src/wl_color_mgmt.c
         src/hdr_compose.c
         src/blend_pass.c
+        src/gpu_busy.c
         generated/color-management-v1-protocol.c
         generated/xdg-shell-protocol.c
         generated/linux-dmabuf-v1-protocol.c
+        generated/wayland-android-protocol.c
         generated/viewporter-protocol.c
         generated/banner-desktop-v1-protocol.c
         generated/presentation-time-protocol.c
@@ -47,6 +50,7 @@ target_include_directories(droiddeckwayland PRIVATE
         prebuilt/include
         src
         ${CMAKE_CURRENT_SOURCE_DIR}/../shaders
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/gpuload/src
 )
 
 set(DROIDDECK_FRAMEGEN_LSFG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../framegen/lsfg)

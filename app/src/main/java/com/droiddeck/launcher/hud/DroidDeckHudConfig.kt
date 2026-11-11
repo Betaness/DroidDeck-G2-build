@@ -3,24 +3,18 @@ package com.droiddeck.launcher.hud
 import android.content.Context
 import com.droiddeck.launcher.session.SessionPrefs
 
-/** DroidDeck HUD's settings as one "key=value,…" string (DroidDeckHudView.applyConfig), stored in SessionPrefs. */
 internal object DroidDeckHudConfig {
-    /**
-     * Bannerlator's defaults (DeckOverlaySettings), with the FPS graph from the old DroidDeck HUD. The HUD starts
-     * locked, so like the old HUD it lets touches through until it is unlocked to move it.
-     */
     val DEFAULTS: Map<String, String> = linkedMapOf(
-        "hudSize" to "minimal", "hudLocked" to "1", "hudScale" to "100", "hudDock" to "none", "hudOpacity" to "80", "hudColor" to "mid",
+        "hudSize" to "minimal", "hudLocked" to "1", "hudSnap" to "1", "hudScale" to "100", "hudDock" to "none", "hudOpacity" to "80", "hudColor" to "mid",
         "hudOutline" to "40", "hudOutlineAccent" to "1",
         "showFPS" to "1", "showFPSGraph" to "1", "showCPUUsage" to "1", "showCPULoad" to "1", "showGPULoad" to "1",
         "showVram" to "1", "showRAM" to "1", "showPower" to "1", "showTemp" to "1", "showBatteryTemp" to "1",
-        "showGpuTemp" to "0", "showBattery" to "0", "showLow001" to "1", "fpsDecimal" to "1", "showPerCore" to "1",
+        "showGpuTemp" to "0", "showBattery" to "0", "showLow1" to "1", "showLow01" to "1", "showLow001" to "1", "fpsDecimal" to "1", "showPerCore" to "1",
         "showSwap" to "1", "showNet" to "1", "showResolution" to "1", "showProton" to "1", "showSession" to "1",
         "showClock" to "1", "showEngine" to "1", "showRenderer" to "1", "showGpuModel" to "1",
         "tempUnit" to "c", "tempBands" to "1", "tempAuto" to "1", "tempRedCpu" to "90", "tempRedGpu" to "90", "tempRedBat" to "48",
     )
 
-    /** Switches Bannerlator sets together (DeckOverlaySettings twins). */
     private val TWINS = mapOf("showCPUUsage" to "showCPULoad", "showTemp" to "showBatteryTemp", "showEngine" to "showRenderer")
 
     fun load(context: Context): MutableMap<String, String> {

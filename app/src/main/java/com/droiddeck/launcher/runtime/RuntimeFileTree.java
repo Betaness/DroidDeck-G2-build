@@ -169,13 +169,6 @@ public final class RuntimeFileTree {
         return false;
     }
 
-    /**
-     * Moves each user path that exists in {@code from} into {@code to}, replacing what {@code to} ships there. With
-     * {@code onlyMissing}, a path already present in {@code to} is left alone. On failure the paths already moved go back
-     * before the exception is thrown. Rollback failures are suppressed on that exception; callers must retain the source
-     * of any incomplete rollback.
-     * Returns the moved paths.
-     */
     static java.util.List<String> carryUserData(File from, File to, boolean onlyMissing) throws IOException {
         return carryUserData(from, to, onlyMissing, new java.util.ArrayList<>(userPaths(from, to)));
     }
@@ -201,7 +194,6 @@ public final class RuntimeFileTree {
         return moved;
     }
 
-    /** Puts the given paths back from {@code from} into {@code to}; failures are collected, not stopped on. */
     static void carryBack(File from, File to, java.util.List<String> paths) throws IOException {
         IOException failed = null;
         for (int i = paths.size() - 1; i >= 0; i--) {

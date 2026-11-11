@@ -14,6 +14,7 @@
 int bl_status_without_tracer(const char *path, int flags, const void *caller) __attribute__((visibility("hidden")));
 int bl_writable_retry(int dirfd, const char *path, int flags) __attribute__((visibility("hidden")));
 int bl_ntsync_open(const char *path, int flags) __attribute__((visibility("hidden")));
+const char *bl_oom_adj_redirect(const char *path, int writing) __attribute__((visibility("hidden")));
 int bl_venc_open(const char *path, int flags) __attribute__((visibility("hidden")));
 const char *bl_oom_adj_redirect(const char *path, int writing) __attribute__((visibility("hidden")));
 int bl_vdec_open(const char *path, int flags) __attribute__((visibility("hidden")));

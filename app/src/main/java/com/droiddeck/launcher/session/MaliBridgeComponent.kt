@@ -12,7 +12,8 @@ import java.io.File
  *
  * Its server, lib/arm64-v8a/libvkbridge_server.so, is a bionic executable like Vortek's: it loads
  * the system Vulkan loader and runs the calls the guest ICD (libvulkan_droidbridge.so) sends over a
- * unix socket. The binaries come from the pinned MaliBridge release (see .github/workflows/build.yml).
+ * unix socket. The binaries are built from the external/MaliBridge submodule, as upstream's own Mali bridge
+ * uses them (app/build.gradle builds the server, tools/components/recipes/vkbridge.sh the guest ICD).
  * The socket is filesDir/.wayland-rt/vkbridge/S, which the guest sees as [GUEST_SOCKET]. The server
  * runs a self-test before it listens, so start() waits for the socket.
  */
