@@ -2820,6 +2820,9 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (joyConVr?.onKeyEvent(event) == true) return true
         if (fromController && event.keyCode != KeyEvent.KEYCODE_BACK && padMouseMode() && padMouse.onKey(event)) return true
         if (event.keyCode != KeyEvent.KEYCODE_BACK && padBridge?.onKeyEvent(event) == true) return true
+        // [mali-g2] Upstream's keyboard Esc just below, but recorded, so its release still reaches the game when the
+        // panel that kept it from the check above closed before the key came up (BackQamInput would swallow it).
+        if (CompositorHost.isStarted && keyboardEscapeInput.onKeyEvent(event, toGuest = true)) return true
         val keyboardKey = event.keyCode != KeyEvent.KEYCODE_BACK ||
             com.droiddeck.launcher.input.GuestKeys.isKeyboardEscape(event.keyCode, event.scanCode)
         if (CompositorHost.isStarted && keyboardKey && !fromController) {
