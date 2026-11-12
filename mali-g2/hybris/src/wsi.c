@@ -722,7 +722,7 @@ static bool waitOnGpu(Swapchain* sc, int fd, VkSemaphore signalSemaphore, VkFenc
     }
     if (!wait) {
         wait = &sc->acquireWaits[sc->nextAcquireWait];
-        if (device->WaitForFences(device->handle, 1, &wait->fence, VK_TRUE, 2000000000ull) != VK_SUCCESS) return false;
+        if (icd_wait_fences(device, 1, &wait->fence, VK_TRUE, 2000000000ull) != VK_SUCCESS) return false;
     }
     sc->nextAcquireWait = (uint32_t)(wait - sc->acquireWaits + 1) % ACQUIRE_WAITS;
 
@@ -910,7 +910,7 @@ static VkResult presentToCompositor(Swapchain* sc, VkQueue queue, uint32_t index
     fdInfo.fence = fence;
     fdInfo.handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
     if (device->GetFenceFdKHR(device->handle, &fdInfo, &fd) != VK_SUCCESS) {
-        device->WaitForFences(device->handle, 1, &fence, VK_TRUE, 1000000000ull);
+        icd_wait_fences(device, 1, &fence, VK_TRUE, 1000000000ull);
         fd = -1;
     }
     device->DestroyFence(device->handle, fence, NULL);
@@ -1500,7 +1500,7 @@ static VkResult presentCovered(Swapchain* sc, VkQueue queue, const VkPresentInfo
         *waitedSemaphores = true;
     }
     VkResult result = icd_queue_submit(device, queue, 1, &submitInfo, sc->fence);
-    if (result == VK_SUCCESS) result = device->WaitForFences(device->handle, 1, &sc->fence, VK_TRUE, UINT64_MAX);
+    if (result == VK_SUCCESS) result = icd_wait_fences(device, 1, &sc->fence, VK_TRUE, UINT64_MAX);
     if (result == VK_SUCCESS) device->ResetFences(device->handle, 1, &sc->fence);
     double now = nowSeconds(), next = sc->lastCoveredFrame + 1.0 / COVERED_FPS;
     bool slept = false;
@@ -1773,7 +1773,7 @@ static VkResult presentOne(Swapchain* sc, VkQueue queue, uint32_t family, const 
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &sc->commandBuffers[imageIndex % sc->imageCount];
     VkResult result = icd_queue_submit(device, queue, 1, &submitInfo, sc->fence);
-    if (result == VK_SUCCESS) result = device->WaitForFences(device->handle, 1, &sc->fence, VK_TRUE, UINT64_MAX);
+    if (result == VK_SUCCESS) result = icd_wait_fences(device, 1, &sc->fence, VK_TRUE, UINT64_MAX);
     if (result == VK_SUCCESS) device->ResetFences(device->handle, 1, &sc->fence);
 
     xcb_get_geometry_reply_t* geometry = xcb_get_geometry_reply(sc->surface->conn, geometryCookie, NULL);
@@ -1814,7 +1814,7 @@ static void destroySwapchain(Swapchain* sc) {
                 (unsigned long long)sc->presentCount);
     for (int i = 0; i < ACQUIRE_WAITS; i++) {
         AcquireWait* wait = &sc->acquireWaits[i];
-        if (wait->pending) device->WaitForFences(device->handle, 1, &wait->fence, VK_TRUE, 2000000000ull);
+        if (wait->pending) icd_wait_fences(device, 1, &wait->fence, VK_TRUE, 2000000000ull);
         if (wait->semaphore) device->DestroySemaphore(device->handle, wait->semaphore, NULL);
         if (wait->fence) device->DestroyFence(device->handle, wait->fence, NULL);
     }

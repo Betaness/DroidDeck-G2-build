@@ -71,6 +71,7 @@
 #include "pipeline_cache.h"
 #define CMDMEM_LOG(fmt, ...) fprintf(stderr, "hybris-icd: " fmt "\n", ##__VA_ARGS__)
 #include "cmd_memory.h"
+#include "crash_guard.h"
 #include "xfb_stats.h"
 
 #define XFB_TAG "hybris-icd"
@@ -322,7 +323,7 @@ static VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice handle, VkPipelineCa
         copy[i].pStages = rewrites[i].stages;
         any = true;
     }
-    VkResult result = device->CreateGraphicsPipelines(handle, use, count, any ? copy : infos, allocator, pipelines);
+    VkResult result = guards_create_graphics_pipelines(device, handle, use, count, any ? copy : infos, allocator, pipelines);
     if (result == VK_SUCCESS) PipelineCache_noteCreated(handle, count, nowNs() - start, use && use != cache);
     if (result >= 0) xfb_stats_pipelines_created(XFB_TAG, count, view, pipelines);
     for (uint32_t i = 0; rewrites && i < count; i++) freeStages(&rewrites[i]);
@@ -351,7 +352,7 @@ static VkResult VKAPI_CALL CreateComputePipelines(VkDevice handle, VkPipelineCac
             any = true;
         }
     }
-    VkResult result = device->CreateComputePipelines(handle, use, count, any ? copy : infos, allocator, pipelines);
+    VkResult result = guards_create_compute_pipelines(device, handle, use, count, any ? copy : infos, allocator, pipelines);
     if (result == VK_SUCCESS) PipelineCache_noteCreated(handle, count, nowNs() - start, use && use != cache);
     for (uint32_t i = 0; rewrites && i < count; i++) freeStages(&rewrites[i]);
     free(rewrites);
@@ -667,11 +668,13 @@ static PFN_vkVoidFunction trackedNext[T_COUNT];
 static VkResult VKAPI_CALL BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* info) {
     PFN_vkResetCommandBuffer reset = __atomic_load_n(&nextResetCommandBuffer, __ATOMIC_ACQUIRE);
     if (cmdmem_begin(commandMemory, KEY(commandBuffer)) && reset) reset(commandBuffer, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
-    return NEXT(T_BEGIN, PFN_vkBeginCommandBuffer)(commandBuffer, info);
+    VkResult result = NEXT(T_BEGIN, PFN_vkBeginCommandBuffer)(commandBuffer, info);
+    if (result == VK_SUCCESS) guards_command_buffer_begun(commandBuffer);
+    return result;
 }
 
 static VkResult VKAPI_CALL EndCommandBuffer(VkCommandBuffer commandBuffer) {
-    VkResult result = NEXT(T_END, PFN_vkEndCommandBuffer)(commandBuffer);
+    VkResult result = guards_end_command_buffer(NEXT(T_END, PFN_vkEndCommandBuffer), commandBuffer);
     cmdmem_end(commandMemory, KEY(commandBuffer));
     return result;
 }
@@ -775,6 +778,9 @@ PFN_vkVoidFunction mali_device_proc(VkDevice handle, const char* name) {
     if (!strncmp(name, "vkGet", 5) && strstr(name, "SubresourceLayout")) return layoutProc(handle, name);
     if (!strcmp(name, "vkResetCommandPool")) return (PFN_vkVoidFunction)ResetCommandPool;
     if (!strcmp(name, "vkResetCommandBuffer")) return (PFN_vkVoidFunction)ResetCommandBuffer;
+    /* guards.c's recordings and crash guard need these also when the release is at a fixed interval */
+    if ((!strcmp(name, "vkBeginCommandBuffer") && guards_query_visible_on()) || (!strcmp(name, "vkEndCommandBuffer") && crash_guard_on()))
+        return trackedProc(handle, name);
     if (releaseEvery() < 0 && (!strncmp(name, "vkCmd", 5) || strstr(name, "Command"))) return trackedProc(handle, name);
     return NULL;
 }

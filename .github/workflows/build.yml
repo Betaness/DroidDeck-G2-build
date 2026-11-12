@@ -386,6 +386,8 @@ jobs:
           path: hybris-guest
           if-no-files-found: error
           retention-days: 14
+      - name: Unit tests of the hybris guards (no GPU)
+        run: sh mali-g2/hybris/tests/guards_test.sh
 
   build-runner:
     needs: [components]
