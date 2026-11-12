@@ -39,7 +39,7 @@ mono-2.0-bdwgc.dll、Mono 的 JIT 代码……）、FEX 自己（分发器、编
 | `guestsnap.py` | `ids`：游戏进程（同名里线程最多的）、主线程（tid == pid）、wineserver、跟踪它的进程（proot）。`snap DIR`：maps、各线程 CPU 节拍、wineserver 和 proot 的进程 CPU、游戏的 FEX/Wine/DXVK 环境变量、FEX 统计、PE 映像（经 `/proc/<pid>/mem` 读映射起点的 PE 头，找 Wine 读进匿名内存的映像）、FEX 的符号文件（gzip） |
 | `fexstats.py` | 读 `fex-<pid>-stats`：`snap`、`rate PID --seconds S`、`diff A B` |
 | `prof-report.py` | 在主机上跑：`simpleperf dump` 的输出 + 前后两份快照 → 每个线程按类别和模块的样本比例、最热的位置（PE 是 RVA，ELF 是文件偏移，JIT 块是客体模块偏移或客体地址）、/proc 的忙碌和内核占比、wineserver 和 proot 的 CPU、FEX 统计的速率。`--json` 另存结果 |
-| `test_fexprof.py` | `python3 -m unittest discover -s mali-g2/tools/fex-prof` |
+| `tools/tests/test_fex_prof.py` | 测试（CI 的 Python 测试会跑）：`PYTHONPATH=tools/tests python3 -m unittest test_fex_prof` |
 
 ## 设备上怎么做
 

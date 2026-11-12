@@ -1,3 +1,4 @@
+"""mali-g2/tools/fex-prof: FEX stats reader, guest snapshot, profile report and the guest env switch."""
 import gzip
 import importlib.util
 import json
@@ -9,7 +10,8 @@ import sys
 import tempfile
 import unittest
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "mali-g2", "tools", "fex-prof")
+HERE = os.path.normpath(HERE)
 sys.path.insert(0, HERE)
 import fexstats  # noqa: E402
 import guestsnap  # noqa: E402
