@@ -393,6 +393,12 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         sendRight = { down -> heldButtons.set(32, PointerGestures.BTN_RIGHT, down) },
         mouseAttached = ::mouseAttached,
     )
+    /** [mali-g2] A keyboard Esc that Android reports as Back (HyperOS does for every external keyboard) is the game's Esc. */
+    private val keyboardEscapeInput = com.droiddeck.launcher.input.KeyboardEscapeInput(
+        sendEscape = { device, down ->
+            sendGuestKey(com.droiddeck.launcher.input.KeyboardEscapeInput.KEY_ESC, down, if (device <= 0) 16 else 8)
+        },
+    )
     private var drawerDirectionKey = KeyEvent.KEYCODE_UNKNOWN
     private var drawerDirectionDownTime = 0L
     private var drawerDirectionDeviceId = -1
@@ -659,6 +665,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             dropMouseCursor()
             backQamInput.onDeviceRemoved(deviceId)
             mouseBackInput.onDeviceRemoved(deviceId)
+            keyboardEscapeInput.onDeviceRemoved(deviceId) // [mali-g2]
             joyConVr?.refresh()
             physicalInputBindings?.disconnected(deviceId)
             padBridge?.onDeviceRemoved(deviceId)
@@ -2717,6 +2724,14 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
         val mouseToGuest = !pipUi && !appTextFocus && !drawerOpen && !pcKeyboardOpen && !achievementsOpen && !gestureSettingsOpen && !inputSettingsOpen &&
             !SessionState.suspended && !(::loading.isInitialized && (loading.visible || loading.ended))
+        // [mali-g2] Ahead of mouseBackInput and backQamInput, which otherwise take this Back in a Steam session
+        // (drawer on a tap, QAM on a double tap or hold) before upstream's own Esc check further down is reached.
+        if (keyboardEscapeInput.onKeyEvent(event, mouseToGuest && CompositorHost.isStarted)) {
+            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                Log.i(TAG, "back key with the Esc scan code sent to the game as Esc device=${event.deviceId}")
+            }
+            return true
+        }
         if (mouseBackInput.onKeyEvent(event, mouseToGuest)) return true
         val backToQam = !pipUi && !appTextFocus && !drawerOpen && !pcKeyboardOpen && !achievementsOpen &&
             !inputSettingsOpen && !gestureSettingsOpen &&
