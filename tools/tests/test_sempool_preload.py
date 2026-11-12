@@ -7,6 +7,7 @@ import unittest
 from test_usr2_preload import runner
 
 PRELOAD = Path(__file__).resolve().parents[1] / "linuxfs/preload"
+IN_USE = "droiddeck-sempool: preload pool in use."
 
 NTDLL = r"""
 #include <stdint.h>
@@ -335,11 +336,13 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
             cmd = args
         out = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stderr)
+        self.stderr = out.stderr
         creates, closes, others, distinct = map(int, out.stdout.split())
         return creates, closes, others, distinct
 
     def test_create_close_loop_reaches_the_server_once(self):
         self.assertEqual(self.run_program("loop"), (1, 0, 0, 1))
+        self.assertEqual(self.stderr.splitlines().count(IN_USE), 1, self.stderr)
 
     def test_file_io_before_the_first_request_is_not_taken_for_the_server(self):
         self.assertEqual(self.run_program("files-then-loop"), (1, 0, 0, 1))
@@ -374,17 +377,20 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
 
     def test_named_semaphores_always_reach_the_server(self):
         self.assertEqual(self.run_program("named"), (10, 10, 0, 0))
+        self.assertNotIn(IN_USE, self.stderr)
 
     def test_requests_not_sent_by_ntdll_pass_through(self):
         self.assertEqual(self.run_program("outside"), (1, 1, 0, 0))
 
     def test_zero_turns_the_pool_off(self):
         self.assertEqual(self.run_program("loop", protocol="0"), (1000, 1000, 0, 1000))
+        self.assertNotIn(IN_USE, self.stderr)
 
     def test_threads_share_the_pool_without_handing_one_semaphore_to_two_threads(self):
         creates, closes, others, clashes = self.run_program("threads")
         self.assertEqual((closes, others, clashes), (40, 40, 0))
         self.assertTrue(4 <= creates <= 44, creates)
+        self.assertEqual(self.stderr.splitlines().count(IN_USE), 1, self.stderr)
 
     def test_a_forked_child_does_not_use_its_parents_pool(self):
         self.assertEqual(self.run_program("fork"), (2, 0, 0, 1))

@@ -288,6 +288,18 @@ static int sp_channel(int fd) {
   return fstat(fd, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode));
 }
 
+/* [mali-g2] Once per process, when the first semaphore is kept, as ntdll.so of the pool packs does with
+ * its own line; the text differs so that the two pools can be told apart in a game log. */
+static void sp_announce(void) {
+  static int said;
+  static const char line[] = "droiddeck-sempool: preload pool in use.\n";
+  if (__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED)) return;
+  int saved = errno;
+  ssize_t done;
+  do done = sp_real_write(2, line, sizeof line - 1); while (done < 0 && errno == EINTR);
+  errno = saved;
+}
+
 static ssize_t sp_send(int fd, const struct iovec *iov, int n) {
   const unsigned char *req = iov[0].iov_base;
   int code = (int)sp_u32(req);
@@ -305,6 +317,7 @@ static ssize_t sp_send(int fd, const struct iovec *iov, int n) {
     int closed = sp_close(handle, known);
     if (closed == SP_KEPT || closed == SP_GONE) {
       sp_fake(closed == SP_KEPT ? 0 : SP_INVALID_HANDLE, 0);
+      if (closed == SP_KEPT) sp_announce();
       return SP_MSG;
     }
     sp_scan(iov, n, handle);
