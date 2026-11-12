@@ -39,7 +39,11 @@ internal class ComponentsMenu(private val activity: android.app.Activity, privat
             runCatching { ComponentUpdater.settle(activity) }
             val modes = ComponentsManager.COMPONENTS.associateWith { SessionPrefs.componentMode(activity, it) }
             val auto = ComponentsManager.COMPONENTS.associateWith { runCatching { ComponentUpdater.status(activity, it) }.getOrDefault(emptyList()) }
-            val held = if (runCatching { ComponentsManager.autoDxvkHeld(activity) }.getOrDefault(false)) setOf("dxvk") else emptySet()
+            val held = when {
+                runCatching { com.droiddeck.launcher.core.DeviceSupport.ownMaliPath(activity) }.getOrDefault(false) -> ComponentsManager.COMPONENTS.toSet()
+                runCatching { ComponentsManager.autoDxvkHeld(activity) }.getOrDefault(false) -> setOf("dxvk")
+                else -> emptySet()
+            }
             ui.post {
                 compModes = modes
                 compAuto = auto

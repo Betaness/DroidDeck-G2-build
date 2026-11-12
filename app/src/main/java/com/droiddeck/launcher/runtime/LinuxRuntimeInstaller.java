@@ -131,6 +131,11 @@ public final class LinuxRuntimeInstaller {
             String url = json.optString("url", "");
             String sha256 = json.optString("sha256", "");
             if (version.isEmpty() || url.isEmpty() || sha256.isEmpty()) return null;
+            // [mali-g2] A later catalog release is taken only once a build pins it, after it was tested on the device.
+            if (!version.equals(PINNED.version)) {
+                Log.i(TAG, "catalog offers " + version + ": staying on the pinned " + PINNED.version);
+                return PINNED;
+            }
             return new Release(version, url, sha256, json.optLong("size", 0L));
         } catch (Exception e) {
             Log.w(TAG, "catalog: " + e);

@@ -73,8 +73,10 @@ object ComponentUpdater {
         }
     }
 
+    /** [mali-g2] Not on this build's own Mali path: its FEX, DXVK and VKD3D are the ones it was measured with. */
     private fun managed(context: Context, comp: String): Boolean =
-        SessionPrefs.componentMode(context, comp) == ComponentUpdates.AUTO && !(comp == "dxvk" && ComponentsManager.hardwareDxvk(context))
+        SessionPrefs.componentMode(context, comp) == ComponentUpdates.AUTO && !(comp == "dxvk" && ComponentsManager.hardwareDxvk(context)) &&
+            !com.droiddeck.launcher.core.DeviceSupport.ownMaliPath(context)
 
     private fun logLines(context: Context): Sequence<String> {
         val dir = ComponentsManager.steamLogs(context)
