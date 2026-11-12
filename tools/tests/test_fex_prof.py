@@ -303,6 +303,15 @@ class GuestEnv(unittest.TestCase):
             r = self.run_env(home, "unset")
             self.assertEqual(load(f)["games"]["3167020"], {"FEX_DISABLEL2CACHE": "0"})
 
+    def test_unset_drops_the_entry_it_created(self):
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, ".config", "droiddeck"))
+            f = os.path.join(home, ".config", "droiddeck", "game-environment.json")
+            save(f, {"shared": {"A": "1"}})
+            self.assertEqual(self.run_env(home, "set").returncode, 0)
+            self.assertEqual(self.run_env(home, "unset").returncode, 0)
+            self.assertEqual(load(f), {"shared": {"A": "1"}, "games": {}})
+
     def test_refuses_foreign_entries(self):
         with tempfile.TemporaryDirectory() as home:
             os.makedirs(os.path.join(home, ".config", "droiddeck"))

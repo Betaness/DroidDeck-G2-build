@@ -52,7 +52,10 @@ if what == "set":
 elif "FEXPROF_MODE" in g:
     for k in keys:
         g.pop(k, None)
-json.dump(c, open(f + ".fexprof-tmp", "w"), indent=1)
+if not g:
+    del c["games"][appid]
+with open(f + ".fexprof-tmp", "w") as out:
+    json.dump(c, out, indent=1)
 os.replace(f + ".fexprof-tmp", f)
 print("ok games[%s]: %s" % (appid, ", ".join("%s=%s" % (k, g[k]) for k in keys if k in g) or "no profile entries"))
 PY
