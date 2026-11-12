@@ -10,7 +10,8 @@ ids   prints the game process (the one named --comm with the most threads), its 
 snap  writes into DIR: maps.txt (/proc/PID/maps), tasks.json (per thread comm, state, cpu, utime/stime ticks, with a
       CLOCK_MONOTONIC time), ids.json, env.json (the game's FEX_*, WINE*, DXVK_* and Proton variables), fexstats.json
       (fexstats.py snapshot, if FEX keeps stats), pe.json (PE images found at mapping starts through /proc/PID/mem:
-      base, SizeOfImage, machine, export name, mapped file; finds images Wine read into anonymous memory) and
+      base, SizeOfImage, machine, export name, mapped file; finds images Wine read into anonymous memory; only
+      anonymous and regular-file mappings are read, never device or dma-buf ones) and
       perfmap.txt.gz + perfmap.json (FEX's JIT symbol file when FEX_BLOCKJITNAMING/LIBRARYJITNAMING/GLOBALJITNAMING
       is on). FEX's Windows build opens "/tmp/perf-<unix pid>.map" through the C runtime, so Wine resolves it on the
       process's current drive: Z: gives the guest's /tmp, C: the prefix's drive_c/tmp; every drive of the prefix is
@@ -120,6 +121,15 @@ def maps_lines(pid):
     return rows
 
 
+def scannable(name):
+    """Anonymous memory and regular files; not device or dma-buf mappings (GPU memory, doorbells) and not FEX's own."""
+    if name == "":
+        return True
+    if name.startswith("[anon:"):
+        return not name.startswith("[anon:FEX")
+    return name.startswith("/") and not name.startswith(("/dev/", "/dmabuf"))
+
+
 def pe_scan(pid, rows):
     """PE images at mapping starts: [{base, size, machine, name, file}]."""
     images = []
@@ -138,7 +148,7 @@ def pe_scan(pid, rows):
     covered = 0
     with mem:
         for lo, hi, perms, _, name in rows:
-            if lo < covered or perms[0] != "r" or name.startswith("[anon:FEX") or name in ("[vvar]", "[vdso]", "[vsyscall]"):
+            if lo < covered or perms[0] != "r" or not scannable(name):
                 continue
             if peek(lo, 2) != b"MZ":
                 continue

@@ -233,7 +233,7 @@ class GuestSnap(unittest.TestCase):
         except OSError:
             self.skipTest("/proc/self/mem not readable here")
         size = 0x3000
-        buf = mmap.mmap(-1, size)
+        buf = mmap.mmap(-1, size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
         head = bytearray(0x1000)
         head[0:2] = b"MZ"
         struct.pack_into("<I", head, 0x3C, 0x80)
@@ -252,6 +252,9 @@ class GuestSnap(unittest.TestCase):
         buf.write(b"fakepe.dll\0")
         import ctypes
         base = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+        # a read-only header page starts its own mapping, as Wine's image views do
+        libc = ctypes.CDLL(None, use_errno=True)
+        self.assertEqual(libc.mprotect(ctypes.c_void_p(base), 0x1000, mmap.PROT_READ), 0)
         try:
             res = guestsnap.pe_scan(os.getpid(), guestsnap.maps_lines(os.getpid()))
             mine = [i for i in res["images"] if i["base"] == base]
