@@ -105,6 +105,7 @@ typedef struct Device {
     bool swapchainEnabled;
     bool ahb;            /* VK_ANDROID_external_memory_android_hardware_buffer enabled */
     bool syncFd;         /* VK_KHR_external_fence_fd and VK_KHR_external_semaphore_fd enabled */
+    bool vertexStores;   /* vertexPipelineStoresAndAtomics enabled (a guard of pass_barrier.h) */
     uint32_t queueCount;
     VkQueue queues[MAX_QUEUES];
     uint32_t queueFamilies[MAX_QUEUES];

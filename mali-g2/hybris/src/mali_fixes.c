@@ -52,6 +52,12 @@
  *     vkCmdDrawIndirectByteCountEXT calls, logged as "hybris-icd: xfb stats: ..." once something is
  *     counted, for the play journal. Counters only; vkDestroyShaderModule is wrapped for the handles
  *     of modules that declare it.
+ *   - DROIDDECK_HYBRIS_PASS_BARRIER=log|narrow|narrow-rt|nogeo (pass_barrier.h): vkCmdPipelineBarrier2
+ *     and ...2KHR are wrapped to count DXVK's end-of-render-pass barriers and, in the narrowing modes,
+ *     drop the vertex pipeline stages from their destination. Shader code the driver gets (modules,
+ *     inline stages, identifier queries) is scanned for the guards. Unset or off: nothing is wrapped
+ *     or scanned. A line "hybris-icd: pass barrier: ..." every DROIDDECK_HYBRIS_PASS_BARRIER_LOG_S
+ *     seconds (60) of presents, and at device destruction.
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
@@ -72,8 +78,56 @@
 #define CMDMEM_LOG(fmt, ...) fprintf(stderr, "hybris-icd: " fmt "\n", ##__VA_ARGS__)
 #include "cmd_memory.h"
 #include "xfb_stats.h"
+#include "pass_barrier.h"
 
 #define XFB_TAG "hybris-icd"
+
+static uint64_t nowNs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* ---- DROIDDECK_HYBRIS_PASS_BARRIER: state; the wrappers are further down ---- */
+
+static PbMode pbMode;
+static uint32_t pbLogSeconds = 60;
+static pthread_once_t pbOnce = PTHREAD_ONCE_INIT;
+static uint32_t pbXfb, pbVertexStores, pbGeoImageReads; /* guards (atomic) */
+static PbCounts pbTotal;                                /* atomic fields */
+static uint64_t pbGeoImageCode, pbPresents, pbStartNs, pbLastLogNs, pbLoggedCalls = UINT64_MAX;
+
+static void pbReadMode(void) {
+    const char* text = getenv("DROIDDECK_HYBRIS_PASS_BARRIER");
+    bool unknown;
+    pbMode = pb_parse_mode(text, &unknown);
+    if (unknown) fprintf(stderr, "hybris-icd: DROIDDECK_HYBRIS_PASS_BARRIER=%s ignored (off, log, narrow, narrow-rt or nogeo)\n", text);
+    if (pbMode == PB_OFF) return;
+    int seconds = icd_env_int("DROIDDECK_HYBRIS_PASS_BARRIER_LOG_S", 60);
+    pbLogSeconds = seconds > 0 ? (uint32_t)seconds : 60;
+    pbStartNs = pbLastLogNs = nowNs();
+    fprintf(stderr, "hybris-icd: DROIDDECK_HYBRIS_PASS_BARRIER=%s, counts every %u s\n", pb_mode_names[pbMode], pbLogSeconds);
+}
+
+static PbMode pbModeNow(void) {
+    pthread_once(&pbOnce, pbReadMode);
+    return pbMode;
+}
+
+/* Shader code handed to the driver (`what`, and the module's handle when there is one): the guards. */
+static void pbShaderSeen(const VkShaderModuleCreateInfo* info, const char* what, uint64_t handle) {
+    if (pbModeNow() == PB_OFF || !info || !info->pCode) return;
+    size_t words = info->codeSize / 4;
+    char at[24] = "";
+    if (handle) snprintf(at, sizeof(at), " 0x%llx", (unsigned long long)handle);
+    if (!__atomic_load_n(&pbXfb, __ATOMIC_RELAXED) && xfb_spirv_declares(info->pCode, words) &&
+        !__atomic_exchange_n(&pbXfb, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "hybris-icd: pass barrier guard: transform feedback (%s%s)\n", what, at);
+    if (!pb_spirv_geo_image_reads(info->pCode, words)) return;
+    __atomic_add_fetch(&pbGeoImageCode, 1, __ATOMIC_RELAXED);
+    if (!__atomic_exchange_n(&pbGeoImageReads, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "hybris-icd: pass barrier guard: vertex pipeline image reads (%s%s)\n", what, at);
+}
 
 static void* findInChain(const void* chain, VkStructureType type) {
     for (const VkBaseInStructure* s = chain; s; s = s->pNext)
@@ -208,7 +262,10 @@ static VkResult VKAPI_CALL CreateShaderModule(VkDevice handle, const VkShaderMod
     uint32_t* code = NULL;
     VkResult result = device->CreateShaderModule(handle, rewriteShader(info, &rewritten, &code) ? &rewritten : info, allocator, module);
     free(code);
-    if (result == VK_SUCCESS) xfb_stats_module_created((uint64_t)*module, info);
+    if (result == VK_SUCCESS) {
+        xfb_stats_module_created((uint64_t)*module, info);
+        pbShaderSeen(info, "shader module", (uint64_t)*module);
+    }
     return result;
 }
 
@@ -280,12 +337,6 @@ static void freeStages(StagesRewrite* r) {
     free(r->stages);
 }
 
-static uint64_t nowNs(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
 /* Inline stage code (DXVK 3.x, pipeline libraries): stages with a VkShaderModuleCreateInfo in their
  * pNext chain are copied with the rewritten code. Without a cache of the application's, pipelines
  * go through the persistent one (pipeline_cache_hybris.c).
@@ -311,6 +362,8 @@ static VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice handle, VkPipelineCa
     }
     const VkGraphicsPipelineCreateInfo* view = copy ? copy : infos; /* pStages safe to read */
     VkPipelineCache use = PipelineCache_forGraphics(handle, cache, view, count);
+    for (uint32_t i = 0; i < count && pbModeNow() != PB_OFF; i++)
+        for (uint32_t s = 0; view[i].pStages && s < view[i].stageCount; s++) pbShaderSeen(dd_inline_module(view[i].pStages[s].pNext), "inline stage", 0);
     uint64_t start = nowNs();
     bool inline_ = false;
     for (uint32_t i = 0; i < count && rewritesOn() && !inline_; i++) inline_ = anyInline(view[i].pStages, view[i].stageCount);
@@ -399,6 +452,7 @@ static void VKAPI_CALL GetShaderModuleCreateInfoIdentifierEXT(VkDevice handle, c
     uint32_t* code = NULL;
     device->GetShaderModuleCreateInfoIdentifierEXT(handle, rewriteShader(info, &rewritten, &code) ? &rewritten : info, identifier);
     free(code);
+    pbShaderSeen(info, "identifier query", 0);
 }
 
 static void fixRowPitch(VkSubresourceLayout* layout) {
@@ -562,19 +616,25 @@ static void keepNext(void* slot, PFN_vkVoidFunction function) {
     if (function) __atomic_compare_exchange_n((void**)slot, &expected, (void*)function, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
 }
 
+static void pbLog(bool force);
+
 void mali_device_created(Device* device) {
     releaseEvery(); /* before the device's first pool */
     keepNext(&nextResetCommandBuffer, (PFN_vkVoidFunction)device->ResetCommandBuffer);
     xfb_stats_device_created();
+    if (pbModeNow() != PB_OFF && device->vertexStores && !__atomic_exchange_n(&pbVertexStores, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "hybris-icd: pass barrier guard: vertexPipelineStoresAndAtomics enabled\n");
 }
 
 void mali_device_destroyed(Device* device) {
     cmdmem_device_destroyed(commandMemory, (uint64_t)(uintptr_t)device->handle);
     xfb_stats_flush(XFB_TAG);
+    if (pbModeNow() != PB_OFF) pbLog(true);
 }
 
 void mali_presented(void) {
     xfb_stats_present(XFB_TAG);
+    if (pbModeNow() != PB_OFF && !(__atomic_add_fetch(&pbPresents, 1, __ATOMIC_RELAXED) & 7)) pbLog(false);
 }
 
 /* ---- stream output counts (xfb_stats.h): the driver's two commands, kept like the reset's ---- */
@@ -605,6 +665,70 @@ static PFN_vkVoidFunction xfbProc(VkDevice handle, const char* name, void* slot,
     if (!driver) return NULL;
     keepNext(slot, driver);
     return wrapper;
+}
+
+/* ---- DROIDDECK_HYBRIS_PASS_BARRIER (pass_barrier.h): the driver's barrier commands, kept like the reset's ---- */
+
+static PFN_vkCmdPipelineBarrier2 nextPipelineBarrier2, nextPipelineBarrier2KHR;
+
+/* The counts so far, unless (`force` aside) the interval has not passed, or no barrier came since the
+ * last line. */
+static void pbLog(bool force) {
+    uint64_t now = nowNs(), last = __atomic_load_n(&pbLastLogNs, __ATOMIC_RELAXED);
+    if (!force && (now - last < pbLogSeconds * 1000000000ull ||
+                   !__atomic_compare_exchange_n(&pbLastLogNs, &last, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)))
+        return;
+    if (force) __atomic_store_n(&pbLastLogNs, now, __ATOMIC_RELAXED);
+    uint64_t calls = __atomic_load_n(&pbTotal.calls, __ATOMIC_RELAXED);
+    if (__atomic_exchange_n(&pbLoggedCalls, calls, __ATOMIC_RELAXED) == calls) return;
+    fprintf(stderr,
+            "hybris-icd: pass barrier: pid %d, mode %s, seconds %llu, presents %llu, calls %llu, global %llu, global-writes %llu, "
+            "attachment %llu, frag-to-geo %llu, narrowed %llu, global-dst 0x%llx, attachment-dst 0x%llx, geo-image-code %llu, "
+            "guards xfb %d vertex-stores %d geo-image-reads %d\n",
+            (int)getpid(), pb_mode_names[pbMode], (unsigned long long)((now - pbStartNs) / 1000000000ull),
+            (unsigned long long)__atomic_load_n(&pbPresents, __ATOMIC_RELAXED), (unsigned long long)calls,
+            (unsigned long long)__atomic_load_n(&pbTotal.global, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&pbTotal.globalWrites, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&pbTotal.attachment, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&pbTotal.fragToGeo, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&pbTotal.narrowed, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&pbTotal.globalDst, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&pbTotal.attachmentDst, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&pbGeoImageCode, __ATOMIC_RELAXED),
+            __atomic_load_n(&pbXfb, __ATOMIC_RELAXED) || __atomic_load_n(&xfbStats.pipelines, __ATOMIC_RELAXED) ? 1 : 0,
+            (int)__atomic_load_n(&pbVertexStores, __ATOMIC_RELAXED), (int)__atomic_load_n(&pbGeoImageReads, __ATOMIC_RELAXED));
+}
+
+static void pbAdd(uint64_t* total, uint64_t n) {
+    if (n) __atomic_add_fetch(total, n, __ATOMIC_RELAXED);
+}
+
+static void passBarrier(PFN_vkCmdPipelineBarrier2 next, VkCommandBuffer commandBuffer, const VkDependencyInfo* info) {
+    PbGuards guards = {
+        .xfb = __atomic_load_n(&pbXfb, __ATOMIC_RELAXED) || __atomic_load_n(&xfbStats.pipelines, __ATOMIC_RELAXED),
+        .vertexStores = __atomic_load_n(&pbVertexStores, __ATOMIC_RELAXED),
+        .geoImageReads = __atomic_load_n(&pbGeoImageReads, __ATOMIC_RELAXED),
+    };
+    PbCounts n = {0};
+    PbCopy copy;
+    next(commandBuffer, pb_rewrite(pbMode, &guards, info, &copy, &n));
+    free(copy.heap);
+    pbAdd(&pbTotal.calls, n.calls);
+    pbAdd(&pbTotal.global, n.global);
+    pbAdd(&pbTotal.globalWrites, n.globalWrites);
+    pbAdd(&pbTotal.attachment, n.attachment);
+    pbAdd(&pbTotal.fragToGeo, n.fragToGeo);
+    pbAdd(&pbTotal.narrowed, n.narrowed);
+    if (n.globalDst) __atomic_store_n(&pbTotal.globalDst, n.globalDst, __ATOMIC_RELAXED);
+    if (n.attachmentDst) __atomic_store_n(&pbTotal.attachmentDst, n.attachmentDst, __ATOMIC_RELAXED);
+}
+
+static void VKAPI_CALL CmdPipelineBarrier2(VkCommandBuffer commandBuffer, const VkDependencyInfo* info) {
+    passBarrier(__atomic_load_n(&nextPipelineBarrier2, __ATOMIC_ACQUIRE), commandBuffer, info);
+}
+
+static void VKAPI_CALL CmdPipelineBarrier2KHR(VkCommandBuffer commandBuffer, const VkDependencyInfo* info) {
+    passBarrier(__atomic_load_n(&nextPipelineBarrier2KHR, __ATOMIC_ACQUIRE), commandBuffer, info);
 }
 
 static VkResult VKAPI_CALL ResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags) {
@@ -767,6 +891,10 @@ PFN_vkVoidFunction mali_device_proc(VkDevice handle, const char* name) {
         return xfbProc(handle, name, &nextBeginTransformFeedback, (PFN_vkVoidFunction)CmdBeginTransformFeedbackEXT);
     if (!strcmp(name, "vkCmdDrawIndirectByteCountEXT"))
         return xfbProc(handle, name, &nextDrawIndirectByteCount, (PFN_vkVoidFunction)CmdDrawIndirectByteCountEXT);
+    if (!strcmp(name, "vkCmdPipelineBarrier2"))
+        return pbModeNow() != PB_OFF ? xfbProc(handle, name, &nextPipelineBarrier2, (PFN_vkVoidFunction)CmdPipelineBarrier2) : NULL;
+    if (!strcmp(name, "vkCmdPipelineBarrier2KHR"))
+        return pbModeNow() != PB_OFF ? xfbProc(handle, name, &nextPipelineBarrier2KHR, (PFN_vkVoidFunction)CmdPipelineBarrier2KHR) : NULL;
     if (!strcmp(name, "vkCreateGraphicsPipelines")) return (PFN_vkVoidFunction)CreateGraphicsPipelines;
     if (!strcmp(name, "vkCreateComputePipelines")) return (PFN_vkVoidFunction)CreateComputePipelines;
     if (!strcmp(name, "vkCreateRayTracingPipelinesKHR") || !strcmp(name, "vkGetShaderModuleCreateInfoIdentifierEXT"))

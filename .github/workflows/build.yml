@@ -386,6 +386,13 @@ jobs:
           path: hybris-guest
           if-no-files-found: error
           retention-days: 14
+      - name: Tests of DROIDDECK_HYBRIS_PASS_BARRIER (no GPU; lavapipe behind the ICD)
+        run: |
+          set -euo pipefail
+          cc -O2 -Wall -Wextra -Werror -Imali-g2/hybris/src -o /tmp/pass_barrier_test mali-g2/hybris/tests/pass_barrier_test.c
+          /tmp/pass_barrier_test
+          sudo apt-get install -y -qq mesa-vulkan-drivers >/dev/null
+          OUT="$PWD/hybris-guest" sh mali-g2/hybris/tests/pass_barrier_icd_test.sh
 
   build-runner:
     needs: [components]

@@ -488,6 +488,8 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDevic
     device->physical = physical;
     device->instance = instance;
     device->placed = placed;
+    device->vertexStores = info->pEnabledFeatures ? info->pEnabledFeatures->vertexPipelineStoresAndAtomics
+                                                  : chained && chained->features.vertexPipelineStoresAndAtomics;
     for (uint32_t i = 0; i < placed_need_count; i++) device->placed = device->placed && named(names, count, placed_needs[i]);
 #define X(name) device->name = (PFN_vk##name)instance->GetDeviceProcAddr(*out, "vk" #name);
     DEVICE_FUNCS(X)
