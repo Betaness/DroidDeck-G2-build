@@ -129,6 +129,13 @@ class ExitClassifierTest {
         assertEquals(null, ExitClassifier.keepFor(listOf("no_sempool")))
     }
 
+    @Test fun thePreloadPoolStandingInForAPackIsNotFlagged() {
+        val said = "droiddeck-esync: pack valve-r1 for Proton Experimental (ARM64) (1 v, exact match); droiddeck-ntsync off, " +
+            "droiddeck-esync on, fds 33368/524288, preload semaphore pool on (this pack has none; create_semaphore 40, close_handle 21)"
+        assertEquals(emptyList<String>(), ExitClassifier.classify(ev(semPool = "preload")).flags)
+        assertEquals(emptyList<String>(), ExitClassifier.classify(ev(f = findings(session = listOf(said)))).flags)
+    }
+
     @Test fun halfAMinuteWithoutFramesWhileLoadingIsNotAFreeze() {
         // A.V.A.: its first frame, then 30 s of loading behind it.
         fun freeze(all: Long, afterLoad: Long) = "freeze" in ExitClassifier.classify(ExitClassifier.Evidence(

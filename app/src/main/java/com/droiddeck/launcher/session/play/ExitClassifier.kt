@@ -41,7 +41,10 @@ object ExitClassifier {
         val runMode: Boolean = false,
         /** The session's fps cap; a game held to 20 fps on purpose is not slow. */
         val fpsLimit: Int? = null,
-        /** BL_SYNC_SEMPOOL from the game's environment: on, off or none (a droiddeck-esync pack without the pool); null when unknown. */
+        /**
+         * BL_SYNC_SEMPOOL from the game's environment: on (the pack's pool), preload (libblsession.so's pool, where no pack with
+         * the pool fits the Proton build), off (turned off, or a pool pack this launch does not use) or none; null when unknown.
+         */
         val semPool: String? = null,
     )
 

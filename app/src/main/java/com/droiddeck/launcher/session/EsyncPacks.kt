@@ -425,7 +425,8 @@ object EsyncPacks {
     internal fun reportPoolless(store: File, tools: List<ToolState>): List<ToolState> = poolless(store, tools).filter { tool ->
         if (!poolsReported.add("${tool.toolDir}\t${tool.packId}")) return@filter false
         Log.w(TAG, "sync pack ${tool.packId} for ${tool.versionLine.ifEmpty { tool.toolDir }} has no semaphore pool: no pack with the " +
-            "pool matches this Proton build yet, so every anonymous semaphore is a wineserver round trip")
+            "pool matches this Proton build yet; games get libblsession.so's pool instead where droiddeck-esync finds the wineserver's " +
+            "request numbers (BL_SYNC_SEMPOOL=preload)")
         SessionEvents.record("sync.pool", mapOf("id" to tool.packId, "proton" to tool.versionLine, "result" to "missing"))
         true
     }
