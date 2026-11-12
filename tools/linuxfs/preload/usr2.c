@@ -38,6 +38,10 @@ __attribute__((visibility("hidden"))) int bl_from_ntdll(const void *caller) {
   return pc >= lo && pc < __atomic_load_n(&ntdll_hi, __ATOMIC_RELAXED);
 }
 
+__attribute__((visibility("hidden"))) int bl_ntdll_known(void) {
+  return __atomic_load_n(&ntdll_lo, __ATOMIC_ACQUIRE) != 0;
+}
+
 #if defined(__aarch64__)
 #include <asm/hwcap.h>
 #include <asm/sigcontext.h>
