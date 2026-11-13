@@ -22,6 +22,16 @@ done
 if grep -qx drmIoctl <<<"$SESSION"; then
   echo "::error::libblsession.so exports drmIoctl"; exit 1
 fi
+# With LD_AUDIT set (droiddeck-proton), glibc loads the preloads after it has sized the static TLS block, so
+# initial-exec TLS in libblsession.so fails every program with "cannot allocate memory in static TLS block".
+for lib in "$D/libblsession.so" "$D/x86_64/libblsession.so" "$D/i386/libblsession.so"; do
+  [ -f "$lib" ] || continue
+  REL=$("${READELF:-readelf}" -rW "$lib")
+  DYN=$("${READELF:-readelf}" -dW "$lib")
+  if grep -qE 'TLS_TPREL|_TPOFF' <<<"$REL" || grep -q STATIC_TLS <<<"$DYN"; then
+    echo "::error::${lib#"$D"/} needs static TLS (initial-exec)"; exit 1
+  fi
+done
 SSBS=$(syms "$D/libssbs.so")
 for sym in sigaction signal bsd_signal sysv_signal; do
   grep -qx "$sym" <<<"$SSBS" || { echo "::error::libssbs.so does not export $sym"; exit 1; }

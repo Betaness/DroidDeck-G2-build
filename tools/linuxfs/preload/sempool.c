@@ -61,18 +61,20 @@ static uint32_t sp_zombie[SP_ZOMBIE];
 static int sp_nzombie;
 static int sp_tracked;
 
-/* [mali-g2] LD_PRELOAD loads this library at startup, so its TLS can be static: every read() checks it. */
-#define SP_TLS __thread __attribute__((tls_model("initial-exec")))
-
 enum { SP_IDLE, SP_CAPTURE, SP_FAKE };
-static SP_TLS int sp_pending;
-static SP_TLS unsigned char sp_reply[SP_MSG];
-static SP_TLS struct sp_key sp_capture;
-static SP_TLS int sp_capture_fd = -1;
-static SP_TLS int sp_wfd = -1;
-static SP_TLS int sp_rfd = -1;
-static SP_TLS int sp_learn_fd = -1;
-static SP_TLS uint32_t sp_learn_max;
+
+struct sp_thread {
+  int pending;
+  int capture_fd, wfd, rfd, learn_fd;
+  uint32_t learn_max;
+  struct sp_key capture;
+  unsigned char reply[SP_MSG];
+};
+
+/* [mali-g2] Not initial-exec: with LD_AUDIT set, glibc loads the preloads after it has sized the static TLS
+ * block, and an initial-exec variable then fails every program with "cannot allocate memory in static TLS
+ * block". Only threads of a process whose pool is on touch it (sp_state > 0). */
+static __thread struct sp_thread sp_t = { .capture_fd = -1, .wfd = -1, .rfd = -1, .learn_fd = -1 };
 
 static ssize_t (*sp_real_read)(int, void *, size_t);
 static ssize_t (*sp_real_write)(int, const void *, size_t);
@@ -84,7 +86,6 @@ static void sp_after_fork(void) {
   __atomic_store_n(&sp_nzombie, 0, __ATOMIC_RELEASE);
   __atomic_store_n(&sp_tracked, 0, __ATOMIC_RELEASE);
   __atomic_store_n(&sp_state, 0, __ATOMIC_RELEASE);
-  sp_pending = SP_IDLE;
 }
 
 static void sp_watch_fork(void) {
@@ -131,11 +132,11 @@ static uint32_t sp_u32(const void *p) {
   return v;
 }
 
-static void sp_fake(uint32_t error, uint32_t handle) {
-  memset(sp_reply, 0, sizeof sp_reply);
-  memcpy(sp_reply, &error, sizeof error);
-  memcpy(sp_reply + 8, &handle, sizeof handle);
-  sp_pending = SP_FAKE;
+static void sp_fake(struct sp_thread *t, uint32_t error, uint32_t handle) {
+  memset(t->reply, 0, sizeof t->reply);
+  memcpy(t->reply, &error, sizeof error);
+  memcpy(t->reply + 8, &handle, sizeof handle);
+  t->pending = SP_FAKE;
 }
 
 static void sp_count(void) {
@@ -316,43 +317,44 @@ static void sp_announce(void) {
 }
 
 static ssize_t sp_send(int fd, const struct iovec *iov, int n) {
-  if (sp_rfd >= 0 ? fd != sp_wfd : !sp_channel(fd)) {
+  struct sp_thread *t = &sp_t;
+  if (t->rfd >= 0 ? fd != t->wfd : !sp_channel(fd)) {
     /* [mali-g2] Requests only travel over pipes and sockets. A file write's buffer may be unreadable, and reading it
      * with every signal blocked kills the process where write() would fail with EFAULT. */
-    if (sp_rfd >= 0 && __atomic_load_n(&sp_tracked, __ATOMIC_ACQUIRE) && sp_channel(fd)) sp_scan(iov, n, 0);
+    if (t->rfd >= 0 && __atomic_load_n(&sp_tracked, __ATOMIC_ACQUIRE) && sp_channel(fd)) sp_scan(iov, n, 0);
     return -2;
   }
   const unsigned char *req = iov[0].iov_base;
   int code = (int)sp_u32(req);
-  if (sp_rfd < 0 && sp_request_shape(iov, n)) {
-    sp_learn_fd = fd;
-    sp_learn_max = sp_u32(req + 8);
+  if (t->rfd < 0 && sp_request_shape(iov, n)) {
+    t->learn_fd = fd;
+    t->learn_max = sp_u32(req + 8);
   }
-  int known = fd == sp_wfd && sp_rfd >= 0;
+  int known = fd == t->wfd && t->rfd >= 0;
   if (code == sp_close_req && n == 1 && !sp_u32(req + 4) && !sp_u32(req + 8)) {
     uint32_t handle = sp_u32(req + SP_HDR);
     int closed = sp_close(handle, known);
     if (closed == SP_KEPT || closed == SP_GONE) {
-      sp_fake(closed == SP_KEPT ? 0 : SP_INVALID_HANDLE, 0);
+      sp_fake(t, closed == SP_KEPT ? 0 : SP_INVALID_HANDLE, 0);
       if (closed == SP_KEPT) sp_announce();
       return SP_MSG;
     }
     sp_scan(iov, n, handle);
-    if (known && !sp_bury(fd, sp_rfd)) return -1;
+    if (known && !sp_bury(fd, t->rfd)) return -1;
     return -2;
   }
   sp_scan(iov, n, 0);
-  if (known && !sp_bury(fd, sp_rfd)) return -1;
+  if (known && !sp_bury(fd, t->rfd)) return -1;
   struct sp_key key;
   if (code == sp_create_req && sp_create_key(iov, n, &key)) {
     uint32_t handle;
     if (known && sp_reuse(&key, &handle)) {
-      sp_fake(0, handle);
+      sp_fake(t, 0, handle);
       return SP_MSG + SP_OBJATTR;
     }
-    sp_capture = key;
-    sp_capture_fd = fd;
-    sp_pending = SP_CAPTURE;
+    t->capture = key;
+    t->capture_fd = fd;
+    t->pending = SP_CAPTURE;
   }
   return -2;
 }
@@ -397,8 +399,8 @@ ssize_t write(int fd, const void *buf, size_t count) {
     if (r != -2) return r;
     r = sp_real_write(fd, buf, count);
     if (r != (ssize_t)count) {
-      sp_pending = SP_IDLE;
-      sp_learn_fd = -1;
+      sp_t.pending = SP_IDLE;
+      sp_t.learn_fd = -1;
     }
     return r;
   }
@@ -422,8 +424,8 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
     for (int i = 0; i < iovcnt; i++) total += iov[i].iov_len;
     r = sp_real_writev(fd, iov, iovcnt);
     if (r != (ssize_t)total) {
-      sp_pending = SP_IDLE;
-      sp_learn_fd = -1;
+      sp_t.pending = SP_IDLE;
+      sp_t.learn_fd = -1;
     }
     return r;
   }
@@ -438,22 +440,24 @@ ssize_t read(int fd, void *buf, size_t count) {
       return -1;
     }
   }
-  if (__builtin_expect(sp_pending != SP_IDLE, 0) && count == SP_MSG && bl_from_ntdll(__builtin_return_address(0))) {
-    if (sp_pending == SP_FAKE) {
-      if (fd != sp_rfd) return sp_real_read(fd, buf, count);
-      sp_pending = SP_IDLE;
-      memcpy(buf, sp_reply, SP_MSG);
+  if (count != SP_MSG || __atomic_load_n(&sp_state, __ATOMIC_RELAXED) <= 0) return sp_real_read(fd, buf, count);
+  struct sp_thread *t = &sp_t;
+  if (__builtin_expect(t->pending != SP_IDLE, 0) && bl_from_ntdll(__builtin_return_address(0))) {
+    if (t->pending == SP_FAKE) {
+      if (fd != t->rfd) return sp_real_read(fd, buf, count);
+      t->pending = SP_IDLE;
+      memcpy(buf, t->reply, SP_MSG);
       return SP_MSG;
     }
-    if (fd == sp_capture_fd || (sp_rfd >= 0 && fd != sp_rfd)) return sp_real_read(fd, buf, count);
-    sp_pending = SP_IDLE;
-    sp_learn_fd = -1;
-    struct sp_key key = sp_capture;
+    if (fd == t->capture_fd || (t->rfd >= 0 && fd != t->rfd)) return sp_real_read(fd, buf, count);
+    t->pending = SP_IDLE;
+    t->learn_fd = -1;
+    struct sp_key key = t->capture;
     ssize_t r = sp_real_read(fd, buf, count);
     if (r == SP_MSG && !sp_u32(buf) && !sp_u32((unsigned char *)buf + 4) && sp_u32((unsigned char *)buf + 8) &&
         sp_channel(fd)) {
-      sp_wfd = sp_capture_fd;
-      sp_rfd = fd;
+      t->wfd = t->capture_fd;
+      t->rfd = fd;
       sigset_t all, old;
       sigfillset(&all);
       pthread_sigmask(SIG_BLOCK, &all, &old);
@@ -462,14 +466,14 @@ ssize_t read(int fd, void *buf, size_t count) {
     }
     return r;
   }
-  if (__builtin_expect(sp_learn_fd >= 0, 0) && sp_rfd < 0 && count == SP_MSG && fd != sp_learn_fd &&
+  if (__builtin_expect(t->learn_fd >= 0, 0) && t->rfd < 0 && fd != t->learn_fd &&
       bl_from_ntdll(__builtin_return_address(0))) {
-    int wfd = sp_learn_fd;
-    sp_learn_fd = -1;
+    int wfd = t->learn_fd;
+    t->learn_fd = -1;
     ssize_t r = sp_real_read(fd, buf, count);
-    if (r == SP_MSG && sp_u32((unsigned char *)buf + 4) <= sp_learn_max && sp_channel(fd)) {
-      sp_wfd = wfd;
-      sp_rfd = fd;
+    if (r == SP_MSG && sp_u32((unsigned char *)buf + 4) <= t->learn_max && sp_channel(fd)) {
+      t->wfd = wfd;
+      t->rfd = fd;
     }
     return r;
   }
