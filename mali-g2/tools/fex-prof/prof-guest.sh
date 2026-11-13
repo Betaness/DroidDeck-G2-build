@@ -8,14 +8,16 @@
 #                      Mono's JIT) and FEX_DISKCACHE=0 (blocks loaded from FEX's disk cache get no symbol); library:
 #                      FEX_LIBRARYJITNAMING=1 and FEX_DISKCACHE=0; none: only the marker. Every mode also sets
 #                      FEXPROF_MODE=<mode> so the snapshot shows which run it was. Also creates the prefix's C:\tmp
-#                      (FEX writes \tmp\perf-<pid>.map on the current drive).
+#                      (FEX writes \tmp\perf-<pid>.map on the current drive) and the marker $Q/env-set.
 #   env unset          take those entries out again (a running game keeps them until it exits)
 #   ids                the game process, main thread, wineserver and tracer (guestsnap.py ids)
 #   snap TAG [ARGS]    guestsnap.py snap $Q/TAG (maps, threads, env, FEX stats, PE images, FEX's symbol file)
 #   stats [S]          fexstats.py rate over S seconds (default 10) for the game
 #   pack TAG           $Q/TAG as $OUTBOX/fexprof-TAG.tar.gz, for adb pull
-#   restore            env unset, delete $Q and $OUTBOX/fexprof-*.tar.gz
-# env: APPID (3167020), GAME_COMM (Duckov.exe), Q (~/.cache/droiddeck-fexprof), INBOX, OUTBOX.
+#   restore            env unset; delete the perf-*.map files newer than $Q/env-set in $GUEST_TMP and in each drive's
+#                      \tmp (every FEX process of the game's environment writes one) and C:\tmp if env set made
+#                      it; delete $Q and $OUTBOX/fexprof-*.tar.gz. Run it after the game has exited.
+# env: APPID (3167020), GAME_COMM (Duckov.exe), Q (~/.cache/droiddeck-fexprof), INBOX, OUTBOX, GUEST_TMP (/tmp).
 A=${APPID:-3167020}
 G=${GAME_COMM:-Duckov.exe}
 Q=${Q:-$HOME/.cache/droiddeck-fexprof}
@@ -24,6 +26,9 @@ INBOX=${INBOX:-$FILES/agent-inbox}
 OUTBOX=${OUTBOX:-$FILES/fexprof}
 F=$HOME/.config/droiddeck/game-environment.json
 S=$HOME/.local/share/Steam
+PFX=$S/steamapps/compatdata/$A/pfx
+M=$Q/env-set
+GT=${GUEST_TMP:-/tmp}
 export GAME_COMM=$G
 
 envjson() { # set MODE | unset
@@ -73,8 +78,12 @@ case ${1:-} in
     case ${2:-} in
       set)
         envjson set "${3:-block}" || exit 1
-        d=$S/steamapps/compatdata/$A/pfx/drive_c
-        if [ -d "$d" ]; then mkdir -p "$d/tmp" && echo "ok $d/tmp"; fi ;;
+        mkdir -p "$Q" || exit 1
+        [ -e "$M" ] || : > "$M" || exit 1
+        d=$PFX/drive_c
+        if [ -d "$d" ] && [ ! -d "$d/tmp" ]; then
+          mkdir "$d/tmp" && echo "$d/tmp" > "$M.mkdir" && echo "ok created $d/tmp"
+        fi ;;
       unset) envjson unset ;;
       *) echo "env set [block|library|none] | env unset"; exit 2 ;;
     esac ;;
@@ -94,8 +103,18 @@ case ${1:-} in
     echo "PACK $OUTBOX/fexprof-$2.tar.gz $(wc -c < "$OUTBOX/fexprof-$2.tar.gz") bytes" ;;
   restore)
     [ -f "$F" ] && envjson unset
+    if [ -e "$M" ]; then
+      n=0
+      for t in "$GT" "$PFX"/dosdevices/?:/tmp "$PFX/drive_c/tmp"; do
+        [ -d "$t" ] || continue
+        k=$(find "$t/" -maxdepth 1 -type f -name 'perf-*.map' -newer "$M" -print -delete 2>/dev/null | wc -l)
+        n=$((n + k))
+      done
+      echo "ok removed $n perf-*.map"
+      if [ -s "$M.mkdir" ]; then d=$(cat "$M.mkdir"); rmdir "$d" 2>/dev/null && echo "ok removed $d"; fi
+    fi
     rm -rf "$Q" "$OUTBOX"/fexprof-*.tar.gz
     rmdir "$OUTBOX" 2>/dev/null
     echo "ok removed $Q" ;;
-  *) sed -n '2,24p' "$0"; exit 2 ;;
+  *) sed -n '/^#!/d;/^#/!q;p' "$0"; exit 2 ;;
 esac

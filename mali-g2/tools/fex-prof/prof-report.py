@@ -10,22 +10,29 @@ SNAPDIR  guestsnap.py snapshots of the game process (prof-guest.sh snap), before
          FEX's symbol file is taken from the last snapshot that has one; FEX stats and thread CPU times are compared
          between the first and the last snapshot.
 
+FEX's symbols are only looked up for addresses in anonymous memory outside every PE image (a PE image counts for
+an address only if the address's mapping lies inside the image), so a symbol whose code buffer FEX has since freed
+does not claim a file mapping or an image Wine later put there.
+
 A sample is put in one category by its address:
   fex-jit         code FEX generated for guest x86 code. With FEX_BLOCKJITNAMING the block's own symbol says which
                   PE image the guest code is in (jit:unityplayer.dll ...) or, for code outside any image (Mono's
                   JIT output, stubs), jit:outside-images and the guest address. A block without a symbol is
                   jit:no-symbol (FEX keeps up to ~4 KB of the newest symbols of each thread unwritten, and blocks
-                  loaded from its disk cache get none); in a run without symbols all of it is jit:no-symbol.
+                  loaded from its disk cache get none); in a run without symbols all of it is jit:no-symbol. A block
+                  symbol's offset is that of the fragment's entry: all blocks of a multiblock fragment report it.
   fex-dispatcher  FEX's dispatcher code ([anon:FEXMem_Misc], or the Dispatch_ symbol)
   fex-runtime     libarm64ecfex.dll / libwow64fex.dll (compiler, lookup slow path, exception handling)
   fex-other       other FEX-named mappings
   wine-unix, wine-pe, wine-loader, dxvk, vkd3d, vulkan-loader, hybris, gpu-driver (Mali, Android's Vulkan
-  loader), android-libs, glibc, other-so, other-pe: by the mapped file
+  loader), android-libs, glibc, other-so, other-pe: by the mapped file; a PE image in anonymous memory by its
+  export name (wine-pe unless the name says dxvk, vkd3d or FEX), other-pe when it has no export name
   vdso, kernel (kernel-mode samples), anon-exec (other anonymous code), unknown (no mapping)
 """
 import argparse
 import bisect
 import gzip
+import heapq
 import json
 import os
 import re
@@ -51,6 +58,11 @@ PGOFF = re.compile(r"^pgoff 0x([0-9a-fA-F]+)(?:, filename (.*))?")
 FNAME = re.compile(r"^prot \d+, flags \d+, filename (.*)$")
 COMM = re.compile(r"^pid (\d+), tid (\d+), comm (.*)$")
 BLOCK = re.compile(r"^(.*)\+0x([0-9a-fA-F]+) \(0x[0-9a-fA-F]+\)$")
+EVENT_ATTR = re.compile(r"^  event_attr: for event type (\S+)")
+IP = re.compile(r"^  ip (0x[0-9a-fA-F]+)$")
+TIME = re.compile(r"^  time (\d+)$")
+PERIOD = re.compile(r"^  period (\d+)$")
+CLOCK_EVENTS = ("cpu-clock", "task-clock")
 KERNEL_MIN = 0xFFFF000000000000
 
 
@@ -92,7 +104,8 @@ def classify_file(path):
 
 class Intervals:
     """[lo, hi) ranges with payloads. One source (a maps copy, a PE scan) does not overlap itself; recorded mmaps can,
-    and then the latest one covering an address wins."""
+    and then find returns, of the rows covering the address among the `depth` nearest starts at or below it, the
+    one with the greatest start (of equal starts, the one given last)."""
 
     def __init__(self, rows=()):
         self.rows = sorted(rows, key=lambda r: r[0])
@@ -123,19 +136,50 @@ def parse_maps(path):
     return rows
 
 
+def newest_on_top(rows):
+    """rows: (lo, hi, payload), oldest first. Returns disjoint (lo, hi, payload) sorted by lo in which every address
+    has the payload of the last row that covers it."""
+    items = sorted(((lo, hi, seq, payload) for seq, (lo, hi, payload) in enumerate(rows) if hi > lo), key=lambda r: r[0])
+    out, heap = [], []
+    i, n, pos = 0, len(items), 0
+    while i < n or heap:
+        if not heap:
+            pos = items[i][0]
+        while i < n and items[i][0] <= pos:
+            lo, hi, seq, payload = items[i]
+            heapq.heappush(heap, (-seq, hi, payload))
+            i += 1
+        while heap and heap[0][1] <= pos:
+            heapq.heappop(heap)
+        if not heap:
+            continue
+        seq, hi, payload = heap[0]
+        nxt = min(hi, items[i][0]) if i < n else hi
+        if out and out[-1][1] == pos and out[-1][3] == seq:
+            out[-1][1] = nxt
+        else:
+            out.append([pos, nxt, payload, seq])
+        pos = nxt
+    return [(lo, hi, payload) for lo, hi, payload, _ in out]
+
+
 class PerfMap:
-    """FEX's JIT symbol file: '<host address> <size hex> <name>' lines, written by the C runtime of FEX's Windows build
-    (so possibly CRLF). The newest line for a start address wins; a lookup takes the closest start at or below the
-    address whose range covers it (block symbols of a multiblock all carry the whole fragment's size)."""
+    """FEX's JIT symbol file: '<host address> <size hex> <name>' lines. FEX's Windows build writes it through its own C
+    runtime, whose _write does not translate newlines (LF); CRLF is read as well.
+    A block symbol in a PE image ('<path>+0x<rva> (<host address>)') is written once per subblock of the fragment,
+    each with the whole fragment's size and the fragment's entry RVA (FEX Core.cpp:950-959): a line with the path, RVA
+    and size of an earlier one that starts inside that one's range is the same fragment and adds nothing, so the
+    fragment ends at its first line's start plus the size. JIT_0x lines carry their own subblock's size. Where ranges
+    overlap the later line wins: FEX reuses code buffer space after it clears its code cache."""
 
     def __init__(self, path=None):
-        self.starts, self.entries, self.spaces = [], [], Intervals()
+        self.los, self.table, self.spaces = [], [], Intervals()
         self.lines = self.bad = 0
         if path:
             self.load(path)
 
     def load(self, path):
-        by_start, spaces = {}, []
+        rows, spaces, fragments = [], [], {}
         with opener(path) as f:
             lines = f.read().splitlines()
         for line in lines:
@@ -150,16 +194,24 @@ class PerfMap:
                 continue
             if name == "FEXJIT":
                 spaces.append((start, start + size, None))
-            else:
-                by_start[start] = (start + size, name)
-        self.starts = sorted(by_start)
-        self.entries = [by_start[s] for s in self.starts]
+                continue
+            m = BLOCK.match(name)
+            if m:
+                key = (m.group(1), m.group(2).lower(), size)
+                first = fragments.get(key)
+                if first is not None and first < start < first + size:
+                    continue
+                fragments[key] = start
+            rows.append((start, start + size, (start, name)))
+        self.table = newest_on_top(rows)
+        self.los = [r[0] for r in self.table]
         self.spaces = Intervals(spaces)
 
     def find(self, addr):
-        i = bisect.bisect_right(self.starts, addr) - 1
-        if i >= 0 and addr < self.entries[i][0]:
-            return self.starts[i], self.entries[i][1]
+        """(start of the symbol's line, name) for an address, or None."""
+        i = bisect.bisect_right(self.los, addr) - 1
+        if i >= 0 and addr < self.table[i][1]:
+            return self.table[i][2]
         return None
 
     def in_space(self, addr):
@@ -167,9 +219,12 @@ class PerfMap:
 
 
 def parse_dump(path):
-    """samples [(pid, tid, ip, kernel, period, time)], mmaps {pid: [(lo, hi, pgoff, name)]}, comms {tid: comm}"""
-    samples, mmaps, comms = [], defaultdict(list), {}
+    """samples [(pid, tid, ip, kernel, period, time)], mmaps {pid: [(lo, hi, pgoff, name)]}, comms {tid: comm},
+    events [name of each attr]. Only a record's own fields are read: they are indented by two spaces; deeper lines
+    are the call chain, its symbolized frames ('time (/apex/.../libc.so[+...])' with --call-graph) and the like."""
+    samples, mmaps, comms, events = [], defaultdict(list), {}, []
     cur = None
+    data = False
 
     def flush(c):
         if not c:
@@ -187,24 +242,36 @@ def parse_dump(path):
                 flush(cur)
                 m = REC.match(line)
                 cur = {"type": m.group(1), "misc": int(m.group(3), 16)} if m else None
+                data = data or cur is not None
                 continue
+            if line.startswith("   ") or not line.startswith("  "):
+                continue
+            line = line.rstrip("\r\n")
             if cur is None:
+                m = EVENT_ATTR.match(line)
+                if m and not data:
+                    events.append(m.group(1))
                 continue
-            s = line.strip()
+            s = line[2:]
             t = cur["type"]
             if s.startswith("sample_id:"):
                 continue
             if t == "sample":
-                if s.startswith("ip "):
-                    cur["ip"] = int(s[3:], 16)
-                elif s.startswith("period "):
-                    cur["period"] = int(s[7:])
-                elif s.startswith("time "):
-                    cur["time"] = int(s[5:])
-                else:
-                    m = PIDTID.match(s)
-                    if m:
-                        cur["pid"], cur["tid"] = int(m.group(1)), int(m.group(2))
+                m = IP.match(line)
+                if m:
+                    cur["ip"] = int(m.group(1), 16)
+                    continue
+                m = PERIOD.match(line)
+                if m:
+                    cur["period"] = int(m.group(1))
+                    continue
+                m = TIME.match(line)
+                if m:
+                    cur["time"] = int(m.group(1))
+                    continue
+                m = PIDTID.match(s)
+                if m:
+                    cur["pid"], cur["tid"] = int(m.group(1)), int(m.group(2))
             elif t in ("mmap", "mmap2"):
                 m = MMAP.match(s)
                 if m:
@@ -224,7 +291,7 @@ def parse_dump(path):
                 if m:
                     cur["tid"], cur["comm"] = int(m.group(2)), m.group(3)
     flush(cur)
-    return samples, mmaps, comms
+    return samples, mmaps, comms, events
 
 
 class Snapshot:
@@ -244,6 +311,10 @@ class Snapshot:
         self.maps = parse_maps(m) if os.path.isfile(m) else []
         pm = os.path.join(path, "perfmap.txt.gz")
         self.perfmap = pm if os.path.isfile(pm) else None
+
+
+def anonymous(name):
+    return name in ("", "//anon") or name.startswith("[anon:")
 
 
 class Resolver:
@@ -275,10 +346,12 @@ class Resolver:
                 return hit
         return None
 
-    def pe_image(self, ip):
+    def pe_image(self, ip, found=None):
+        """The PE image an address is in. With the address's mapping given, only an image the whole mapping lies in
+        (a file's data view can claim more than it maps: SizeOfImage is the image's size in memory)."""
         for src in self.pe:
             hit = src.find(ip, depth=1)
-            if hit:
+            if hit and (found is None or (hit[0] <= found[0] and found[1] <= hit[1])):
                 return hit
         return None
 
@@ -286,25 +359,27 @@ class Resolver:
         """(category, module, location) for one sample address."""
         if kernel:
             return "kernel", "kernel", None
-        hit = self.perfmap.find(ip)
-        if hit:
-            start, name = hit
-            if name.startswith("JIT_0x"):
-                guest = name[4:].split("_", 1)[0]
-                return "fex-jit", "jit:outside-images", guest
-            if name.startswith("Dispatch_"):
-                return "fex-dispatcher", "dispatcher", "+0x%x" % (ip - start)
-            m = BLOCK.match(name)
-            if m:
-                return "fex-jit", "jit:" + winbase(m.group(1)), "+0x%s" % m.group(2).lower()
-            return "fex-jit", "jit:" + winbase(name), None
-        if self.perfmap.in_space(ip):
-            return "fex-jit", "jit:no-symbol", None
         found = self.mapping(ip)
+        anon = found is None or anonymous(found[2][2])
+        img = self.pe_image(ip, found) if anon else None
+        if anon and img is None:
+            hit = self.perfmap.find(ip)
+            if hit:
+                start, name = hit
+                if name.startswith("JIT_0x"):
+                    guest = name[4:].split("_", 1)[0]
+                    return "fex-jit", "jit:outside-images", guest
+                if name.startswith("Dispatch_"):
+                    return "fex-dispatcher", "dispatcher", "+0x%x" % (ip - start)
+                m = BLOCK.match(name)
+                if m:
+                    return "fex-jit", "jit:" + winbase(m.group(1)), "+0x%s" % m.group(2).lower()
+                return "fex-jit", "jit:" + winbase(name), None
+            if self.perfmap.in_space(ip):
+                return "fex-jit", "jit:no-symbol", None
+        if img:
+            return self.pe_hit(ip, img)
         if not found:
-            img = self.pe_image(ip)
-            if img:
-                return self.pe_hit(ip, img)
             return "unknown", "unknown", "0x%x" % ip
         lo, hi, (perms, off, name) = found
         if name == "[anon:FEXMemJIT]":
@@ -323,19 +398,21 @@ class Resolver:
             else:
                 loc = "off 0x%x" % (ip - lo + off)
             return cat, os.path.basename(name), loc
-        img = self.pe_image(ip)
-        if img:
-            return self.pe_hit(ip, img)
         if "x" in perms and self.named_run and (not name or name == "//anon"):
             return "fex-jit", "jit:no-symbol", None
         return "anon-exec", name or "[anon]", "0x%x" % ip
 
     def pe_hit(self, ip, hit):
         lo, _, img = hit
-        name = img.get("name") or os.path.basename(img.get("file") or "") or "pe@0x%x" % lo
-        cat = classify_file(img["file"]) if img.get("file") else classify_file(name)
-        if cat == "other-pe" and not img.get("file"):
-            cat = "wine-pe"
+        name = img.get("name") or os.path.basename(img.get("file") or "")
+        if img.get("file"):
+            cat = classify_file(img["file"])
+        elif not name:
+            cat, name = "other-pe", "pe@0x%x" % lo
+        else:
+            cat = classify_file(name)
+            if cat in ("other-pe", "other-so"):
+                cat = "wine-pe"
         return cat, name.lower(), "rva 0x%x" % (ip - lo)
 
 
@@ -373,7 +450,7 @@ def process_cpu(first, last):
 
 def report(dump, snapdirs, tids=None, min_pct=1.0, top=15):
     snaps = [Snapshot(d) for d in snapdirs]
-    samples, mmaps, comms = parse_dump(dump)
+    samples, mmaps, comms, events = parse_dump(dump)
     if not samples:
         raise ValueError("no samples in %s" % dump)
     ids = next((s.ids for s in reversed(snaps) if s.ids), None) or {}
@@ -388,6 +465,13 @@ def report(dump, snapdirs, tids=None, min_pct=1.0, top=15):
         if main in per_tid and main not in chosen:
             chosen.insert(0, main)
         chosen.sort(key=lambda t: (t != main, -per_tid[t]))
+    if not chosen:
+        have = ", ".join("%d (%d)" % kv for kv in per_tid.most_common(12))
+        if tids:
+            raise ValueError("no samples of thread %s in %s; threads with samples (count): %s" % (",".join(map(str, tids)), dump, have))
+        raise ValueError("no thread has %s%% of the samples and the main thread (%s) has none; threads with samples (count): %s"
+                         % (min_pct, main, have))
+    event = events[0] if len(set(events)) == 1 else None
     resolvers = {}
     names = {}
     for s in snaps:
@@ -397,7 +481,8 @@ def report(dump, snapdirs, tids=None, min_pct=1.0, top=15):
     times = [s[5] for s in samples if s[5] is not None]
     span = (max(times) - min(times)) / 1e9 if len(times) > 1 else None
     out = {"dump": dump, "snapshots": snapdirs, "samples": len(samples), "span_s": round(span, 2) if span else None,
-           "pid": ids.get("pid"), "main_tid": main, "threads": []}
+           "pid": ids.get("pid"), "main_tid": main, "events": events, "threads": [],
+           "tids_without_samples": [t for t in tids or () if t not in per_tid]}
     jit_total = jit_named = 0
     for tid in chosen:
         pid = pid_of[tid]
@@ -421,7 +506,8 @@ def report(dump, snapdirs, tids=None, min_pct=1.0, top=15):
                 jit_total += 1
                 jit_named += mod != "jit:no-symbol"
         row = {"tid": tid, "comm": names.get(tid), "main": tid == main, "samples": n,
-               "period_ms_per_s": round(period / 1e6 / span, 1) if span else None,
+               "period_per_s": round(period / span) if span and event else None,
+               "period_ms_per_s": round(period / 1e6 / span, 1) if span and event in CLOCK_EVENTS else None,
                "cpu": thread_cpu(snaps[0] if snaps else None, snaps[-1] if snaps else None, tid),
                "categories": [], "top": []}
         for cat in sorted(cats, key=lambda c: (ORDER.index(c) if c in ORDER else len(ORDER), -cats[c])):
@@ -445,7 +531,11 @@ def report(dump, snapdirs, tids=None, min_pct=1.0, top=15):
 
 
 def show(res):
-    print("%d samples over %s s, pid %s, main thread %s" % (res["samples"], res["span_s"], res["pid"], res["main_tid"]))
+    events = res.get("events") or []
+    print("%d samples over %s s, pid %s, main thread %s, event %s" % (res["samples"], res["span_s"], res["pid"], res["main_tid"],
+                                                                     ",".join(events) or "unknown (no attr section)"))
+    if res.get("tids_without_samples"):
+        print("no samples of thread " + ",".join(map(str, res["tids_without_samples"])))
     if res["env"]:
         print("game FEX env: " + " ".join("%s=%s" % kv for kv in res["env"].items()))
     pm = res["perfmap"]
@@ -453,9 +543,14 @@ def show(res):
         pm["file"] or "none", pm["lines"], pm["jit_with_symbol_pct"] if pm["jit_with_symbol_pct"] is not None else "-"))
     for t in res["threads"]:
         cpu = t["cpu"]
+        if t.get("period_ms_per_s") is not None:
+            rate = ", %.0f ms/s on-cpu by sample period" % t["period_ms_per_s"]
+        elif t.get("period_per_s") is not None:
+            rate = ", %.1f M %s/s by sample period" % (t["period_per_s"] / 1e6, events[0])
+        else:
+            rate = ""
         print("\nthread %d (%s)%s: %d samples%s%s" % (
-            t["tid"], t["comm"], " [main]" if t["main"] else "", t["samples"],
-            ", %.0f ms/s on-cpu by sample period" % t["period_ms_per_s"] if t["period_ms_per_s"] else "",
+            t["tid"], t["comm"], " [main]" if t["main"] else "", t["samples"], rate,
             ", /proc: busy %.1f%% (user %.1f%%, system %.1f%%) over %.0f s" % (cpu["busy"] * 100, cpu["user"] * 100, cpu["system"] * 100, cpu["dt"]) if cpu else ""))
         for c in t["categories"]:
             print("  %-16s %6.2f%%  %d" % (c["category"], c["pct"], c["samples"]))

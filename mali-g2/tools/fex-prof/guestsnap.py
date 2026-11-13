@@ -11,13 +11,15 @@ snap  writes into DIR: maps.txt (/proc/PID/maps), tasks.json (per thread comm, s
       CLOCK_MONOTONIC time), ids.json, env.json (the game's FEX_*, WINE*, DXVK_* and Proton variables), fexstats.json
       (fexstats.py snapshot, if FEX keeps stats), pe.json (PE images found at mapping starts through /proc/PID/mem:
       base, SizeOfImage, machine, export name, mapped file; finds images Wine read into anonymous memory; only
-      anonymous and regular-file mappings are read, never device or dma-buf ones) and
+      anonymous and regular-file mappings are read, never device or dma-buf ones, also for the export directory
+      and name the header points at) and
       perfmap.txt.gz + perfmap.json (FEX's JIT symbol file when FEX_BLOCKJITNAMING/LIBRARYJITNAMING/GLOBALJITNAMING
       is on). FEX's Windows build opens "/tmp/perf-<unix pid>.map" through the C runtime, so Wine resolves it on the
       process's current drive: Z: gives the guest's /tmp, C: the prefix's drive_c/tmp; every drive of the prefix is
       searched.
 """
 import argparse
+import bisect
 import glob
 import gzip
 import json
@@ -131,25 +133,39 @@ def scannable(name):
 
 
 def pe_scan(pid, rows):
-    """PE images at mapping starts: [{base, size, machine, name, file}]."""
+    """PE images at mapping starts: [{base, size, machine, name, file}]. The mappings that continue an image found
+    (adjacent, same name, inside its SizeOfImage) are not looked at again; any other mapping start is, also one
+    inside the SizeOfImage of a file's data view."""
     images = []
     try:
         mem = open("/proc/%d/mem" % pid, "rb", buffering=0)
     except OSError as e:
         return {"error": "open /proc/%d/mem: %s" % (pid, e), "images": []}
+    rows = sorted(rows)
+    los = [r[0] for r in rows]
 
     def peek(addr, n):
+        """Up to n bytes at addr, only from a readable anonymous or regular-file mapping (and not past its end)."""
+        i = bisect.bisect_right(los, addr) - 1
+        if i < 0:
+            return b""
+        lo, hi, perms, _, name = rows[i]
+        n = min(n, hi - addr)
+        if n <= 0 or perms[0] != "r" or not scannable(name):
+            return b""
         try:
             mem.seek(addr)
             return mem.read(n) or b""
         except (OSError, OverflowError, ValueError):
             return b""
 
-    covered = 0
+    run = None  # (name, end, image end) of the last image's mappings
     with mem:
         for lo, hi, perms, _, name in rows:
-            if lo < covered or perms[0] != "r" or not scannable(name):
+            if run and lo == run[1] and name == run[0] and lo < run[2]:
+                run = (name, hi, run[2])
                 continue
+            run = None
             if peek(lo, 2) != b"MZ":
                 continue
             head = peek(lo, 4096)
@@ -175,7 +191,7 @@ def pe_scan(pid, rows):
                         export = peek(lo + name_rva, 260).split(b"\0", 1)[0].decode("ascii", "replace")
             images.append({"base": lo, "size": size, "machine": "0x%04x" % machine, "pe32plus": magic == 0x20B,
                            "name": export, "file": name if name.startswith("/") else ""})
-            covered = lo + size
+            run = (name, hi, lo + size)
     return {"images": images}
 
 

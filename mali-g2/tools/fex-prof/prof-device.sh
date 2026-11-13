@@ -6,8 +6,9 @@
 # <profileable android:shell="true"/>) and reaches every process of the app's uid, so also the guest's game
 # process under proot. Nothing here needs root.
 #   check [PID]                       Android version, perf_event_paranoid and the LSM-hook property, simpleperf,
-#                                     whether the package is profileable; with PID a 1 s `simpleperf stat` on that
-#                                     thread (cpu-clock, then cpu-cycles,instructions) to show it is reachable
+#                                     gzip, what simpleperf_app_runner makes of the package (profileable,
+#                                     debuggable or non_profileable); with PID a 1 s `simpleperf stat` on
+#                                     that thread (cpu-clock, then cpu-cycles,instructions) to show it is reachable
 #   record TAG TIDS SECONDS [EVENT] [FREQ] [-- simpleperf record args]
 #                                     simpleperf record --app on the comma-separated TIDS (default event cpu-clock,
 #                                     4000 Hz), then on the device `simpleperf dump` (gzip) and `simpleperf report`
@@ -29,8 +30,9 @@ case ${1:-} in
     sh_dev "echo SDK \$(getprop ro.build.version.sdk) RELEASE \$(getprop ro.build.version.release) TYPE \$(getprop ro.build.type);
       echo PERF_HARDEN \$(getprop security.perf_harden) LSM_HOOKS \$(getprop sys.init.perf_lsm_hooks);
       echo PARANOID \$(cat /proc/sys/kernel/perf_event_paranoid) MAX_RATE \$(cat /proc/sys/kernel/perf_event_max_sample_rate) CPU_PCT \$(cat /proc/sys/kernel/perf_cpu_time_max_percent);
-      ls -l /system/bin/simpleperf /system/bin/simpleperf_app_runner 2>&1; simpleperf --version 2>&1 | head -2"
-    echo "PROFILEABLE $(sh_dev dumpsys package "$PKG" | grep -i -o -E 'PROFILEABLE[A-Z_]*|profileable[A-Za-z]*=[a-z]*' | sort -u | tr '\n' ' ')"
+      ls -l /system/bin/simpleperf /system/bin/simpleperf_app_runner 2>&1; simpleperf --version 2>&1 | head -2;
+      echo GZIP \$(command -v gzip)"
+    echo "APP_TYPE $(sh_dev "simpleperf_app_runner $PKG --show-app-type 2>&1")"
     if [ -n "${2:-}" ]; then
       for ev in cpu-clock cpu-cycles,instructions; do
         echo "STAT $ev on tid $2:"
@@ -63,5 +65,5 @@ case ${1:-} in
     sh_dev "simpleperf stat --app $PKG -t $2 --per-thread -e ${4:-cpu-cycles,instructions,branch-misses,cache-references,cache-misses} --duration $3 2>&1" ;;
   clean)
     sh_dev "rm -rf $D" && echo "ok removed $D" ;;
-  *) sed -n '2,22p' "$0"; exit 2 ;;
+  *) sed -n '/^#!/d;/^#/!q;p' "$0"; exit 2 ;;
 esac
