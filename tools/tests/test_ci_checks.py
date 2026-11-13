@@ -55,6 +55,24 @@ class CiChecksTest(unittest.TestCase):
         # [mali-g2] The APK also waits for the Vortek client and libhybris, built from the commit on arm runners.
         self.assertEqual(set(jobs['build']['needs']), {'source', 'components', 'xbox', 'build-runner', 'vortek', 'hybris'})
 
+    def test_hybris_tests_fail_the_run_without_gating_the_apk(self):
+        # [mali-g2] The hybris job may fail without failing the run (continue-on-error); its tests may not.
+        jobs = yaml.safe_load((ROOT / '.github/workflows/build.yml').read_text())['jobs']
+        self.assertTrue(jobs['hybris']['continue-on-error'])
+        self.assertNotIn('pass_barrier', json.dumps(jobs['hybris']['steps']))
+        tests = jobs['hybris-tests']
+        self.assertNotIn('continue-on-error', tests)
+        self.assertEqual(tests['needs'], 'hybris')
+        self.assertIn('!cancelled()', tests['if'])
+        run = '\n'.join(step.get('run', '') for step in tests['steps'])
+        self.assertIn('tests/pass_barrier_test.c', run)
+        self.assertIn('-fsanitize=undefined,pointer-overflow', run)
+        self.assertIn('tests/pass_barrier_icd_test.sh', run)
+        self.assertTrue(all(not step.get('continue-on-error') for step in tests['steps'] if 'run' in step))
+        for name, job in jobs.items():
+            needs = job.get('needs', [])
+            self.assertNotIn('hybris-tests', [needs] if isinstance(needs, str) else needs, name)
+
     def test_dependency_update_errors_block_installation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
