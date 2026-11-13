@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import re
 import runpy
 import shutil
 import stat
@@ -1052,18 +1053,21 @@ class PreloadPoolTest(SyncTestCase):
         tool = make_tool(self.tools, "Proton Experimental (ARM64)")
         for value in ("0", "off", " False ", "NO"):
             command, env, said = self.select(tool, self.env(BL_SEMPOOL_PRELOAD=value))
-            self.assertEqual(env["BL_SYNC_SEMPOOL"], "off", value)
+            self.assertEqual(env["BL_SYNC_SEMPOOL"], "none", value)
             self.assertNotIn("BL_SEMPOOL", env, value)
-            self.assertTrue(said.endswith("\ndroiddeck-esync: preload semaphore pool off (BL_SEMPOOL_PRELOAD)\n"), said)
+            self.assertTrue(said.endswith("\ndroiddeck-esync: no semaphore pool (BL_SEMPOOL_PRELOAD turns the preload pool off)\n"), said)
         command, env, said = self.select(tool, self.env(WINE_SEM_POOL="0"))
-        self.assertTrue(said.endswith("\ndroiddeck-esync: preload semaphore pool off (WINE_SEM_POOL)\n"), said)
+        self.assertTrue(said.endswith("\ndroiddeck-esync: no semaphore pool (WINE_SEM_POOL turns the preload pool off)\n"), said)
         self.assertEqual(self.asked, [])
         for value in ("1", "", "yes"):
             self.assertEqual(self.select(tool, self.env(BL_SEMPOOL_PRELOAD=value))[1]["BL_SYNC_SEMPOOL"], "preload", value)
         make_pack(root, tool, "valve-experimental-r1", pool=False)
-        command, env, said = self.select(tool, self.env(BL_SEMPOOL_PRELOAD="0"))
-        self.assertNotIn("BL_SEMPOOL", env)
-        self.assertTrue(said.endswith(", preload semaphore pool off (BL_SEMPOOL_PRELOAD; this pack has none)\n"), said)
+        for extra, switch in (({"BL_SEMPOOL_PRELOAD": "0"}, "BL_SEMPOOL_PRELOAD"), ({"WINE_SEM_POOL": "0"}, "WINE_SEM_POOL")):
+            command, env, said = self.select(tool, self.env(**extra))
+            self.assertEqual(env["BL_SYNC_SEMPOOL"], "none", extra)
+            self.assertNotIn("BL_SEMPOOL", env, extra)
+            self.assertTrue(said.endswith(", no semaphore pool in this pack (every anonymous semaphore is a wineserver round trip; "
+                                          "%s turns the preload pool off)\n" % switch), said)
 
     def test_stock_launches_of_a_build_with_a_pool_pack_stay_without_a_pool(self):
         root = self.store()
@@ -1089,9 +1093,89 @@ class PreloadPoolTest(SyncTestCase):
             for extra in ({"BL_SEMPOOL_PRELOAD": "0"}, {"WINE_SEM_POOL": "0"}):
                 command, env, said = self.select(tool, self.env(**extra), verb="run")
                 self.assertNotIn("BL_SEMPOOL", env, extra)
-                self.assertEqual(env["BL_SYNC_SEMPOOL"], "off", extra)
-                self.assertIn("keeping its sync choice (droiddeck-esync, semaphore pool off)", said)
+                self.assertEqual(env["BL_SYNC_SEMPOOL"], "none", extra)
+                self.assertIn("keeping its sync choice (droiddeck-esync, no semaphore pool)", said)
         self.assertEqual(len(self.asked), 1)
+
+    def test_the_no_pack_switch_runs_the_stock_binaries_with_the_preload_pool(self):
+        root = self.store()
+        tool = make_tool(self.tools, "Proton Experimental (ARM64)")
+        fsync = make_tool(self.tools, "Proton 11.0 (ARM64)", "1789000000 proton-11.0-3", salt=b"f", fsync=True)
+        pack = make_pack(root, tool, "valve-experimental-r2", rev=2)
+        fsync_pack = make_pack(root, fsync, "valve-11.0-r1", pool=False)
+        preload = "droiddeck-esync: preload semaphore pool on (create_semaphore 40, close_handle 21)\n"
+        command, env, said = self.select(tool, self.env(BL_SYNC_NO_PACK="1"))
+        self.assertEqual(command[0], str(tool / "proton"))
+        self.assertNotIn("BL_SYNC_PACK", env)
+        self.assertEqual((env["BL_SYNC"], env["BL_SYNC_SEMPOOL"], env["BL_SEMPOOL"]), ("1", "preload", "40,21"))
+        self.assertEqual(said, "droiddeck-esync: pack %s left out (BL_SYNC_NO_PACK=1); stock binaries with droiddeck-ntsync\n"
+                         % pack["id"] + preload)
+        command, env, said = self.select(fsync, self.env(BL_SYNC_NO_PACK="yes"))
+        self.assertEqual((command[0], env["BL_FSYNC"], env["BL_SYNC_SEMPOOL"]), (str(fsync / "proton"), "1", "preload"))
+        self.assertEqual(said, "droiddeck-fsync: pack %s left out (BL_SYNC_NO_PACK=yes); stock binaries with Proton's fsync\n"
+                         % fsync_pack["id"] + preload)
+        self.assertFalse((root / "wanted.tsv").exists())
+        command, env, said = self.select(tool, self.env(BL_SYNC_NO_PACK="1", BL_SEMPOOL_PRELOAD="0"))
+        self.assertEqual((command[0], env["BL_SYNC_SEMPOOL"]), (str(tool / "proton"), "off"))
+        self.assertNotIn("BL_SEMPOOL", env)
+        self.assertTrue(said.endswith("\ndroiddeck-esync: semaphore pool off (pack %s has one, but BL_SYNC_NO_PACK keeps it out; "
+                                      "BL_SEMPOOL_PRELOAD turns the preload pool off)\n" % pack["id"]), said)
+        command, env, said = self.select(fsync, self.env(BL_SYNC_NO_PACK="1", BL_SEMPOOL_PRELOAD="0"))
+        self.assertEqual(env["BL_SYNC_SEMPOOL"], "none")
+        self.assertTrue(said.endswith("\ndroiddeck-esync: no semaphore pool (BL_SEMPOOL_PRELOAD turns the preload pool off)\n"), said)
+        for value in ("0", ""):
+            command, env, said = self.select(tool, self.env(BL_SYNC_NO_PACK=value))
+            self.assertEqual((env["BL_SYNC_PACK"], env["BL_SYNC_SEMPOOL"]), (pack["id"], "on"), value)
+        self.assertEqual(len(self.asked), 2)
+        self.select(tool, self.env(BL_SYNC_NO_PACK="1"))
+        with mock.patch.dict(GLOBALS, {"server_running": lambda path: True}):
+            command, env, said = self.select(tool, self.env(BL_SEMPOOL_PRELOAD="0"), verb="run")
+        self.assertEqual((command[0], env["BL_SYNC_SEMPOOL"]), (str(tool / "proton"), "off"))
+        self.assertNotIn("BL_SEMPOOL", env)
+        self.assertIn("keeping its sync choice (droiddeck-ntsync, semaphore pool off)", said)
+
+    def test_inherited_pool_settings_never_reach_a_launch_left_alone(self):
+        self.store()
+        tool = make_tool(self.tools, "Proton Experimental (ARM64)")
+        dist = make_tool(self.tools, "dist", salt=b"d")
+        (dist / RECORD).write_text("{}")
+        inherited = {"BL_SEMPOOL": "1,2", "BL_SYNC_SEMPOOL": "preload"}
+        for where, extra in ((tool, {"PROTON_USE_ARM64": "0"}), (tool, {"STEAM_COMPAT_DATA_PATH": "/compatdata/0"}),
+                             (tool, {"STEAM_COMPAT_DATA_PATH": ""}), (dist, {}), (self.tmp, {})):
+            command, env, said = self.select(where, self.env(**inherited, **extra))
+            self.assertEqual(env, self.env(**extra), (where, extra))
+        self.assertEqual(self.asked, [])
+
+    def test_only_launches_without_any_pool_say_what_the_play_journal_flags_as_nopool(self):
+        source = (Path(__file__).resolve().parents[2] / "app/src/main/java/com/droiddeck/launcher/session/play/LogSliceScanner.kt").read_text()
+        needles = re.findall(r'Pattern\("no_sempool", "([^"\\]*)"\)', source)
+        self.assertGreaterEqual(len(needles), 3)
+        root = self.store()
+        pooled = make_tool(self.tools, "pooled", salt=b"p")
+        poolless = make_tool(self.tools, "poolless", salt=b"l")
+        bare = make_tool(self.tools, "bare", salt=b"b")
+        make_pack(root, pooled, "pooled-r2", rev=2)
+        make_pack(root, poolless, "poolless-r1", pool=False)
+        cases = (
+            (pooled, {}, True, "on"), (pooled, {"WINE_SEM_POOL": "0"}, True, "off"), (pooled, {"BL_SYNC_FALLBACK": "0"}, True, "off"),
+            (pooled, {"BL_SYNC_NO_PACK": "1"}, True, "preload"), (pooled, {"BL_SYNC_NO_PACK": "1", "BL_SEMPOOL_PRELOAD": "0"}, True, "off"),
+            (pooled, {"BL_SYNC_NO_PACK": "1"}, False, "off"),
+            (poolless, {}, True, "preload"), (poolless, {"BL_SEMPOOL_PRELOAD": "0"}, True, "none"),
+            (poolless, {"WINE_SEM_POOL": "0"}, True, "none"), (poolless, {}, False, "none"),
+            (poolless, {"BL_SYNC_NO_PACK": "1"}, True, "preload"), (poolless, {"BL_SYNC_NO_PACK": "1", "BL_SEMPOOL_PRELOAD": "0"}, True, "none"),
+            (bare, {}, True, "preload"), (bare, {"BL_SEMPOOL_PRELOAD": "0"}, True, "none"), (bare, {}, False, "none"),
+        )
+        for index, (tool, extra, numbers, state) in enumerate(cases):
+            env = self.env(STEAM_COMPAT_DATA_PATH="/compatdata/%d" % (100 + index), **extra)
+            with mock.patch.dict(GLOBALS, {} if numbers else {"semaphore_requests": lambda path: None}):
+                command, chosen, said = self.select(tool, env)
+                self.assertEqual(chosen["BL_SYNC_SEMPOOL"], state, (tool.name, extra, numbers))
+                self.assertEqual(any(needle in said for needle in needles), state == "none", (tool.name, extra, numbers, said))
+                with mock.patch.dict(GLOBALS, {"server_running": lambda path: True}):
+                    command, kept, said = self.select(tool, env, verb="run")
+                self.assertIn("keeping its sync choice", said)
+                self.assertEqual(kept["BL_SYNC_SEMPOOL"], state, (tool.name, extra, numbers))
+                self.assertEqual(any(needle in said for needle in needles), state == "none", (tool.name, extra, numbers, said))
 
     def test_an_inherited_preload_setting_is_dropped_when_there_are_no_numbers(self):
         self.store()

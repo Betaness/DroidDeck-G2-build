@@ -1,5 +1,7 @@
 import os
 from pathlib import Path
+import platform
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -65,10 +67,12 @@ ssize_t nt_read_file(int fd, uint32_t *words) {
 """
 
 PROGRAM = r"""
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -196,6 +200,21 @@ int main(int argc, char **argv) {
     distinct = nt_write_file(f[1], words) == 64 && read(f[0], back, sizeof back) == sizeof back;
     if (!strcmp(mode, "zombie-close")) distinct &= nt_close(q[1], a[0], h) == 0xC0000008u;
     distinct &= create(0x7fffffff, 0) != h;
+  } else if (!strcmp(mode, "regular-file-pooled") || !strcmp(mode, "unreadable-file-write")) {
+    char path[] = "/tmp/sempool-file-XXXXXX";
+    int fd = mkstemp(path);
+    uint32_t *none = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (fd < 0 || none == MAP_FAILED) return 9;
+    unlink(path);
+    uint32_t h = create(0x7fffffff, 0);
+    if (!strcmp(mode, "unreadable-file-write")) {
+      errno = 0;
+      distinct = nt_write_file(fd, none) == -1 && errno == EFAULT;
+    } else {
+      nt_close(q[1], a[0], h);
+      uint32_t words[16] = { 21, 0, 0, h };
+      distinct = nt_write_file(fd, words) == 64 && create(0x7fffffff, 0) == h;
+    }
   } else if (!strcmp(mode, "different")) {
     uint32_t h = create(0x7fffffff, 0);
     nt_close(q[1], a[0], h);
@@ -294,6 +313,38 @@ int main(int argc, char **argv) {
 """
 
 
+# Built against a libblsession.so whose sempool.c never finds the real read, write and writev.
+NOSYM = r"""
+#include <errno.h>
+#include <stdio.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+int main(void) {
+  int p[2];
+  char c = 'x';
+  if (pipe(p)) return 1;
+  struct iovec v = { &c, 1 };
+  errno = 0;
+  ssize_t w = write(p[1], &c, 1);
+  int we = errno;
+  errno = 0;
+  ssize_t wv = writev(p[1], &v, 1);
+  int wve = errno;
+  errno = 0;
+  ssize_t r = read(p[0], &c, 1);
+  int re = errno;
+  printf("%zd %d %zd %d %zd %d\n", w, we == ENOSYS, wv, wve == ENOSYS, r, re == ENOSYS);
+  return 0;
+}
+"""
+
+NO_DLSYM = r"""
+#include <stddef.h>
+void *sp_test_dlsym(void *handle, const char *name) { (void)handle; (void)name; return NULL; }
+"""
+
+
 class SemaphorePoolPreloadTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -312,6 +363,16 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
         subprocess.run([cls.cc, "-O1", "-pthread", "-o", str(tmp / "prog"), str(tmp / "prog.c"), str(tmp / "ntdll.so"),
                         "-Wl,-rpath," + str(tmp)], check=True)
         subprocess.run([cls.cc, "-O1", "-pthread", "-o", str(tmp / "late"), str(tmp / "late.c"), "-ldl"], check=True)
+        (tmp / "nosym.c").write_text(NOSYM)
+        (tmp / "nodlsym.c").write_text(NO_DLSYM)
+        subprocess.run([cls.cc, "-c", "-fPIC", "-O2", "-pthread", "-Ddlsym=sp_test_dlsym", "-o", str(tmp / "sempool-nodlsym.o"),
+                        str(PRELOAD / "sempool.c")], check=True)
+        subprocess.run([cls.cc, "-shared", "-fPIC", "-O2", "-pthread", "-o", str(tmp / "libnodlsym.so"),
+                        *(p for p in sources if not p.endswith("/sempool.c")), str(tmp / "sempool-nodlsym.o"), str(tmp / "nodlsym.c"),
+                        "-ldl"], check=True)
+        subprocess.run([cls.cc, "-O1", "-o", str(tmp / "nosym"), str(tmp / "nosym.c")], check=True)
+        cls.nosym = tmp / "nosym"
+        cls.nodlsym = tmp / "libnodlsym.so"
         cls.program = tmp / "prog"
         cls.late = tmp / "late"
         cls.ntdll = tmp / "ntdll.so"
@@ -321,7 +382,7 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def run_program(self, mode, protocol="40,21", program=None):
+    def run_program(self, mode, protocol="40,21", program=None, preload=None):
         args = [str(program or self.program)] + (mode if isinstance(mode, list) else [mode])
         env = dict(os.environ)
         env.pop("LD_PRELOAD", None)
@@ -330,15 +391,14 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
             env["BL_SEMPOOL"] = protocol
         if self.prefix:
             # qemu splits -E values on commas, so BL_SEMPOOL reaches the guest through qemu's own environment.
-            cmd = list(self.prefix) + ["-E", "LD_PRELOAD=" + str(self.preload)] + args
+            cmd = list(self.prefix) + ["-E", "LD_PRELOAD=" + str(preload or self.preload)] + args
         else:
-            env["LD_PRELOAD"] = str(self.preload)
+            env["LD_PRELOAD"] = str(preload or self.preload)
             cmd = args
         out = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.stderr = out.stderr
-        creates, closes, others, distinct = map(int, out.stdout.split())
-        return creates, closes, others, distinct
+        return tuple(map(int, out.stdout.split()))
 
     def test_create_close_loop_reaches_the_server_once(self):
         self.assertEqual(self.run_program("loop"), (1, 0, 0, 1))
@@ -371,6 +431,36 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
 
     def test_closing_a_semaphore_waiting_to_be_closed_fails_like_wine(self):
         self.assertEqual(self.run_program("zombie-close"), (2, 1, 0, 1))
+
+    def test_a_semaphore_named_in_a_regular_file_write_stays_pooled(self):
+        self.assertEqual(self.run_program("regular-file-pooled"), (1, 0, 0, 1))
+
+    def test_an_unreadable_file_write_fails_with_efault_while_semaphores_are_tracked(self):
+        self.assertEqual(self.run_program("unreadable-file-write"), (1, 0, 0, 1))
+
+    def test_unresolved_libc_calls_fail_with_enosys(self):
+        for protocol in ("40,21", None):
+            self.assertEqual(self.run_program([], protocol=protocol, program=self.nosym, preload=self.nodlsym), (-1, 1, -1, 1, -1, 1))
+
+    def test_the_pool_state_uses_static_tls(self):
+        readelf = shutil.which("readelf")
+        if readelf is None:
+            self.skipTest("no readelf")
+        compilers = [(self.cc, [])]
+        if platform.machine() == "x86_64" and shutil.which("gcc"):
+            compilers += [("gcc", ["-m64"]), ("gcc", ["-m32"])]
+        tmp = Path(self.tmp.name)
+        for cc, flags in compilers:
+            with self.subTest(cc=cc, flags=flags):
+                obj = tmp / "sempool-tls.o"
+                built = subprocess.run([cc, *flags, "-c", "-fPIC", "-O2", "-pthread", "-o", str(obj), str(PRELOAD / "sempool.c")],
+                                       capture_output=True, text=True)
+                if built.returncode and flags == ["-m32"]:
+                    self.skipTest("no 32-bit headers")
+                self.assertEqual(built.returncode, 0, built.stderr)
+                relocations = subprocess.run([readelf, "-rW", str(obj)], capture_output=True, text=True, check=True).stdout
+                self.assertRegex(relocations, r"GOTTPREL|GOTTPOFF|TLS_IE|TLS_GOTIE")
+                self.assertNotRegex(relocations, r"TLSDESC|TLS_DESC|TLS_GOTDESC|TLSGD|TLSLD|TLS_GD|TLS_LDM|DTPOFF|DTPREL|DTPMOD")
 
     def test_only_an_identical_create_reuses_a_semaphore(self):
         self.assertEqual(self.run_program("different"), (2, 0, 0, 1))

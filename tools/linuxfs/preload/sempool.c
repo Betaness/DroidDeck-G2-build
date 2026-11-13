@@ -10,8 +10,8 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-/* [mali-g2] From Droid-Deck/DroidDeck#2351. droiddeck-esync sets BL_SEMPOOL only where the Proton build
- * has no pack whose ntdll.so pools semaphores itself, so the two pools never run together.
+/* [mali-g2] From Droid-Deck/DroidDeck#2351. droiddeck-esync sets BL_SEMPOOL only for launches that do not
+ * run the ntdll.so of a pack that pools semaphores itself, so the two pools never run together.
  *
  * Some Unity games create and close an unused unnamed semaphore thousands of times a second, each
  * a wineserver round trip. A semaphore no request named between its create and its close stays
@@ -61,15 +61,18 @@ static uint32_t sp_zombie[SP_ZOMBIE];
 static int sp_nzombie;
 static int sp_tracked;
 
+/* [mali-g2] LD_PRELOAD loads this library at startup, so its TLS can be static: every read() checks it. */
+#define SP_TLS __thread __attribute__((tls_model("initial-exec")))
+
 enum { SP_IDLE, SP_CAPTURE, SP_FAKE };
-static __thread int sp_pending;
-static __thread unsigned char sp_reply[SP_MSG];
-static __thread struct sp_key sp_capture;
-static __thread int sp_capture_fd = -1;
-static __thread int sp_wfd = -1;
-static __thread int sp_rfd = -1;
-static __thread int sp_learn_fd = -1;
-static __thread uint32_t sp_learn_max;
+static SP_TLS int sp_pending;
+static SP_TLS unsigned char sp_reply[SP_MSG];
+static SP_TLS struct sp_key sp_capture;
+static SP_TLS int sp_capture_fd = -1;
+static SP_TLS int sp_wfd = -1;
+static SP_TLS int sp_rfd = -1;
+static SP_TLS int sp_learn_fd = -1;
+static SP_TLS uint32_t sp_learn_max;
 
 static ssize_t (*sp_real_read)(int, void *, size_t);
 static ssize_t (*sp_real_write)(int, const void *, size_t);
@@ -88,6 +91,18 @@ static void sp_watch_fork(void) {
   pthread_atfork(NULL, NULL, sp_after_fork);
 }
 
+static int sp_resolve(void) {
+  if (!__atomic_load_n(&sp_real_read, __ATOMIC_ACQUIRE))
+    __atomic_store_n(&sp_real_read, (ssize_t (*)(int, void *, size_t))dlsym(RTLD_NEXT, "read"), __ATOMIC_RELEASE);
+  if (!__atomic_load_n(&sp_real_write, __ATOMIC_ACQUIRE))
+    __atomic_store_n(&sp_real_write, (ssize_t (*)(int, const void *, size_t))dlsym(RTLD_NEXT, "write"), __ATOMIC_RELEASE);
+  if (!__atomic_load_n(&sp_real_writev, __ATOMIC_ACQUIRE))
+    __atomic_store_n(&sp_real_writev, (ssize_t (*)(int, const struct iovec *, int))dlsym(RTLD_NEXT, "writev"),
+                     __ATOMIC_RELEASE);
+  return __atomic_load_n(&sp_real_read, __ATOMIC_ACQUIRE) && __atomic_load_n(&sp_real_write, __ATOMIC_ACQUIRE) &&
+         __atomic_load_n(&sp_real_writev, __ATOMIC_ACQUIRE);
+}
+
 static int sp_on(void) {
   int s = __atomic_load_n(&sp_state, __ATOMIC_ACQUIRE);
   if (s >= 0) return s;
@@ -100,7 +115,7 @@ static int sp_on(void) {
     close = strtol(second, &end, 10);
     if (end == second) close = -1;
   }
-  s = create >= 0 && create < 4096 && close >= 0 && close < 4096 && create != close && *end == 0;
+  s = create >= 0 && create < 4096 && close >= 0 && close < 4096 && create != close && *end == 0 && sp_resolve();
   if (s) {
     __atomic_store_n(&sp_create_req, (int)create, __ATOMIC_RELAXED);
     __atomic_store_n(&sp_close_req, (int)close, __ATOMIC_RELAXED);
@@ -301,12 +316,14 @@ static void sp_announce(void) {
 }
 
 static ssize_t sp_send(int fd, const struct iovec *iov, int n) {
-  const unsigned char *req = iov[0].iov_base;
-  int code = (int)sp_u32(req);
   if (sp_rfd >= 0 ? fd != sp_wfd : !sp_channel(fd)) {
-    sp_scan(iov, n, 0);
+    /* [mali-g2] Requests only travel over pipes and sockets. A file write's buffer may be unreadable, and reading it
+     * with every signal blocked kills the process where write() would fail with EFAULT. */
+    if (sp_rfd >= 0 && __atomic_load_n(&sp_tracked, __ATOMIC_ACQUIRE) && sp_channel(fd)) sp_scan(iov, n, 0);
     return -2;
   }
+  const unsigned char *req = iov[0].iov_base;
+  int code = (int)sp_u32(req);
   if (sp_rfd < 0 && sp_request_shape(iov, n)) {
     sp_learn_fd = fd;
     sp_learn_max = sp_u32(req + 8);
@@ -353,7 +370,7 @@ static ssize_t sp_send_masked(int fd, const struct iovec *iov, int n) {
   return r;
 }
 
-/* wineserver writes each reply as one 64-byte write and never loads ntdll.so, so after its first
+/* [mali-g2] wineserver writes each reply as one 64-byte write and never loads ntdll.so, so after its first
  * SP_LOOKUP_EVERY such writes a process without it looks for it only every SP_LOOKUP_EVERY writes. */
 static int sp_from_ntdll(const void *caller) {
   static unsigned int misses;
@@ -364,20 +381,16 @@ static int sp_from_ntdll(const void *caller) {
   return bl_from_ntdll(caller);
 }
 
-static void sp_resolve(void) {
-  if (!__atomic_load_n(&sp_real_read, __ATOMIC_ACQUIRE))
-    __atomic_store_n(&sp_real_read, (ssize_t (*)(int, void *, size_t))dlsym(RTLD_NEXT, "read"), __ATOMIC_RELEASE);
-  if (!__atomic_load_n(&sp_real_write, __ATOMIC_ACQUIRE))
-    __atomic_store_n(&sp_real_write, (ssize_t (*)(int, const void *, size_t))dlsym(RTLD_NEXT, "write"), __ATOMIC_RELEASE);
-  if (!__atomic_load_n(&sp_real_writev, __ATOMIC_ACQUIRE))
-    __atomic_store_n(&sp_real_writev, (ssize_t (*)(int, const struct iovec *, int))dlsym(RTLD_NEXT, "writev"),
-                     __ATOMIC_RELEASE);
-}
-
 ssize_t write(int fd, const void *buf, size_t count) {
   ssize_t nl;
   if (bl_nl_write(fd, buf, count, &nl)) return nl;
-  if (__builtin_expect(!__atomic_load_n(&sp_real_write, __ATOMIC_ACQUIRE), 0)) sp_resolve();
+  if (__builtin_expect(!__atomic_load_n(&sp_real_write, __ATOMIC_ACQUIRE), 0)) {
+    sp_resolve();
+    if (!__atomic_load_n(&sp_real_write, __ATOMIC_ACQUIRE)) {
+      errno = ENOSYS;
+      return -1;
+    }
+  }
   if (count == SP_MSG && sp_on() && sp_from_ntdll(__builtin_return_address(0))) {
     struct iovec one = { (void *)buf, count };
     ssize_t r = sp_send_masked(fd, &one, 1);
@@ -395,7 +408,13 @@ ssize_t write(int fd, const void *buf, size_t count) {
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
   ssize_t nl;
   if (bl_nl_writev(fd, iov, iovcnt, &nl)) return nl;
-  if (__builtin_expect(!__atomic_load_n(&sp_real_writev, __ATOMIC_ACQUIRE), 0)) sp_resolve();
+  if (__builtin_expect(!__atomic_load_n(&sp_real_writev, __ATOMIC_ACQUIRE), 0)) {
+    sp_resolve();
+    if (!__atomic_load_n(&sp_real_writev, __ATOMIC_ACQUIRE)) {
+      errno = ENOSYS;
+      return -1;
+    }
+  }
   if (iovcnt > 0 && iov[0].iov_len == SP_MSG && sp_on() && sp_from_ntdll(__builtin_return_address(0))) {
     ssize_t r = sp_send_masked(fd, iov, iovcnt);
     if (r != -2) return r;
@@ -412,7 +431,13 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
 }
 
 ssize_t read(int fd, void *buf, size_t count) {
-  if (__builtin_expect(!__atomic_load_n(&sp_real_read, __ATOMIC_ACQUIRE), 0)) sp_resolve();
+  if (__builtin_expect(!__atomic_load_n(&sp_real_read, __ATOMIC_ACQUIRE), 0)) {
+    sp_resolve();
+    if (!__atomic_load_n(&sp_real_read, __ATOMIC_ACQUIRE)) {
+      errno = ENOSYS;
+      return -1;
+    }
+  }
   if (__builtin_expect(sp_pending != SP_IDLE, 0) && count == SP_MSG && bl_from_ntdll(__builtin_return_address(0))) {
     if (sp_pending == SP_FAKE) {
       if (fd != sp_rfd) return sp_real_read(fd, buf, count);

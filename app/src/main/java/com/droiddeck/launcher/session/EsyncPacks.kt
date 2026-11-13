@@ -426,7 +426,7 @@ object EsyncPacks {
         if (!poolsReported.add("${tool.toolDir}\t${tool.packId}")) return@filter false
         Log.w(TAG, "sync pack ${tool.packId} for ${tool.versionLine.ifEmpty { tool.toolDir }} has no semaphore pool: no pack with the " +
             "pool matches this Proton build yet; games get libblsession.so's pool instead where droiddeck-esync finds the wineserver's " +
-            "request numbers (BL_SYNC_SEMPOOL=preload)")
+            "request numbers (BL_SYNC_SEMPOOL=preload), unless BL_SEMPOOL_PRELOAD=0")
         SessionEvents.record("sync.pool", mapOf("id" to tool.packId, "proton" to tool.versionLine, "result" to "missing"))
         true
     }

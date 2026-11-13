@@ -13,9 +13,10 @@ from pathlib import Path
 GAME_TU_DEBUG = "DROIDDECK_GAME_TU_DEBUG"
 CHROMIUM_FILES = {"chrome-sandbox", "chrome_100_percent.pak", "v8_context_snapshot.bin"}
 SYNC_KEYS = ("BL_SYNC", "BL_SYNC_FALLBACK", "BL_FSYNC_FIRST", "BL_SYNC_MIN_NOFILE", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC", "PROTON_NO_NTSYNC", "WINEESYNC",
-             "WINE_SEM_POOL", "BL_SEMPOOL_PRELOAD")
+             "WINE_SEM_POOL", "BL_SEMPOOL_PRELOAD", "BL_SYNC_NO_PACK")
 SEED_REDISTS = "/usr/local/bin/droiddeck-seed-redists"
-PACK_KEYS = ("WINESERVER", "BL_SYNC_PACK", "WINEESYNC", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC", "BL_SYNC_SEMPOOL", "BL_SEMPOOL")
+PACK_KEYS = ("WINESERVER", "BL_SYNC_PACK", "WINEESYNC", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC")
+POOL_KEYS = ("BL_SYNC_SEMPOOL", "BL_SEMPOOL")
 
 
 def game_id(env):
@@ -734,6 +735,8 @@ def without_pack(chosen_env, env):
             result[name] = env[name]
         else:
             result.pop(name, None)
+    for name in POOL_KEYS:
+        result.pop(name, None)
     return result
 
 

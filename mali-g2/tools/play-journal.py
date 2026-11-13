@@ -372,7 +372,8 @@ def cmd_show(args, records):
         f"  logs: files/logs/{r.get('logs')}   app {get(r, 'app', 'version')} {get(r, 'app', 'commit')}",
         "gpu:", kv(r.get("gpu")),
         "sync:", kv({k: v for k, v in (r.get("env") or {}).items()
-                     if k in ("BL_SYNC", "BL_SYNC_PACK", "BL_SYNC_SEMPOOL", "WINEESYNC", "BL_FSYNC", "WINE_SEM_POOL")}),
+                     if k in ("BL_SYNC", "BL_SYNC_PACK", "BL_SYNC_SEMPOOL", "BL_SYNC_NO_PACK", "WINEESYNC", "BL_FSYNC",
+                              "WINE_SEM_POOL")}),
         "display:", kv(r.get("display")),
         "fps:", kv({k: v for k, v in (r.get("fps") or {}).items() if k != "perMin"}),
         "refresh:", kv({k: v for k, v in (r.get("hz") or {}).items() if k != "perMin"}),
