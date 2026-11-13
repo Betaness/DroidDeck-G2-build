@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -345,6 +346,50 @@ void *sp_test_dlsym(void *handle, const char *name) { (void)handle; (void)name; 
 """
 
 
+# A do-nothing audit module like libblaudit.so (no libc). With LD_AUDIT set, glibc sizes the static TLS block
+# before it loads the preloads, which then only get what is left over.
+AUDIT = r"""
+unsigned int la_version(unsigned int version) { return version; }
+"""
+
+# 2 KiB of initial-exec TLS, more than glibc leaves over after an audit module: shows whether this loader
+# reproduces "cannot allocate memory in static TLS block".
+STATIC_TLS = r"""
+static __thread __attribute__((tls_model("initial-exec"))) char block[2048];
+char *static_tls_block(void) { return block; }
+"""
+
+# Stands in for the coreutils of a launch script where those are not aarch64 programs (qemu).
+TOOLS = r"""
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+  char dir[PATH_MAX], link[PATH_MAX], back[PATH_MAX], when[64];
+  if (argc != 2) return 1;
+  snprintf(dir, sizeof dir, "%s/d", argv[1]);
+  snprintf(link, sizeof link, "%s/l", argv[1]);
+  if (mkdir(dir, 0700) && errno != EEXIST) return 2;
+  unlink(link);
+  if (symlink(dir, link)) return 3;
+  ssize_t n = readlink(link, back, sizeof back - 1);
+  if (n < 0) return 4;
+  back[n] = 0;
+  time_t now = time(NULL);
+  if (!strftime(when, sizeof when, "%Y-%m-%d", localtime(&now))) return 5;
+  printf("%s %s\n", strcmp(back, dir) ? "wrong" : "ok", when);
+  return 0;
+}
+"""
+
+STATIC_TLS_ERROR = "cannot allocate memory in static TLS block"
+
+
 class SemaphorePoolPreloadTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -371,6 +416,15 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
                         *(p for p in sources if not p.endswith("/sempool.c")), str(tmp / "sempool-nodlsym.o"), str(tmp / "nodlsym.c"),
                         "-ldl"], check=True)
         subprocess.run([cls.cc, "-O1", "-o", str(tmp / "nosym"), str(tmp / "nosym.c")], check=True)
+        (tmp / "audit.c").write_text(AUDIT)
+        (tmp / "static-tls.c").write_text(STATIC_TLS)
+        (tmp / "tools.c").write_text(TOOLS)
+        subprocess.run([cls.cc, "-shared", "-fPIC", "-O2", "-nostdlib", "-o", str(tmp / "audit.so"), str(tmp / "audit.c")], check=True)
+        subprocess.run([cls.cc, "-shared", "-fPIC", "-O2", "-o", str(tmp / "libstatictls.so"), str(tmp / "static-tls.c")], check=True)
+        subprocess.run([cls.cc, "-O1", "-o", str(tmp / "tools"), str(tmp / "tools.c")], check=True)
+        cls.audit = tmp / "audit.so"
+        cls.static_tls = tmp / "libstatictls.so"
+        cls.tools = tmp / "tools"
         cls.nosym = tmp / "nosym"
         cls.nodlsym = tmp / "libnodlsym.so"
         cls.program = tmp / "prog"
@@ -382,20 +436,26 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def run_program(self, mode, protocol="40,21", program=None, preload=None):
-        args = [str(program or self.program)] + (mode if isinstance(mode, list) else [mode])
+    def launch(self, args, protocol=None, preload=None, audit=False):
         env = dict(os.environ)
-        env.pop("LD_PRELOAD", None)
-        env.pop("BL_SEMPOOL", None)
+        for name in ("LD_PRELOAD", "LD_AUDIT", "BL_SEMPOOL"):
+            env.pop(name, None)
         if protocol:
             env["BL_SEMPOOL"] = protocol
+        loader = {"LD_PRELOAD": str(preload or self.preload)}
+        if audit:
+            loader["LD_AUDIT"] = str(self.audit)
         if self.prefix:
             # qemu splits -E values on commas, so BL_SEMPOOL reaches the guest through qemu's own environment.
-            cmd = list(self.prefix) + ["-E", "LD_PRELOAD=" + str(preload or self.preload)] + args
+            cmd = list(self.prefix) + [arg for name, value in loader.items() for arg in ("-E", name + "=" + value)] + args
         else:
-            env["LD_PRELOAD"] = str(preload or self.preload)
+            env.update(loader)
             cmd = args
-        out = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
+        return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
+
+    def run_program(self, mode, protocol="40,21", program=None, preload=None, audit=False):
+        args = [str(program or self.program)] + (mode if isinstance(mode, list) else [mode])
+        out = self.launch(args, protocol, preload, audit)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.stderr = out.stderr
         return tuple(map(int, out.stdout.split()))
@@ -442,10 +502,15 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
         for protocol in ("40,21", None):
             self.assertEqual(self.run_program([], protocol=protocol, program=self.nosym, preload=self.nodlsym), (-1, 1, -1, 1, -1, 1))
 
-    def test_the_pool_state_uses_static_tls(self):
+    def test_the_preload_asks_for_no_static_tls(self):
         readelf = shutil.which("readelf")
         if readelf is None:
             self.skipTest("no readelf")
+        # Initial-exec and local-exec relocations of aarch64, x86_64 and i386, in objects and in linked libraries.
+        static = re.compile(r"GOTTPREL|GOTTPOFF|TLS_IE|TLS_GOTIE|TLSLE|TLS_LE|TLS_TPREL|_TPOFF")
+        def static_relocations(path):
+            out = subprocess.run([readelf, "-rW", str(path)], capture_output=True, text=True, check=True).stdout
+            return [line for line in out.splitlines() if static.search(line)]
         compilers = [(self.cc, [])]
         if platform.machine() == "x86_64" and shutil.which("gcc"):
             compilers += [("gcc", ["-m64"]), ("gcc", ["-m32"])]
@@ -458,9 +523,45 @@ class SemaphorePoolPreloadTest(unittest.TestCase):
                 if built.returncode and flags == ["-m32"]:
                     self.skipTest("no 32-bit headers")
                 self.assertEqual(built.returncode, 0, built.stderr)
-                relocations = subprocess.run([readelf, "-rW", str(obj)], capture_output=True, text=True, check=True).stdout
-                self.assertRegex(relocations, r"GOTTPREL|GOTTPOFF|TLS_IE|TLS_GOTIE")
-                self.assertNotRegex(relocations, r"TLSDESC|TLS_DESC|TLS_GOTDESC|TLSGD|TLSLD|TLS_GD|TLS_LDM|DTPOFF|DTPREL|DTPMOD")
+                self.assertEqual(static_relocations(obj), [])
+                library = self.preload
+                if flags:
+                    library = tmp / "libblsession-x86.so"
+                    subprocess.run([cc, *flags, "-shared", "-fPIC", "-O2", "-Wall", "-pthread", "-o", str(library),
+                                    *sorted(str(p) for p in PRELOAD.glob("*.c")), "-ldl"], check=True)
+                self.assertEqual(static_relocations(library), [])
+                dynamic = subprocess.run([readelf, "-dW", str(library)], capture_output=True, text=True, check=True).stdout
+                self.assertNotIn("STATIC_TLS", dynamic)
+
+    def test_programs_start_with_an_audit_module_and_the_preload(self):
+        with tempfile.TemporaryDirectory() as work:
+            control = self.launch([str(self.tools), work], preload=self.static_tls, audit=True)
+            out = self.launch([str(self.tools), work], audit=True)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertNotIn(STATIC_TLS_ERROR, out.stderr)
+            self.assertTrue(out.stdout.startswith("ok "), out.stdout)
+            if not self.prefix:
+                commands = [["true"], ["date"], ["dirname", "/a/b"], ["awk", "BEGIN { exit 0 }"], ["mkdir", "-p", work + "/m"],
+                            ["ln", "-sfn", work + "/m", work + "/n"], ["sh", "-c", "exit 0"], ["python3", "-c", "pass"]]
+                for command in commands:
+                    path = shutil.which(command[0])
+                    if path is None:
+                        continue
+                    with self.subTest(command=command[0]):
+                        out = self.launch([path, *command[1:]], audit=True)
+                        self.assertEqual(out.returncode, 0, out.stderr)
+                        self.assertNotIn(STATIC_TLS_ERROR, out.stderr)
+        if STATIC_TLS_ERROR not in control.stderr:
+            self.skipTest("this loader keeps 2 KiB of static TLS free after an audit module, so it cannot show the failure")
+
+    def test_the_pool_works_with_an_audit_module(self):
+        self.assertEqual(self.run_program("loop", audit=True), (1, 0, 0, 1))
+        self.assertEqual(self.stderr.splitlines().count(IN_USE), 1, self.stderr)
+        creates, closes, others, clashes = self.run_program("threads", audit=True)
+        self.assertEqual((closes, others, clashes), (40, 40, 0))
+        self.assertTrue(4 <= creates <= 44, creates)
+        self.assertEqual(self.run_program("fork", audit=True), (2, 0, 0, 1))
+        self.assertEqual(self.run_program("loop", protocol=None, audit=True), (1000, 1000, 0, 1000))
 
     def test_only_an_identical_create_reuses_a_semaphore(self):
         self.assertEqual(self.run_program("different"), (2, 0, 0, 1))
