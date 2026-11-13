@@ -1007,9 +1007,17 @@ class GameEnvironmentTest(unittest.TestCase):
 
     def test_a_games_wine_sync_choice_also_reaches_its_setup_runs(self):
         env = {"BL_SYNC": "1", "BL_SYNC_FALLBACK": "1", "BL_FSYNC_FIRST": "0", "OTHER": "kept"}
-        config = {"version": 1, "games": {"42": {"BL_SYNC": "0", "BL_FSYNC_FIRST": "1", "PROTON_NO_ESYNC": "1", "FEX_TSOENABLED": "1"}}}
+        config = {"version": 1, "games": {"42": {"BL_SYNC": "0", "BL_FSYNC_FIRST": "1", "PROTON_NO_ESYNC": "1", "FEX_TSOENABLED": "1",
+                                                 "BL_SEMPOOL_PRELOAD": "0", "WINE_SEM_POOL": "0", "BL_SYNC_NO_PACK": "1"}}}
         chosen = MODULE["apply_config"](env, MODULE["sync_config"](config, "42"), "42")
-        self.assertEqual(chosen, {"BL_SYNC": "0", "BL_SYNC_FALLBACK": "1", "BL_FSYNC_FIRST": "1", "PROTON_NO_ESYNC": "1", "OTHER": "kept"})
+        self.assertEqual(chosen, {"BL_SYNC": "0", "BL_SYNC_FALLBACK": "1", "BL_FSYNC_FIRST": "1", "PROTON_NO_ESYNC": "1", "OTHER": "kept",
+                                  "BL_SEMPOOL_PRELOAD": "0", "WINE_SEM_POOL": "0", "BL_SYNC_NO_PACK": "1"})
+
+    def test_a_stock_fallback_drops_the_preload_semaphore_pool(self):
+        chosen = {"BL_SYNC_PACK": "p-r1", "BL_SYNC_SEMPOOL": "preload", "BL_SEMPOOL": "40,21", "WINESERVER": "/dist/wineserver", "X": "1"}
+        self.assertEqual(MODULE["without_pack"](chosen, {"X": "1"}), {"X": "1"})
+        inherited = {"X": "1", "BL_SYNC_PACK": "p-r0", "BL_SYNC_SEMPOOL": "on", "BL_SEMPOOL": "1,2"}
+        self.assertEqual(MODULE["without_pack"](chosen, inherited), {"X": "1", "BL_SYNC_PACK": "p-r0"})
 
     def test_component_profiles_override_general_and_restore_it_for_the_next_game(self):
         with tempfile.TemporaryDirectory() as tmp:

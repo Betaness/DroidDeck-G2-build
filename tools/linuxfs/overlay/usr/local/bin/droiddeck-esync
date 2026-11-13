@@ -32,6 +32,17 @@ NTSYNC_MARKER = b"/dev/ntsync"
 # Printed by ntdll.so of the packs with the semaphore pool (patch 0002, rev 2 here); upstream's rev 1 packs lack it.
 SEMPOOL_MARKER = b"droiddeck-sempool: up and running"
 SEMPOOL_KEY = "BL_SYNC_SEMPOOL"
+# [mali-g2] Read by libblsession.so (sempool.c): "<create_semaphore>,<close_handle>" request numbers.
+PRELOAD_KEY = "BL_SEMPOOL"
+PRELOAD_SWITCH = "BL_SEMPOOL_PRELOAD"
+SWITCHED_OFF = ("0", "off", "false", "no")
+# [mali-g2] Runs a launch on the stock binaries even where a pack fits, so the preload pool can be compared with a pack's.
+NO_PACK_SWITCH = "BL_SYNC_NO_PACK"
+EM_AARCH64, EM_X86_64 = 183, 62
+R_AARCH64_RELATIVE, R_X86_64_RELATIVE = 1027, 8
+RELATIVE_RELOCATIONS = {EM_AARCH64: R_AARCH64_RELATIVE, EM_X86_64: R_X86_64_RELATIVE}
+PT_LOAD, PT_DYNAMIC = 1, 2
+DT_NULL, DT_RELA, DT_RELASZ, DT_RELRSZ, DT_RELR = 0, 7, 8, 35, 36
 WINESERVER_ONLY = ("PROTON_NO_ESYNC", "PROTON_NO_FSYNC", "PROTON_NO_NTSYNC")
 NOSYNC_APPS = frozenset(("2630", "1060210", "414740", "201510", "1233880"))
 SOURCES = ("Proton Experimental (ARM64)", "Proton 11.0 (ARM64)")
@@ -45,7 +56,7 @@ LOG_LINES = 200
 LIVE_FILE = "prefixes.json"
 LIVE_ROWS = 200
 LIVE_KEYS = ("WINESERVER", "BL_SYNC_PACK", "WINEESYNC", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC", "BL_SYNC", "BL_FSYNC", "WINEFSYNC",
-             SEMPOOL_KEY)
+             SEMPOOL_KEY, PRELOAD_KEY)
 CACHE_ROWS = 512
 TEMP_AGE = 3600
 GC_GRACE = 600
@@ -171,6 +182,86 @@ def exports_hash(path):
     except (struct.error, IndexError) as error:
         raise ValueError("%s is a truncated ELF file (%s)" % (path, error))
     return hashlib.sha256(b"\n".join(sorted(names))).hexdigest()
+
+
+def semaphore_requests(path):
+    """The create_semaphore and close_handle request numbers ("<create>,<close>") in the wineserver's request name
+    table, which starts at new_process; None when the table is not found. Based on Droid-Deck/DroidDeck#2351."""
+    try:
+        with open(path, "rb") as source:
+            data = source.read()
+        if data[:4] != b"\x7fELF" or data[4:6] != b"\x02\x01":
+            return None
+        relative_type = RELATIVE_RELOCATIONS.get(struct.unpack_from("<H", data, 18)[0])
+        phoff = struct.unpack_from("<Q", data, 32)[0]
+        phsize, phnum = struct.unpack_from("<HH", data, 54)
+        loads = []
+        dynamic = None
+        for index in range(phnum):
+            kind, _, offset, vaddr, _, filesz = struct.unpack_from("<IIQQQQ", data, phoff + index * phsize)
+            if kind == PT_LOAD:
+                loads.append((vaddr, offset, filesz))
+            elif kind == PT_DYNAMIC:
+                dynamic = (offset, filesz)
+
+        def file_offset(vaddr, size):
+            for start, offset, filesz in loads:
+                if start <= vaddr and vaddr + size <= start + filesz:
+                    return offset + vaddr - start
+            return None
+
+        tags = {}
+        if dynamic is not None:
+            for entry in range(dynamic[0], dynamic[0] + dynamic[1] - 15, 16):
+                tag, value = struct.unpack_from("<qQ", data, entry)
+                if tag == DT_NULL:
+                    break
+                tags.setdefault(tag, value)
+        pointers = {}
+        size = tags.get(DT_RELASZ, 0) - tags.get(DT_RELASZ, 0) % 24
+        start = file_offset(tags[DT_RELA], size) if DT_RELA in tags and relative_type else None
+        if start is not None:
+            for where, info, addend in struct.iter_unpack("<QQq", data[start:start + size]):
+                if info & 0xffffffff == relative_type:
+                    pointers[where] = addend
+        size = tags.get(DT_RELRSZ, 0) - tags.get(DT_RELRSZ, 0) % 8
+        start = file_offset(tags[DT_RELR], size) if DT_RELR in tags else None
+        if start is not None:
+            slots = []
+            base = 0
+            for (word,) in struct.iter_unpack("<Q", data[start:start + size]):
+                if not word & 1:
+                    slots.append(word)
+                    base = word + 8
+                    continue
+                slots += [base + 8 * bit for bit in range(63) if word >> (bit + 1) & 1]
+                base += 63 * 8
+            for where in slots:
+                offset = file_offset(where, 8)
+                if offset is not None:
+                    pointers.setdefault(where, struct.unpack_from("<Q", data, offset)[0])
+
+        def name_at(vaddr):
+            begin = file_offset(vaddr, 1)
+            if begin is None:
+                return None
+            end = data.find(b"\0", begin, begin + 64)
+            return data[begin:end] if end > begin else None
+
+        for first in sorted(where for where, target in pointers.items() if name_at(target) == b"new_process"):
+            names = []
+            where = first
+            while where in pointers:
+                name = name_at(pointers[where])
+                if not name or not name.replace(b"_", b"").isalnum() or (names and name == b"new_process"):
+                    break
+                names.append(name)
+                where += 8
+            if len(names) > 100 and names.count(b"create_semaphore") == 1 and names.count(b"close_handle") == 1:
+                return "%d,%d" % (names.index(b"create_semaphore"), names.index(b"close_handle"))
+    except (OSError, struct.error, ValueError, OverflowError):
+        pass
+    return None
 
 
 def stat_key(info):
@@ -419,18 +510,64 @@ def pack_pool(root, pack):
         return False
 
 
-def pool_state(root, pack, env):
-    if not pack_pool(root, pack):
-        return "none"
+def pool_wanted(env):
     # ntdll reads WINE_SEM_POOL with atoi(): unset means on, anything that parses as 0 means off.
     value = env.get("WINE_SEM_POOL")
     number = re.match(r"\s*([+-]?\d+)", value) if value is not None else None
-    return "on" if value is None or (number is not None and int(number.group(1)) != 0) else "off"
+    return value is None or (number is not None and int(number.group(1)) != 0)
 
 
-def describe_pool(state):
-    return {"on": "semaphore pool on", "off": "semaphore pool off (WINE_SEM_POOL)",
-            "none": "no semaphore pool in this pack (every anonymous semaphore is a wineserver round trip)"}[state]
+def pack_pool_choice(env):
+    env.pop(PRELOAD_KEY, None)
+    env[SEMPOOL_KEY] = "on" if pool_wanted(env) else "off"
+    return "semaphore pool on" if env[SEMPOOL_KEY] == "on" else "semaphore pool off (WINE_SEM_POOL)"
+
+
+def preload_off(env):
+    if (env.get(PRELOAD_SWITCH) or "").strip().lower() in SWITCHED_OFF:
+        return PRELOAD_SWITCH
+    return None if pool_wanted(env) else "WINE_SEM_POOL"
+
+
+def preload_choice(env, server, pack=None, pooled=None, forced=False):
+    """The pool of libblsession.so for a launch whose binaries have none ([pack] is the pack in use without one). It stands
+    in where no pack with the pool fits the Proton build ([pooled] is the one that does), or where [forced] keeps that pack
+    out. BL_SYNC_SEMPOOL is none, the play journal's nopool, only where no pack with the pool fits and this pool does not run."""
+    env.pop(PRELOAD_KEY, None)
+    off = preload_off(env)
+    numbers = None if off or (pooled is not None and not forced) else semaphore_requests(server)
+    if numbers is not None:
+        env[PRELOAD_KEY] = numbers
+        env[SEMPOOL_KEY] = "preload"
+        return "preload semaphore pool on (%screate_semaphore %s, close_handle %s)" % (
+            ("this pack has none; " if pack is not None else ""), *numbers.split(","))
+    reason = "%s turns the preload pool off" % off if off else "no request numbers for the preload pool in %s" % server
+    if pooled is not None:
+        env[SEMPOOL_KEY] = "off"
+        if forced:
+            return "semaphore pool off (pack %s has one, but %s keeps it out; %s)" % (pooled["id"], NO_PACK_SWITCH, reason)
+        return "semaphore pool off (pack %s has one, but this launch runs the stock binaries)" % pooled["id"]
+    env[SEMPOOL_KEY] = "none"
+    if pack is not None:
+        return "no semaphore pool in this pack (every anonymous semaphore is a wineserver round trip; %s)" % reason
+    return "no semaphore pool (%s)" % reason
+
+
+def pooled_pack(root, tool):
+    try:
+        cache = HashCache(root)
+        try:
+            pack = find_pack(load_packs(root), measure(tool, cache))
+        finally:
+            cache.save()
+    except Exception:
+        return None
+    return pack if pack is not None and pack_pool(root, pack) else None
+
+
+def describe_pool(env):
+    return {"on": "semaphore pool on", "off": "semaphore pool off", "preload": "preload semaphore pool on",
+            "none": "no semaphore pool"}.get(env.get(SEMPOOL_KEY))
 
 
 def find_pack(packs, measured):
@@ -743,6 +880,7 @@ def want(root, measured):
 
 
 def select(command, env):
+    env = {name: value for name, value in env.items() if name not in (SEMPOOL_KEY, PRELOAD_KEY)}
     result = (list(command), dict(env))
     try:
         command = list(command)
@@ -765,6 +903,10 @@ def select(command, env):
         if kept is not None:
             return kept
         chosen = choose(root, command, env, tool, result)
+        if SEMPOOL_KEY not in chosen[1]:
+            server = chosen[1].get("WINESERVER") or os.path.join(tool, WINESERVER)
+            say("droiddeck-esync: " + preload_choice(chosen[1], server, pooled=pooled_pack(root, tool),
+                                                     forced=truthy(env.get(NO_PACK_SWITCH))))
         remember(root, env, tool, chosen)
         return chosen
     except Exception as error:
@@ -867,7 +1009,12 @@ def keep_live(root, command, env, tool):
             env[name] = value
         else:
             env.pop(name, None)
-    say("droiddeck-esync: Wine is still running in this prefix; keeping its sync choice (%s)" % describe(env))
+    if env.get(SEMPOOL_KEY) == "preload" and preload_off(env) is not None:
+        env.pop(PRELOAD_KEY, None)
+        env[SEMPOOL_KEY] = "off" if pooled_pack(root, tool) is not None else "none"
+    pool = describe_pool(env)
+    say("droiddeck-esync: Wine is still running in this prefix; keeping its sync choice (%s%s)"
+        % (describe(env), ", " + pool if pool else ""))
     log_launch(root, command, env, tool, env.get("BL_SYNC_PACK"))
     return command, env
 
@@ -971,6 +1118,9 @@ def choose(root, command, env, tool, stock):
             log_launch(root, command, env, tool, None)
             return stock
         pack = find_pack(load_packs(root), measured)
+        if pack is not None and truthy(env.get(NO_PACK_SWITCH)):
+            return stand_in(root, command, env, tool, "pack %s left out (%s=%s)" % (pack["id"], NO_PACK_SWITCH, env[NO_PACK_SWITCH]),
+                            measured)
         if pack is None:
             want(root, measured)
             return stand_in(root, command, env, tool, "no pack for %s (%s, ntdll %s)"
@@ -994,11 +1144,11 @@ def choose(root, command, env, tool, stock):
         env["PROTON_NO_FSYNC"] = "1"
     env["WINESERVER"] = os.path.join(dist, WINESERVER)
     env["BL_SYNC_PACK"] = pack["id"]
-    env[SEMPOOL_KEY] = pool_state(root, pack, env)
+    pool = pack_pool_choice(env) if pack_pool(root, pack) else preload_choice(env, env["WINESERVER"], pack)
     command[0] = os.path.join(dist, os.path.basename(command[0]))
     say("droiddeck-esync: pack %s for %s (%s, %s match); droiddeck-ntsync %s, droiddeck-esync %s, fds %s/%s, %s"
         % (pack["id"], name, measured["version_line"], match_kind(pack, measured), "on" if env.get("BL_SYNC") == "1" else "off",
-           "on" if truthy(env["WINEESYNC"]) else "off", limit(soft), limit(hard), describe_pool(env[SEMPOOL_KEY])))
+           "on" if truthy(env["WINEESYNC"]) else "off", limit(soft), limit(hard), pool))
     log_launch(root, command, env, tool, pack["id"])
     return command, env
 

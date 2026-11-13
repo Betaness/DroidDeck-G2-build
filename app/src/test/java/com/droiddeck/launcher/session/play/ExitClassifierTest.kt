@@ -129,6 +129,37 @@ class ExitClassifierTest {
         assertEquals(null, ExitClassifier.keepFor(listOf("no_sempool")))
     }
 
+    @Test fun thePreloadPoolStandingInForAPackIsNotFlagged() {
+        val said = "droiddeck-esync: pack valve-r1 for Proton Experimental (ARM64) (1 v, exact match); droiddeck-ntsync off, " +
+            "droiddeck-esync on, fds 33368/524288, preload semaphore pool on (this pack has none; create_semaphore 40, close_handle 21)"
+        assertEquals(emptyList<String>(), ExitClassifier.classify(ev(semPool = "preload")).flags)
+        assertEquals(emptyList<String>(), ExitClassifier.classify(ev(f = findings(session = listOf(said)))).flags)
+    }
+
+    @Test fun withoutTheEnvironmentOnlyLaunchLinesWithoutAnyPoolAreFlagged() {
+        val pack = "droiddeck-esync: pack valve-r1 for Proton Experimental (ARM64) (1 v, exact match); droiddeck-ntsync off, " +
+            "droiddeck-esync on, fds 33368/524288, "
+        val kept = "droiddeck-esync: Wine is still running in this prefix; keeping its sync choice "
+        val none = listOf(
+            pack + "no semaphore pool in this pack (every anonymous semaphore is a wineserver round trip; BL_SEMPOOL_PRELOAD turns the " +
+                "preload pool off)",
+            "droiddeck-esync: no semaphore pool (BL_SEMPOOL_PRELOAD turns the preload pool off)",
+            "droiddeck-esync: no semaphore pool (no request numbers for the preload pool in /p/Proton (ARM64)/files/bin-arm64/wineserver)",
+            kept + "(droiddeck-esync, no semaphore pool)",
+        )
+        val pooled = listOf(
+            "droiddeck-esync: preload semaphore pool on (create_semaphore 40, close_handle 21)",
+            "droiddeck-esync: semaphore pool off (pack valve-r2 has one, but this launch runs the stock binaries)",
+            "droiddeck-esync: semaphore pool off (pack valve-r2 has one, but BL_SYNC_NO_PACK keeps it out; BL_SEMPOOL_PRELOAD turns " +
+                "the preload pool off)",
+            kept + "(droiddeck-esync, semaphore pool off)",
+            kept + "(droiddeck-ntsync, preload semaphore pool on)",
+        )
+        fun flags(line: String) = ExitClassifier.classify(ev(f = findings(session = listOf(line)))).flags
+        for (line in none) assertEquals(line, listOf("no_sempool"), flags(line))
+        for (line in pooled) assertEquals(line, emptyList<String>(), flags(line))
+    }
+
     @Test fun halfAMinuteWithoutFramesWhileLoadingIsNotAFreeze() {
         // A.V.A.: its first frame, then 30 s of loading behind it.
         fun freeze(all: Long, afterLoad: Long) = "freeze" in ExitClassifier.classify(ExitClassifier.Evidence(

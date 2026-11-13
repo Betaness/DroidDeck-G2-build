@@ -133,6 +133,17 @@ class JournalTest(unittest.TestCase):
         self.assertNotIn("VK_ICD_FILENAMES", sync)
         self.assertIn("nopool", self.run_cli("problems")[0])
 
+    def test_a_launch_kept_off_its_pack_for_the_preload_pool_shows_the_switch(self):
+        play = json.loads(PLAY)
+        play["flags"] = []
+        play["env"].update(BL_SYNC="1", BL_SYNC_NO_PACK="1", BL_SYNC_SEMPOOL="preload")
+        self.path.write_text(json.dumps(play) + "\n", encoding="utf-8")
+        out, _ = self.run_cli("show", "1")
+        sync = out[out.index("sync:"):out.index("display:")]
+        self.assertIn("BL_SYNC_SEMPOOL  preload", sync)
+        self.assertIn("BL_SYNC_NO_PACK  1", sync)
+        self.assertNotIn("nopool", self.run_cli("problems")[0])
+
     def test_show_unknown_play_fails(self):
         with self.assertRaises(SystemExit):
             self.run_cli("show", "9")

@@ -285,6 +285,8 @@ class LogSliceScanner(
             Pattern("oom", "bad_alloc"),
             Pattern("compiler", "cmpbe_v2_compile"),
             Pattern("no_sempool", "no semaphore pool in this pack"),
+            Pattern("no_sempool", "droiddeck-esync: no semaphore pool ("),
+            Pattern("no_sempool", ", no semaphore pool)"),
             Pattern("vulkan", "err:vulkan"),
             Pattern("vulkan", "DxvkError"),
             Pattern("vulkan", "err:   "),
