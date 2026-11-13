@@ -17,16 +17,18 @@
  *   narrow     global barriers (no pNext, access masks 0, destination including CS, VS, FS, transfer,
  *              colour output and both fragment tests) lose VS, TCS, TES, GS and transform feedback,
  *              unless shader code declaring transform feedback or a pipeline with it was seen, or a
- *              device enabled vertexPipelineStoresAndAtomics. Without that feature the vertex
+ *              device enabled vertexPipelineStoresAndAtomics, or vertex, tessellation or geometry
+ *              shader code writing memory was seen (pb_spirv_geo_scan). Without those the vertex
  *              pipeline does not write memory, so it has no write-after-read hazard to wait for.
  *   narrow-rt  narrow, and attachment release barriers (no pNext, layout and queue family
  *              unchanged, source access attachment writes only, source stage colour output or a
  *              fragment test, destination with a vertex pipeline stage) lose VS, TCS, TES and GS,
  *              unless vertex, tessellation or geometry shader code reading an image that is not a
- *              texel buffer was seen (pb_spirv_geo_image_reads), or vertexPipelineStoresAndAtomics
- *              was enabled.
- *   nogeo      every barrier with a fragment stage in its source loses VS, TCS, TES, GS and transform
- *              feedback, without guards: an upper bound of what narrowing gives; it can break rendering.
+ *              texel buffer or writing memory was seen (pb_spirv_geo_scan), or
+ *              vertexPipelineStoresAndAtomics was enabled.
+ *   nogeo      every barrier without pNext with a fragment stage in its source loses VS, TCS, TES, GS
+ *              and transform feedback, without guards: an upper bound of what narrowing gives; it can
+ *              break rendering.
  * A destination stays as it is when dropping would leave it empty or no longer covering its access
  * mask (shader access without a shader stage left, access types not listed here); transform feedback
  * access keeps the transform feedback stage.
@@ -88,7 +90,7 @@ static inline PbMode pb_parse_mode(const char* text, bool* unknown) {
 
 typedef struct {
     bool xfb;           /* transform feedback code or pipelines seen */
-    bool vertexStores;  /* a device enabled vertexPipelineStoresAndAtomics */
+    bool vertexStores;  /* a device enabled vertexPipelineStoresAndAtomics, or vertex pipeline code writing memory seen */
     bool geoImageReads; /* vertex, tessellation or geometry shader code reading images seen */
 } PbGuards;
 
@@ -132,7 +134,7 @@ static inline VkPipelineStageFlags2 pb_drop(VkPipelineStageFlags2 dst, VkAccessF
 
 /* The destination stage mask to record (`cls` from the class function). */
 static inline VkPipelineStageFlags2 pb_memory_dst(PbMode mode, const PbGuards* g, const VkMemoryBarrier2* b, unsigned cls) {
-    if (mode == PB_NOGEO && (cls & PB_FRAG_TO_GEO)) return pb_drop(b->dstStageMask, b->dstAccessMask, PB_GEO | PB_XFB);
+    if (mode == PB_NOGEO && (cls & PB_FRAG_TO_GEO) && !b->pNext) return pb_drop(b->dstStageMask, b->dstAccessMask, PB_GEO | PB_XFB);
     if ((mode == PB_NARROW || mode == PB_NARROW_RT) && (cls & (PB_GLOBAL | PB_GLOBAL_WRITES)) == PB_GLOBAL && !g->xfb && !g->vertexStores)
         return pb_drop(b->dstStageMask, b->dstAccessMask, PB_GEO | PB_XFB);
     return b->dstStageMask;
@@ -140,12 +142,12 @@ static inline VkPipelineStageFlags2 pb_memory_dst(PbMode mode, const PbGuards* g
 
 static inline VkPipelineStageFlags2 pb_buffer_dst(PbMode mode, const PbGuards* g, const VkBufferMemoryBarrier2* b, unsigned cls) {
     (void)g;
-    if (mode == PB_NOGEO && (cls & PB_FRAG_TO_GEO)) return pb_drop(b->dstStageMask, b->dstAccessMask, PB_GEO | PB_XFB);
+    if (mode == PB_NOGEO && (cls & PB_FRAG_TO_GEO) && !b->pNext) return pb_drop(b->dstStageMask, b->dstAccessMask, PB_GEO | PB_XFB);
     return b->dstStageMask;
 }
 
 static inline VkPipelineStageFlags2 pb_image_dst(PbMode mode, const PbGuards* g, const VkImageMemoryBarrier2* b, unsigned cls) {
-    if (mode == PB_NOGEO && (cls & PB_FRAG_TO_GEO)) return pb_drop(b->dstStageMask, b->dstAccessMask, PB_GEO | PB_XFB);
+    if (mode == PB_NOGEO && (cls & PB_FRAG_TO_GEO) && !b->pNext) return pb_drop(b->dstStageMask, b->dstAccessMask, PB_GEO | PB_XFB);
     if (mode == PB_NARROW_RT && (cls & PB_ATTACHMENT) && !g->geoImageReads && !g->vertexStores)
         return pb_drop(b->dstStageMask, b->dstAccessMask, PB_GEO);
     return b->dstStageMask;
@@ -217,9 +219,10 @@ static inline const VkDependencyInfo* pb_rewrite(PbMode mode, const PbGuards* g,
     if (heapBytes && !heap) return info;
     c->heap = heap;
     c->info = *info;
+    size_t at = 0; /* heap is NULL when nothing goes there */
     if (firstMemory != PB_NONE) {
-        VkMemoryBarrier2* copy = memoryHeap ? (VkMemoryBarrier2*)heap : c->memory;
-        heap += memoryHeap * sizeof(VkMemoryBarrier2);
+        VkMemoryBarrier2* copy = memoryHeap ? (VkMemoryBarrier2*)(heap + at) : c->memory;
+        at += memoryHeap * sizeof(VkMemoryBarrier2);
         memcpy(copy, info->pMemoryBarriers, info->memoryBarrierCount * sizeof(*copy));
         for (uint32_t i = firstMemory; i < info->memoryBarrierCount; i++) {
             VkPipelineStageFlags2 dst = pb_memory_dst(mode, g, &copy[i], pb_memory_class(&copy[i]));
@@ -229,8 +232,8 @@ static inline const VkDependencyInfo* pb_rewrite(PbMode mode, const PbGuards* g,
         c->info.pMemoryBarriers = copy;
     }
     if (firstBuffer != PB_NONE) {
-        VkBufferMemoryBarrier2* copy = bufferHeap ? (VkBufferMemoryBarrier2*)heap : c->buffers;
-        heap += bufferHeap * sizeof(VkBufferMemoryBarrier2);
+        VkBufferMemoryBarrier2* copy = bufferHeap ? (VkBufferMemoryBarrier2*)(heap + at) : c->buffers;
+        at += bufferHeap * sizeof(VkBufferMemoryBarrier2);
         memcpy(copy, info->pBufferMemoryBarriers, info->bufferMemoryBarrierCount * sizeof(*copy));
         for (uint32_t i = firstBuffer; i < info->bufferMemoryBarrierCount; i++) {
             VkPipelineStageFlags2 dst = pb_buffer_dst(mode, g, &copy[i], pb_buffer_class(&copy[i]));
@@ -240,7 +243,7 @@ static inline const VkDependencyInfo* pb_rewrite(PbMode mode, const PbGuards* g,
         c->info.pBufferMemoryBarriers = copy;
     }
     if (firstImage != PB_NONE) {
-        VkImageMemoryBarrier2* copy = imageHeap ? (VkImageMemoryBarrier2*)heap : c->images;
+        VkImageMemoryBarrier2* copy = imageHeap ? (VkImageMemoryBarrier2*)(heap + at) : c->images;
         memcpy(copy, info->pImageMemoryBarriers, info->imageMemoryBarrierCount * sizeof(*copy));
         for (uint32_t i = firstImage; i < info->imageMemoryBarrierCount; i++) {
             VkPipelineStageFlags2 dst = pb_image_dst(mode, g, &copy[i], pb_image_class(&copy[i]));
@@ -252,14 +255,29 @@ static inline const VkDependencyInfo* pb_rewrite(PbMode mode, const PbGuards* g,
     return &c->info;
 }
 
-/* ---- the guard of narrow-rt: SPIR-V of the vertex pipeline that reads images ---- */
+/* ---- the guards from shader code: SPIR-V of the vertex pipeline that reads images or writes memory ---- */
 
 static inline bool pb_image_read_op(uint32_t op) {
     return op == 60 /* OpImageTexelPointer */ || (op >= 87 && op <= 98) /* OpImageSample*, Fetch, Gather, DrefGather, Read */ ||
            (op >= 305 && op <= 315) /* OpImageSparseSample*, Fetch, Gather, DrefGather */ || op == 320 /* OpImageSparseRead */;
 }
 
-/* Instructions <result type> <result id> ... an image operand can come from. */
+/* OpImageWrite and the atomics but OpAtomicLoad */
+static inline bool pb_write_op(uint32_t op) {
+    return op == 99 || (op >= 228 && op <= 242) || op == 318 || op == 319 || op == 5614 || op == 5615 || op == 6035;
+}
+
+/* OpStore, OpCopyMemory, OpCopyMemorySized: the pointer written through is the first operand. */
+static inline bool pb_store_op(uint32_t op) {
+    return op >= 62 && op <= 64;
+}
+
+/* Uniform (a BufferBlock), Image, StorageBuffer, PhysicalStorageBuffer */
+static inline bool pb_writable_class(uint32_t storageClass) {
+    return storageClass == 2 || storageClass == 11 || storageClass == 12 || storageClass == 5349;
+}
+
+/* Instructions <result type> <result id> ... an image operand or a pointer can come from. */
 static inline bool pb_typed_value_op(uint32_t op) {
     switch (op) {
     case 1:   /* OpUndef */
@@ -283,49 +301,69 @@ static inline bool pb_typed_value_op(uint32_t op) {
     return false;
 }
 
-enum { PB_KIND_TEXEL_BUFFER = 1, PB_KIND_IMAGE = 2 };
+enum { PB_KIND_TEXEL_BUFFER = 1, PB_KIND_IMAGE = 2, PB_KIND_WRITABLE = 4 };
+enum { PB_SCAN_IMAGE_READS = 1, PB_SCAN_WRITES = 2 };
 
-/* Whether SPIR-V code has a Vertex, TessellationControl, TessellationEvaluation or Geometry entry
- * point and reads texels of an image (the opcodes of pb_image_read_op) whose type is not Dim Buffer:
- * texel buffers are no images to image barriers. An image operand whose type cannot be followed, or
- * code that cannot be parsed after such an entry point, counts as a read. */
-static inline bool pb_spirv_geo_image_reads(const uint32_t* code, size_t words) {
-    if (!code || words < 5 || code[0] != 0x07230203u) return false;
-    bool geo = false, reads = false;
+/* Which of `want` SPIR-V code with a Vertex, TessellationControl, TessellationEvaluation or Geometry
+ * entry point does:
+ *   PB_SCAN_IMAGE_READS  reads texels of an image (the opcodes of pb_image_read_op) whose type is not
+ *                        Dim Buffer: texel buffers are no images to image barriers;
+ *   PB_SCAN_WRITES       writes memory: OpImageWrite, an atomic but OpAtomicLoad, or a store or copy
+ *                        through a pointer of a pb_writable_class storage class.
+ * An image operand or a pointer whose type cannot be followed, code that cannot be parsed after such an
+ * entry point and byte-swapped code count as the operation. */
+static inline unsigned pb_spirv_geo_scan(const uint32_t* code, size_t words, unsigned want) {
+    want &= PB_SCAN_IMAGE_READS | PB_SCAN_WRITES;
+    if (!code || words < 5 || !want) return 0;
+    if (code[0] == 0x03022307u) return want;
+    if (code[0] != 0x07230203u) return 0;
+    bool geo = false;
+    unsigned found = 0, follow = 0; /* follow: candidates that need the types */
     for (size_t i = 5; i < words;) {
         uint32_t op = code[i] & 0xffffu, n = code[i] >> 16;
-        if (!n || n > words - i) return geo;
+        if (!n || n > words - i) return geo ? want : 0;
         if (op == 15 /* OpEntryPoint */ && n >= 2 && code[i + 1] <= 3) geo = true;
-        if (pb_image_read_op(op)) reads = true;
+        if (pb_image_read_op(op)) follow |= PB_SCAN_IMAGE_READS;
+        if (pb_write_op(op)) found |= PB_SCAN_WRITES;
+        if (pb_store_op(op)) follow |= PB_SCAN_WRITES;
         i += n;
     }
-    if (!geo || !reads) return false;
+    if (!geo) return 0;
+    found &= want;
+    follow &= want & ~found;
+    if (!follow) return found;
     uint32_t bound = code[3];
-    if (!bound || bound > (1u << 24)) return true;
+    if (!bound || bound > (1u << 24)) return found | follow;
     uint32_t* ref = calloc(bound, sizeof(uint32_t) + 1); /* id -> its type, or the type a type refers to */
-    if (!ref) return true;
+    if (!ref) return found | follow;
     uint8_t* kind = (uint8_t*)(ref + bound);
     for (size_t i = 5; i < words; i += code[i] >> 16) {
         uint32_t op = code[i] & 0xffffu, n = code[i] >> 16;
         if (op == 25 /* OpTypeImage */ && n >= 9 && code[i + 1] < bound)
-            kind[code[i + 1]] = code[i + 3] == 5 /* Dim Buffer */ ? PB_KIND_TEXEL_BUFFER : PB_KIND_IMAGE;
+            kind[code[i + 1]] |= code[i + 3] == 5 /* Dim Buffer */ ? PB_KIND_TEXEL_BUFFER : PB_KIND_IMAGE;
         else if (op == 27 /* OpTypeSampledImage */ && n >= 3 && code[i + 1] < bound)
             ref[code[i + 1]] = code[i + 2];
-        else if (op == 32 /* OpTypePointer */ && n >= 4 && code[i + 1] < bound)
-            ref[code[i + 1]] = code[i + 3];
-        else if (pb_typed_value_op(op) && n >= 3 && code[i + 2] < bound)
+        else if ((op == 32 /* OpTypePointer */ || op == 39 /* OpTypeForwardPointer */ || op == 4417 /* OpTypeUntypedPointerKHR */) &&
+                 n >= 3 && code[i + 1] < bound) {
+            if (pb_writable_class(code[i + 2])) kind[code[i + 1]] |= PB_KIND_WRITABLE;
+            if (op == 32 && n >= 4) ref[code[i + 1]] = code[i + 3];
+        } else if (pb_typed_value_op(op) && n >= 3 && code[i + 2] < bound)
             ref[code[i + 2]] = code[i + 1];
     }
-    bool found = false;
-    for (size_t i = 5; i < words && !found; i += code[i] >> 16) {
+    for (size_t i = 5; i < words && (follow & ~found); i += code[i] >> 16) {
         uint32_t op = code[i] & 0xffffu, n = code[i] >> 16;
-        if (!pb_image_read_op(op)) continue;
-        uint32_t id = n >= 4 ? code[i + 3] : 0, k = 0;
-        for (int hop = 0; hop < 4 && id && id < bound && !k; hop++) {
-            k = kind[id];
-            id = ref[id];
+        if ((follow & ~found & PB_SCAN_IMAGE_READS) && pb_image_read_op(op)) {
+            uint32_t id = n >= 4 ? code[i + 3] : 0, k = 0;
+            for (int hop = 0; hop < 4 && id && id < bound && !k; hop++) {
+                k = kind[id] & (PB_KIND_TEXEL_BUFFER | PB_KIND_IMAGE);
+                id = ref[id];
+            }
+            if (k != PB_KIND_TEXEL_BUFFER) found |= PB_SCAN_IMAGE_READS;
         }
-        found = k != PB_KIND_TEXEL_BUFFER;
+        if ((follow & ~found & PB_SCAN_WRITES) && pb_store_op(op)) {
+            uint32_t type = n >= 2 && code[i + 1] < bound ? ref[code[i + 1]] : 0;
+            if (!type || type >= bound || (kind[type] & PB_KIND_WRITABLE)) found |= PB_SCAN_WRITES;
+        }
     }
     free(ref);
     return found;

@@ -55,9 +55,9 @@
  *   - DROIDDECK_HYBRIS_PASS_BARRIER=log|narrow|narrow-rt|nogeo (pass_barrier.h): vkCmdPipelineBarrier2
  *     and ...2KHR are wrapped to count DXVK's end-of-render-pass barriers and, in the narrowing modes,
  *     drop the vertex pipeline stages from their destination. Shader code the driver gets (modules,
- *     inline stages, identifier queries) is scanned for the guards. Unset or off: nothing is wrapped
- *     or scanned. A line "hybris-icd: pass barrier: ..." every DROIDDECK_HYBRIS_PASS_BARRIER_LOG_S
- *     seconds (60) of presents, and at device destruction.
+ *     inline stages, identifier queries) is scanned for the guards until they trip. Unset or off:
+ *     nothing is wrapped or scanned. A line "hybris-icd: pass barrier: ..." every
+ *     DROIDDECK_HYBRIS_PASS_BARRIER_LOG_S seconds (60) of presents, and at device destruction.
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
@@ -95,7 +95,7 @@ static uint32_t pbLogSeconds = 60;
 static pthread_once_t pbOnce = PTHREAD_ONCE_INIT;
 static uint32_t pbXfb, pbVertexStores, pbGeoImageReads; /* guards (atomic) */
 static PbCounts pbTotal;                                /* atomic fields */
-static uint64_t pbGeoImageCode, pbPresents, pbStartNs, pbLastLogNs, pbLoggedCalls = UINT64_MAX;
+static uint64_t pbPresents, pbStartNs, pbLastLogNs, pbLoggedCalls = UINT64_MAX;
 
 static void pbReadMode(void) {
     const char* text = getenv("DROIDDECK_HYBRIS_PASS_BARRIER");
@@ -114,19 +114,24 @@ static PbMode pbModeNow(void) {
     return pbMode;
 }
 
-/* Shader code handed to the driver (`what`, and the module's handle when there is one): the guards. */
+/* Shader code handed to the driver (`what`, and the module's handle when there is one): the guards not
+ * tripped yet. */
 static void pbShaderSeen(const VkShaderModuleCreateInfo* info, const char* what, uint64_t handle) {
     if (pbModeNow() == PB_OFF || !info || !info->pCode) return;
     size_t words = info->codeSize / 4;
+    bool xfb = !__atomic_load_n(&pbXfb, __ATOMIC_RELAXED) && xfb_spirv_declares(info->pCode, words);
+    unsigned want = (__atomic_load_n(&pbGeoImageReads, __ATOMIC_RELAXED) ? 0 : PB_SCAN_IMAGE_READS) |
+                    (__atomic_load_n(&pbVertexStores, __ATOMIC_RELAXED) ? 0 : PB_SCAN_WRITES);
+    unsigned found = want ? pb_spirv_geo_scan(info->pCode, words, want) : 0;
+    if (!xfb && !found) return;
     char at[24] = "";
     if (handle) snprintf(at, sizeof(at), " 0x%llx", (unsigned long long)handle);
-    if (!__atomic_load_n(&pbXfb, __ATOMIC_RELAXED) && xfb_spirv_declares(info->pCode, words) &&
-        !__atomic_exchange_n(&pbXfb, 1, __ATOMIC_RELAXED))
+    if (xfb && !__atomic_exchange_n(&pbXfb, 1, __ATOMIC_RELAXED))
         fprintf(stderr, "hybris-icd: pass barrier guard: transform feedback (%s%s)\n", what, at);
-    if (!pb_spirv_geo_image_reads(info->pCode, words)) return;
-    __atomic_add_fetch(&pbGeoImageCode, 1, __ATOMIC_RELAXED);
-    if (!__atomic_exchange_n(&pbGeoImageReads, 1, __ATOMIC_RELAXED))
+    if ((found & PB_SCAN_IMAGE_READS) && !__atomic_exchange_n(&pbGeoImageReads, 1, __ATOMIC_RELAXED))
         fprintf(stderr, "hybris-icd: pass barrier guard: vertex pipeline image reads (%s%s)\n", what, at);
+    if ((found & PB_SCAN_WRITES) && !__atomic_exchange_n(&pbVertexStores, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "hybris-icd: pass barrier guard: vertex pipeline memory writes (%s%s)\n", what, at);
 }
 
 static void* findInChain(const void* chain, VkStructureType type) {
@@ -674,8 +679,9 @@ static PFN_vkCmdPipelineBarrier2 nextPipelineBarrier2, nextPipelineBarrier2KHR;
 /* The counts so far, unless (`force` aside) the interval has not passed, or no barrier came since the
  * last line. */
 static void pbLog(bool force) {
-    uint64_t now = nowNs(), last = __atomic_load_n(&pbLastLogNs, __ATOMIC_RELAXED);
-    if (!force && (now - last < pbLogSeconds * 1000000000ull ||
+    uint64_t last = __atomic_load_n(&pbLastLogNs, __ATOMIC_RELAXED);
+    uint64_t now = nowNs();
+    if (!force && ((int64_t)(now - last) < (int64_t)pbLogSeconds * 1000000000ll ||
                    !__atomic_compare_exchange_n(&pbLastLogNs, &last, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)))
         return;
     if (force) __atomic_store_n(&pbLastLogNs, now, __ATOMIC_RELAXED);
@@ -683,7 +689,7 @@ static void pbLog(bool force) {
     if (__atomic_exchange_n(&pbLoggedCalls, calls, __ATOMIC_RELAXED) == calls) return;
     fprintf(stderr,
             "hybris-icd: pass barrier: pid %d, mode %s, seconds %llu, presents %llu, calls %llu, global %llu, global-writes %llu, "
-            "attachment %llu, frag-to-geo %llu, narrowed %llu, global-dst 0x%llx, attachment-dst 0x%llx, geo-image-code %llu, "
+            "attachment %llu, frag-to-geo %llu, narrowed %llu, global-dst 0x%llx, attachment-dst 0x%llx, "
             "guards xfb %d vertex-stores %d geo-image-reads %d\n",
             (int)getpid(), pb_mode_names[pbMode], (unsigned long long)((now - pbStartNs) / 1000000000ull),
             (unsigned long long)__atomic_load_n(&pbPresents, __ATOMIC_RELAXED), (unsigned long long)calls,
@@ -694,7 +700,6 @@ static void pbLog(bool force) {
             (unsigned long long)__atomic_load_n(&pbTotal.narrowed, __ATOMIC_RELAXED),
             (unsigned long long)__atomic_load_n(&pbTotal.globalDst, __ATOMIC_RELAXED),
             (unsigned long long)__atomic_load_n(&pbTotal.attachmentDst, __ATOMIC_RELAXED),
-            (unsigned long long)__atomic_load_n(&pbGeoImageCode, __ATOMIC_RELAXED),
             __atomic_load_n(&pbXfb, __ATOMIC_RELAXED) || __atomic_load_n(&xfbStats.pipelines, __ATOMIC_RELAXED) ? 1 : 0,
             (int)__atomic_load_n(&pbVertexStores, __ATOMIC_RELAXED), (int)__atomic_load_n(&pbGeoImageReads, __ATOMIC_RELAXED));
 }

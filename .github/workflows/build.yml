@@ -386,13 +386,40 @@ jobs:
           path: hybris-guest
           if-no-files-found: error
           retention-days: 14
+
+  # [mali-g2] Tests of the hybris ICD, a job of their own: the hybris job may fail without failing the run,
+  # these may not. Nothing waits for them, so they do not decide whether the APK carries libhybris.
+  hybris-tests:
+    name: libhybris Vulkan tests (mali-g2)
+    needs: hybris
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: hybris-guest
+          path: hybris-guest
       - name: Tests of DROIDDECK_HYBRIS_PASS_BARRIER (no GPU; lavapipe behind the ICD)
         run: |
           set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc clang libvulkan-dev mesa-vulkan-drivers >/dev/null
           cc -O2 -Wall -Wextra -Werror -Imali-g2/hybris/src -o /tmp/pass_barrier_test mali-g2/hybris/tests/pass_barrier_test.c
           /tmp/pass_barrier_test
-          sudo apt-get install -y -qq mesa-vulkan-drivers >/dev/null
-          OUT="$PWD/hybris-guest" sh mali-g2/hybris/tests/pass_barrier_icd_test.sh
+          clang -O1 -g -Wall -Wextra -Werror -fsanitize=undefined,pointer-overflow -fno-sanitize-recover=all -Imali-g2/hybris/src \
+            -o /tmp/pass_barrier_test_ubsan mali-g2/hybris/tests/pass_barrier_test.c
+          /tmp/pass_barrier_test_ubsan
+          if [ -f hybris-guest/usr/local/lib/droiddeck-hybris/libdroiddeck_hybris_vk.so ]; then
+            OUT="$PWD/hybris-guest" sh mali-g2/hybris/tests/pass_barrier_icd_test.sh
+          else
+            echo "::warning::no hybris-guest artifact (the hybris job failed): the ICD test did not run"
+          fi
 
   build-runner:
     needs: [components]
