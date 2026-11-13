@@ -12,7 +12,9 @@
 #   zero-copy-shared-queue  the application takes every queue and submits from a second thread too:
 #               acquire shares a queue, under a lock
 #   zero-copy-afbc  buffers as the session allocates them (likely AFBC: pixels not checked)
-#   cover-partly, cover-fully  another window over the window: X11 copies, paced frames, back
+#   cover-partly, cover-fully  another window over the window: X11 copies, paced frames (10 a second), back
+#   cover-fully-default  the same at the default pace of hidden windows (VORTEK_COVERED_FPS unset: 1 a
+#               second), fewer frames
 #   vkcube      vkcube zero-copy, its last frame in out/tests/vkcube.ppm
 #   resize      the window shrinks halfway: VK_SUBOPTIMAL_KHR, swapchain recreated
 #   fshack, fshack-copy  ../vortek/tests/fshack_test.c: Proton's fullscreen hack (an emulated display
@@ -92,8 +94,11 @@ run resize SC_RESIZE=1 SC_EXPECT_COPY=1
 export MOCK_GAPS=1
 run_zc cover-partly early SC_COVER=partly SC_FRAMES=180 DROIDDECK_HYBRIS_AHB_CPU_READ=1
 grep -q 'now through X11, partly covered by' "$TMP/cover-partly.log" || failed="$failed cover-partly(no-X11-path)"
-run_zc cover-fully early SC_COVER=fully SC_FRAMES=180 DROIDDECK_HYBRIS_AHB_CPU_READ=1
+run_zc cover-fully early SC_COVER=fully SC_FRAMES=180 DROIDDECK_HYBRIS_AHB_CPU_READ=1 VORTEK_COVERED_FPS=10
 grep -q 'now hidden, frames paced' "$TMP/cover-fully.log" || failed="$failed cover-fully(not-paced)"
+run_zc cover-fully-default early SC_COVER=fully SC_FRAMES=30 DROIDDECK_HYBRIS_AHB_CPU_READ=1
+grep -q 'now hidden, frames paced' "$TMP/cover-fully-default.log" || failed="$failed cover-fully-default(not-paced)"
+grep -q 'hidden windows paced to 1 a second' "$TMP/cover-fully-default.log" || failed="$failed cover-fully-default(not-1)"
 unset MOCK_GAPS
 export TEST=fshack_test
 run_zc fshack early DROIDDECK_HYBRIS_AHB_CPU_READ=1 FS_MODE=fshack

@@ -352,6 +352,12 @@ jobs:
           JOBS=4 mali-g2/vortek/build-client.sh "$PWD/vortek-client"
           install -m644 mali-g2/vortek/NOTICE mali-g2/vortek/LICENSE.LGPL-2.1 vortek-client/
           ls -l vortek-client
+      - name: Hidden-window pacing test (mali-g2)
+        run: |
+          set -euo pipefail
+          mkdir -p mali-g2/vortek/out
+          cc -O2 -Wall -Werror -Imali-g2/vortek/src -o mali-g2/vortek/out/covered_pacing_test mali-g2/vortek/tests/covered_pacing_test.c -lm
+          mali-g2/vortek/out/covered_pacing_test
       - uses: actions/upload-artifact@v4
         with:
           name: vortek-client
