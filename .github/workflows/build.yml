@@ -386,6 +386,8 @@ jobs:
           path: hybris-guest
           if-no-files-found: error
           retention-days: 14
+      - name: Unit tests of the hybris guards (no GPU)
+        run: sh mali-g2/hybris/tests/guards_test.sh
 
   # [mali-g2] Tests of the hybris ICD, a job of their own: the hybris job may fail without failing the run,
   # these may not. Nothing waits for them, so they do not decide whether the APK carries libhybris.
