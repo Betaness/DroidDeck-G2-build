@@ -21,6 +21,8 @@
  *   VORTEK_RECREATE_LIMIT=N  [mali-g2] swapchains per second with the same parameters for a window
  *                        before a size mismatch stops being reported as VK_SUBOPTIMAL_KHR (default 10,
  *                        0: never; swapchain_loop.h)
+ *   VORTEK_COVERED_FPS=N [mali-g2] frames a second of a window that is entirely hidden (default 1;
+ *                        covered_pacing.h)
  *
  * [mali-g2] Zero-copy: when the server backs the swapchain with AHardwareBuffers and DroidDeck's
  * compositor is reachable, a present that no other X window covers is handed to the server
@@ -48,6 +50,7 @@
 
 #include "vortek.h"
 #include "client_x11_present.h"
+#include "covered_pacing.h"
 #include "droiddeck_requests.h"
 #include "swapchain_loop.h"
 
@@ -108,6 +111,7 @@ typedef struct X11Swapchain {
     bool covered;              /* nothing of the window is visible: frames are dropped, paced */
     uint32_t coverCountdown;
     double lastCoveredFrame;
+    bool pacedShared;          /* the last hidden frame kept COVERED_SHARED_FPS (covered_pacing.h) */
     uint32_t rootOrder;        /* the root's children when coverage was last checked (hashed), 0: unknown */
     /* the window's ancestors up to the root and their origins in root coordinates */
     int chainLength;
@@ -138,6 +142,8 @@ typedef struct X11Swapchain {
         int chainLength;
         xcb_window_t chain[16];
         uint64_t key;          /* the stacking key the compositor has */
+        double shownAt;        /* when a frame of it was last drawn (zero-copy or through X11), 0: never */
+        pthread_t shownThread; /* the thread that presented it */
     } pub;
     /* Held across a zero-copy present (request and publishLayer); the sweep only trylocks it, so a
      * HIDE or RESTACK never overtakes a present that is on its way. */
@@ -180,6 +186,27 @@ static void publishLayer(X11Swapchain* sc, bool shown, int x, int y, int w, int 
         sc->pub.key = sc->stackKey;
     }
     pthread_mutex_unlock(&registryLock);
+}
+
+static void noteShown(X11Swapchain* sc, double now) {
+    pthread_mutex_lock(&registryLock);
+    sc->pub.shownAt = now;
+    sc->pub.shownThread = pthread_self();
+    pthread_mutex_unlock(&registryLock);
+}
+
+/* Whether this thread drew a frame of another window of the process recently (covered_pacing.h). */
+static bool shownOnThisThread(X11Swapchain* sc, double now) {
+    pthread_t self = pthread_self();
+    bool shown = false;
+    pthread_mutex_lock(&registryLock);
+    for (int i = 0; i < MAX_TRACKED_SWAPCHAINS && !shown; i++) {
+        X11Swapchain* other = registry[i];
+        if (other && other != sc && other->pub.shownAt > 0)
+            shown = covered_shown_recently(now, other->pub.shownAt, pthread_equal(other->pub.shownThread, self));
+    }
+    pthread_mutex_unlock(&registryLock);
+    return shown;
 }
 
 static struct {
@@ -860,14 +887,8 @@ static bool checkOccluded(X11Swapchain* sc, int x, int y, int w, int h) {
     return occluded;
 }
 
-/* For swapchains on the X11 path: whether the window is entirely hidden, re-checked every frame
- * while it is (cheap at the paced rate) and every 10 frames otherwise. */
-static void updateCoverage(X11Swapchain* sc) {
-    if (sc->coverCountdown > 0 && !sc->covered) {
-        sc->coverCountdown--;
-        return;
-    }
-    sc->coverCountdown = 10;
+/* Whether the window is entirely hidden now, in sc->covered. */
+static void checkCoverage(X11Swapchain* sc) {
     xcb_connection_t* conn = sc->surface->conn;
     xcb_get_geometry_reply_t* geo = xcb_get_geometry_reply(conn, xcb_get_geometry(conn, sc->surface->window), NULL);
     if (!geo) { sc->covered = false; return; }
@@ -882,10 +903,20 @@ static void updateCoverage(X11Swapchain* sc) {
     free(geo);
 }
 
+/* For swapchains on the X11 path: whether the window is entirely hidden, re-checked every frame
+ * while it is (cheap at the paced rate) and every 10 frames otherwise. */
+static void updateCoverage(X11Swapchain* sc) {
+    if (sc->coverCountdown > 0 && !sc->covered) {
+        sc->coverCountdown--;
+        return;
+    }
+    sc->coverCountdown = 10;
+    checkCoverage(sc);
+}
+
 /* Whether the root's children changed since the window was found covered (the WM raised or lowered
- * a top-level window, or one came or went). The new order is kept, so a coverage that was not
- * checked again (another swapchain of the present took the semaphores) ends one wait, not all. One
- * round trip. */
+ * a top-level window, or one came or went). The new order is kept, so one change starts one check of
+ * the coverage. One round trip. */
 static bool rootRestacked(X11Swapchain* sc) {
     if (!sc->rootOrder || !sc->root) return false;
     xcb_connection_t* conn = sc->surface->conn;
@@ -898,15 +929,46 @@ static bool rootRestacked(X11Swapchain* sc) {
     return changed;
 }
 
-/* A hidden window's frame: its semaphores are waited for and nothing is copied or drawn, at most
- * COVERED_FPS a second. Windows hidden behind a game (a launcher left running, the Steam client)
- * otherwise render as fast as the GPU allows and take it from the game. The wait is cut into
- * COVERED_SLICE slices and ends early when the root's children changed since the coverage check
- * (also during this frame's GPU wait): a game raised back over a closed menu is checked again on
- * its next frame instead of up to 100 ms later, while the screen shows Xwayland's stale copy of it. */
-#define COVERED_FPS 10
-#define COVERED_SLICE 0.008
+static double waitNow(void* ctx) {
+    return nowSeconds();
+}
+
+static void waitSleep(void* ctx, double seconds) {
+    struct timespec ts = {(time_t)seconds, (long)((seconds - (time_t)seconds) * 1e9)};
+    nanosleep(&ts, NULL);
+}
+
+static bool waitRestacked(void* ctx) {
+    return rootRestacked(ctx);
+}
+
+static void sweepLayers(void);
+
+/* The sweep of the other windows' layers runs at the pace a present used to give it (one per frame). */
+static bool waitHidden(void* ctx) {
+    X11Swapchain* sc = ctx;
+    sweepLayers();
+    checkCoverage(sc);
+    return sc->covered;
+}
+
+static const CoveredWaitOps coveredWaitOps = {waitNow, waitSleep, waitRestacked, waitHidden};
+
+static int coveredFps(void) {
+    static int fps;
+    if (!fps) {
+        fps = covered_fps_parse(getenv("VORTEK_COVERED_FPS"));
+        fprintf(stderr, "vortek-x11: frames of hidden windows paced to %d a second (VORTEK_COVERED_FPS)\n", fps);
+    }
+    return fps;
+}
+
+/* A hidden window's frame: its semaphores are waited for and nothing is copied or drawn, and the
+ * present returns when the window's next frame is due (covered_pacing.h). Windows hidden behind a
+ * game (a launcher left running, the Steam client) otherwise render as fast as the GPU allows and take
+ * it from the game. */
 static VkResult presentCovered(X11Swapchain* sc, VkQueue queue, const VkPresentInfoKHR* presentInfo, bool* waitedSemaphores) {
+    double checked = nowSeconds();
     VkPipelineStageFlags waitStages[presentInfo->waitSemaphoreCount + 1];
     for (uint32_t s = 0; s < presentInfo->waitSemaphoreCount; s++) waitStages[s] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkSubmitInfo submitInfo = {0};
@@ -920,17 +982,15 @@ static VkResult presentCovered(X11Swapchain* sc, VkQueue queue, const VkPresentI
     VkResult result = vk.QueueSubmit(queue, 1, &submitInfo, sc->fence);
     if (result == VK_SUCCESS) result = vk.WaitForFences(sc->device, 1, &sc->fence, VK_TRUE, UINT64_MAX);
     if (result == VK_SUCCESS) vk.ResetFences(sc->device, 1, &sc->fence);
-    double now = nowSeconds(), next = sc->lastCoveredFrame + 1.0 / COVERED_FPS;
-    bool slept = false;
-    while (now < next && !rootRestacked(sc)) {
-        double wait = next - now < COVERED_SLICE ? next - now : COVERED_SLICE;
-        struct timespec ts = {(time_t)wait, (long)((wait - (time_t)wait) * 1e9)};
-        nanosleep(&ts, NULL);
-        now = nowSeconds();
-        slept = true;
+    int fps = coveredFps();
+    bool shared = fps < COVERED_SHARED_FPS && shownOnThisThread(sc, nowSeconds());
+    if (shared != sc->pacedShared) {
+        sc->pacedShared = shared;
+        fprintf(stderr, "vortek-x11: window 0x%x %ux%u hidden, %d frames a second%s (t=%.3f)\n", sc->surface->window,
+                sc->extent.width, sc->extent.height, shared ? COVERED_SHARED_FPS : fps,
+                shared ? ": a shown window is drawn on the same thread" : "", nowSeconds());
     }
-    if (slept && now >= next) now = next;
-    sc->lastCoveredFrame = now;
+    sc->lastCoveredFrame = covered_wait(&coveredWaitOps, sc, sc->lastCoveredFrame + covered_interval(fps, shared), checked);
     return result;
 }
 
@@ -1185,6 +1245,7 @@ VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, 
                 if (zc == VK_SUCCESS) {
                     waitedSemaphores = true;
                     notePath(sc, PATH_ZERO_COPY, 0);
+                    noteShown(sc, nowSeconds());
                     countFrame(sc);
                     if (suboptimal) zc = VK_SUBOPTIMAL_KHR;
                 }
@@ -1253,6 +1314,7 @@ VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, 
                 }
                 putFrame(sc, geometry->depth);
                 notePath(sc, sc->zeroCopy >= 0 && sc->occluded ? PATH_OCCLUDED : PATH_X11, geometry->depth);
+                noteShown(sc, nowSeconds());
                 if (reportSuboptimal(sc, geometry->width, geometry->height)) {
                     result = VK_SUBOPTIMAL_KHR;
                     if (!sc->suboptimalLogged) {
