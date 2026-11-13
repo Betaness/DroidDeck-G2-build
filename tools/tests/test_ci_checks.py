@@ -60,6 +60,7 @@ class CiChecksTest(unittest.TestCase):
         jobs = yaml.safe_load((ROOT / '.github/workflows/build.yml').read_text())['jobs']
         self.assertTrue(jobs['hybris']['continue-on-error'])
         self.assertNotIn('pass_barrier', json.dumps(jobs['hybris']['steps']))
+        self.assertNotIn('guards_test', json.dumps(jobs['hybris']['steps']))
         tests = jobs['hybris-tests']
         self.assertNotIn('continue-on-error', tests)
         self.assertEqual(tests['needs'], 'hybris')
@@ -68,6 +69,7 @@ class CiChecksTest(unittest.TestCase):
         self.assertIn('tests/pass_barrier_test.c', run)
         self.assertIn('-fsanitize=undefined,pointer-overflow', run)
         self.assertIn('tests/pass_barrier_icd_test.sh', run)
+        self.assertIn('tests/guards_test.sh', run)
         self.assertTrue(all(not step.get('continue-on-error') for step in tests['steps'] if 'run' in step))
         for name, job in jobs.items():
             needs = job.get('needs', [])

@@ -392,8 +392,6 @@ jobs:
           path: hybris-guest
           if-no-files-found: error
           retention-days: 14
-      - name: Unit tests of the hybris guards (no GPU)
-        run: sh mali-g2/hybris/tests/guards_test.sh
 
   # [mali-g2] Tests of the hybris ICD, a job of their own: the hybris job may fail without failing the run,
   # these may not. Nothing waits for them, so they do not decide whether the APK carries libhybris.
@@ -417,7 +415,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc clang libvulkan-dev mesa-vulkan-drivers >/dev/null
+          sudo apt-get install -y -qq gcc clang libvulkan-dev libxcb1-dev libxcb-shm0-dev mesa-vulkan-drivers >/dev/null
           cc -O2 -Wall -Wextra -Werror -Imali-g2/hybris/src -o /tmp/pass_barrier_test mali-g2/hybris/tests/pass_barrier_test.c
           /tmp/pass_barrier_test
           clang -O1 -g -Wall -Wextra -Werror -fsanitize=undefined,pointer-overflow -fno-sanitize-recover=all -Imali-g2/hybris/src \
@@ -428,6 +426,8 @@ jobs:
           else
             echo "::warning::no hybris-guest artifact (the hybris job failed): the ICD test did not run"
           fi
+      - name: Unit tests of the hybris guards (no GPU)
+        run: sh mali-g2/hybris/tests/guards_test.sh
 
   build-runner:
     needs: [components]

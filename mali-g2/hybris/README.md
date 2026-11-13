@@ -133,7 +133,7 @@ cc -O2 -o out/tests/placed_memory_test tests/placed_memory_test.c -lvulkan && sh
                                    # placed.c 的内存：每种主机可见类型用哪个 dma-buf 堆（/proc/self/fdinfo），先读进缓存再只 flush/invalidate
                                    # 一段范围时 GPU 和 CPU 能否看到对方的数据，300 轮分配释放不漏 fd，没有 fd 时分配失败，最优图像专用内存的 placed 映射失败
                                    # （DROIDDECK_HYBRIS_PLACED_OPTIMAL_IMAGES=1 时成功）；PM_BENCH=1 另测带宽和同步耗时
-sh tests/guards_test.sh            # 不用 GPU 的单元测试（CI 的 hybris 任务也跑）：堆上限的规则、/proc/meminfo 解析和改报；等待重试（假时钟、
+sh tests/guards_test.sh            # 不用 GPU 的单元测试（CI 的 hybris-tests 任务也跑）：堆上限的规则、/proc/meminfo 解析和改报；等待重试（假时钟、
                                    # 假等待：-3 后等到完成或截止、提前 VK_TIMEOUT、30 秒上限、整段等待后重新计时、极大的有限超时也有上限、
                                    # 退避、变量解析）；卡住查询的计数和回可见的条件（次级、提交早于 End、表回绕）；崩溃收容（tests/fake_mali.c
                                    # 编成 libfake_mali.so 代替驱动，先装的处理函数代替 Wine：收容 SIGSEGV、SIGBUS、SIGILL、驱动调用的 libc 叶函数
