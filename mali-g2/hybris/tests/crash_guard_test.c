@@ -28,8 +28,15 @@ int fake_mali_call(void* ctx);
 int fake_mali_exit(void* ctx);
 int fake_mali_ill(void* ctx);
 int fake_mali_trap(void* ctx);
+int fake_mali_nested(void* ctx);
+int fake_mali_nofp(void* ctx);
+int fake_mali_other_stack(void* ctx, void* sp, void* fp);
 
 static int failures, checks;
+
+/* Every check of a run: a jump into the wrong frame skips some, or repeats some. */
+#define CHECKS_ON 78
+#define CHECKS_OFF 19
 
 #define CHECK(cond, ...)                                                       \
     do {                                                                       \
@@ -46,7 +53,7 @@ static int failures, checks;
 
 static __thread sigjmp_buf abandonTo;
 static __thread volatile int abandonReady;
-static volatile int previousHits, previousResumes;
+static volatile int previousHits, previousResumes, oneShotHits;
 static char* watchPage;
 static long pageSize;
 
@@ -67,6 +74,10 @@ static void previousHandler(int sig, siginfo_t* info, void* context) {
     _exit(99);
 }
 
+static void oneShot(int sig, siginfo_t* info, void* context) {
+    oneShotHits++;
+}
+
 static void installPrevious(void) {
     static char altStack[64 * 1024];
     stack_t ss = {.ss_sp = altStack, .ss_size = sizeof(altStack)};
@@ -78,6 +89,11 @@ static void installPrevious(void) {
     sigaddset(&sa.sa_mask, SIGUSR1);
     const int signals[] = {SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT};
     for (unsigned i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) sigaction(signals[i], &sa, NULL);
+    struct sigaction once = {0};
+    once.sa_sigaction = oneShot;
+    once.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigemptyset(&once.sa_mask);
+    sigaction(SIGFPE, &once, NULL);
 }
 
 /* The statement's fault is abandoned by the previous handler. */
@@ -117,6 +133,33 @@ static int abandonDirectly(void* ctx) {
 
 static int callAbort(void* ctx) {
     abort();
+}
+
+/* A driver fault from below the frame of a guarded call abandoned just before (its slots unwritten). */
+__attribute__((noinline)) static int deeperFault(void) {
+    volatile char pad[16 * 1024];
+    __asm__ volatile("" : : "r"(pad) : "memory");
+    return fake_mali_read((void*)(uintptr_t)0x18) + 1;
+}
+
+/* The guarded call's frame record changed under it, as when another frame sits at its address: the
+ * chain reaches the address, not the record. The call is abandoned, the record never used again. */
+static int changedRecord(void* ctx) {
+    uintptr_t* frame = (uintptr_t*)*(uintptr_t*)__builtin_frame_address(0);
+    frame[1] ^= 4;
+    return fake_mali_read(ctx);
+}
+
+/* The driver on a stack of its own, below this one, with a frame record there that points at the
+ * guarded call's: the chain reaches it, the stack mapping does not. */
+static char* otherStack;
+#define OTHER_STACK (64 * 1024)
+
+static int onOtherStack(void* ctx) {
+    uintptr_t* record = (uintptr_t*)(otherStack + OTHER_STACK / 2);
+    record[0] = *(uintptr_t*)__builtin_frame_address(0);
+    record[1] = 0;
+    return fake_mali_other_stack(ctx, otherStack + OTHER_STACK / 4, record);
 }
 
 static int nestedOuter(void* ctx) {
@@ -163,6 +206,17 @@ static void testMapsLine(void) {
     const char* spaces = "7f1000-7f3000 r-xp 00000000 fd:01 99   /data/my apps/libGLES_mali.so";
     CHECK(crash_guard_maps_line(spaces, strlen(spaces), 0x7f1000, &mali) && mali, "path with spaces");
     CHECK(!crash_guard_maps_line("garbage", 7, 1, &mali), "garbage");
+    static const struct {
+        const char* name;
+        bool mali;
+    } names[] = {{"libmali.so", true}, {"mali.so", true}, {"libfake_mali.so", true}, {"libmali-r56p0.so", true},
+                 {"libnormalizer.so", false}, {"libmalicious.so", false}, {"somali.so", false}, {"libsomali.so", false}};
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char text[128];
+        snprintf(text, sizeof(text), "7f1000-7f3000 r-xp 00000000 fd:01 99 /vendor/lib64/%s", names[i].name);
+        mali = !names[i].mali;
+        CHECK(crash_guard_maps_line(text, strlen(text), 0x7f1000, &mali) && mali == names[i].mali, "%s", names[i].name);
+    }
 }
 
 static void testOff(void) {
@@ -187,13 +241,36 @@ static void testOn(void) {
     CHECK((now.sa_flags & SA_ONSTACK) && (now.sa_flags & SA_SIGINFO) && sigismember(&now.sa_mask, SIGUSR1),
           "the previous handler's flags and mask: %#x", now.sa_flags);
 
+    /* a one-shot handler before ours runs once, and leaves the default action, as without ours */
+    sigaction(SIGFPE, NULL, &now);
+    CHECK(now.sa_sigaction != oneShot && !(now.sa_flags & SA_RESETHAND), "ours stays installed: %#x", now.sa_flags);
+    pthread_kill(pthread_self(), SIGFPE);
+    sigaction(SIGFPE, NULL, &now);
+    CHECK(oneShotHits == 1 && now.sa_handler == SIG_DFL, "one-shot: hits %d, default action %d", oneShotHits, now.sa_handler == SIG_DFL);
+
     bool faulted = true;
     CHECK(crash_guard_call("ok", fake_mali_ok, NULL, &faulted) == 42 && !faulted, "a call that returns");
 
     int hits = previousHits;
     contain("null read", fake_mali_read, (void*)(uintptr_t)0x18);
     contain("leaf libc call from the driver", fake_mali_copy, (void*)(uintptr_t)0x40);
+    contain("three driver frames, 256 KB down", fake_mali_nested, (void*)(uintptr_t)0x18);
     CHECK(previousHits == hits, "contained faults do not reach the previous handler");
+
+    /* driver code that does not keep x29 a frame pointer: the chain is lost, the fault passed on */
+    EXPECT_ABANDONED("driver without frame records", crash_guard_call("nofp", fake_mali_nofp, (void*)(uintptr_t)0x18, &faulted));
+    CHECK(!crash_guard_thread_armed(), "disarmed after a fault without frame records");
+
+    EXPECT_ABANDONED("changed frame record", crash_guard_call("changed", changedRecord, (void*)(uintptr_t)0x18, &faulted));
+    CHECK(!crash_guard_thread_armed(), "disarmed after a changed frame record");
+
+    /* a frame chain to the guarded call from another stack mapping: passed on */
+    otherStack = mmap(NULL, OTHER_STACK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(otherStack != MAP_FAILED && (uintptr_t)otherStack < (uintptr_t)__builtin_frame_address(0), "a stack below this one");
+    if (otherStack != MAP_FAILED) {
+        EXPECT_ABANDONED("chain from another stack", crash_guard_call("other stack", onOtherStack, (void*)(uintptr_t)0x18, &faulted));
+        munmap(otherStack, OTHER_STACK);
+    }
 
     /* a fault two calls away from the driver: passed on, the call abandoned */
     EXPECT_ABANDONED("deep fault outside the driver", crash_guard_call("deep", fake_mali_call, (void*)deepFault, &faulted));
@@ -242,12 +319,29 @@ static void testOn(void) {
     /* a call abandoned without a signal (none of ours ran): still armed, but a later driver fault
      * from a shallower frame is not jumped to it; the next guarded call arms afresh */
     abandonReady = 1;
-    if (!sigsetjmp(abandonTo, 1)) crash_guard_call("abandoned", abandonDirectly, NULL, &faulted);
+    if (!sigsetjmp(abandonTo, 1)) {
+        crash_guard_call("abandoned", abandonDirectly, NULL, &faulted);
+        CHECK(0, "abandoned: returned");
+    }
     CHECK(crash_guard_thread_armed(), "left armed");
     EXPECT_ABANDONED("fault after an abandoned frame", fake_mali_read((void*)(uintptr_t)0x18));
     CHECK(!crash_guard_thread_armed(), "disarmed by the fault passed on");
+    /* and from deeper down the stack than the abandoned frame */
     abandonReady = 1;
-    if (!sigsetjmp(abandonTo, 1)) crash_guard_call("abandoned again", abandonDirectly, NULL, &faulted);
+    if (!sigsetjmp(abandonTo, 1)) {
+        crash_guard_call("abandoned, then deeper", abandonDirectly, NULL, &faulted);
+        CHECK(0, "abandoned, then deeper: returned");
+    }
+    CHECK(crash_guard_thread_armed(), "left armed again");
+    before = crash_guard_contained();
+    EXPECT_ABANDONED("deeper fault after an abandoned frame", deeperFault());
+    CHECK(!crash_guard_thread_armed() && crash_guard_contained() == before, "passed on, not contained: %d",
+          crash_guard_contained() - before);
+    abandonReady = 1;
+    if (!sigsetjmp(abandonTo, 1)) {
+        crash_guard_call("abandoned again", abandonDirectly, NULL, &faulted);
+        CHECK(0, "abandoned again: returned");
+    }
     contain("armed afresh over a stale slot", fake_mali_read, (void*)(uintptr_t)0x18);
 
     /* threads that end inside guarded calls give their slots back (more threads than slots) */
@@ -290,6 +384,11 @@ int main(int argc, char** argv) {
         setenv("DROIDDECK_HYBRIS_CRASH_GUARD", "1", 1);
         setenv("DROIDDECK_HYBRIS_CRASH_GUARD_MAX", "16", 1);
         testOn();
+    }
+    int expected = argc > 1 ? CHECKS_OFF : CHECKS_ON;
+    if (checks != expected) {
+        failures++;
+        fprintf(stderr, "FAIL: %d checks made, %d expected\n", checks, expected);
     }
     printf("crash_guard_test%s: %d checks, %d failed\n", argc > 1 ? " (off)" : "", checks, failures);
     return failures ? 1 : 0;

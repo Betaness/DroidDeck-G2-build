@@ -177,6 +177,8 @@ PFN_vkVoidFunction guards_instance_proc(const char* name);
 PFN_vkVoidFunction guards_device_proc(VkDevice handle, const char* name);
 void guards_device_destroyed(Device* device);
 bool guards_wait_retry_on(void);
+/* The application's waits go through guards.c's and icd.c's wrappers (wait retry, lost device). */
+bool guards_want_waits(void);
 enum { GUARDS_WAIT_FENCE, GUARDS_WAIT_SEMAPHORE, GUARDS_WAIT_QUEUE_IDLE, GUARDS_WAIT_DEVICE_IDLE, GUARDS_WAIT_QUERY, GUARDS_WAIT_KINDS };
 /* `first`: the driver's answer to a wait that began at `start` (CLOCK_MONOTONIC ns); what the caller
  * gets. `poll` may be NULL; the idle waits pass UINT64_MAX as the timeout. */
@@ -186,6 +188,8 @@ VkResult guards_retry_wait(int kind, VkResult (*wait)(void* ctx, uint64_t timeou
 VkResult icd_wait_fences(Device* device, uint32_t count, const VkFence* fences, VkBool32 all, uint64_t timeout);
 /* Queue submissions go through icd.c's wrappers (lost device, recordings submitted). */
 bool guards_want_submits(void);
+/* Set by a contained vkEndCommandBuffer fault: the application's submissions, waits, presents and
+ * acquires return VK_ERROR_DEVICE_LOST. */
 bool guards_device_lost(void);
 void guards_submitted(uint32_t count, const VkSubmitInfo* submits);
 void guards_submitted2(uint32_t count, const VkSubmitInfo2* submits);

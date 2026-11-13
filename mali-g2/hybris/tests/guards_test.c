@@ -114,7 +114,7 @@ static void fakeNap(uint64_t ns) {
 }
 
 static VkResult fakeWait(void* ctx, uint64_t timeout) {
-    fake.waits++;
+    if (++fake.waits > 100000) return VK_ERROR_DEVICE_LOST; /* a retry that does not end */
     fake.lastTimeout = timeout;
     int i = fake.next < fake.count ? fake.next++ : fake.count - 1;
     VkResult r = fake.results[i];
@@ -298,6 +298,101 @@ static void testNapGrowth(void) {
     CHECK(fake.now == w.start + 200 * WR_MS, "at the deadline: %llu", (unsigned long long)(fake.now - w.start));
 }
 
+/* A finite timeout far past the cap (INT64_MAX ns), the driver failing at once: its error after the
+ * cap, not retries until the deadline. */
+static void testHugeTimeout(void) {
+    fakeReset();
+    WaitOp w = op(INT64_MAX, true);
+    w.capNs = 2 * WR_SEC;
+    fake.results[0] = VK_ERROR_INITIALIZATION_FAILED;
+    fake.blocks[0] = 0;
+    fake.count = 1;
+    uint64_t began = fake.now;
+    WaitOutcome o = wr_retry(&w, VK_ERROR_INITIALIZATION_FAILED);
+    CHECK(o.result == VK_ERROR_INITIALIZATION_FAILED && o.keptFailing, "the driver's error: %d", o.result);
+    CHECK(fake.now - began >= 2 * WR_SEC && fake.now - began <= 2 * WR_SEC + WR_NAP_LAST_NS, "at the cap: %llu",
+          (unsigned long long)(fake.now - began));
+    CHECK(fake.lastTimeout <= 2 * WR_SEC, "no wait past the cap: %llu",
+          (unsigned long long)fake.lastTimeout);
+    CHECK(o.tries < 200, "tries %u", o.tries);
+}
+
+/* A -3, then whole waits (the driver waits again as it should): no deadline, so waited on past the
+ * cap until done, not the -3 after 30 s. */
+static void testWholeWaitsGoOn(void) {
+    fakeReset();
+    WaitOp w = op(UINT64_MAX, true);
+    fake.full = true;
+    fake.results[0] = VK_TIMEOUT;
+    fake.results[1] = VK_TIMEOUT;
+    fake.results[2] = VK_SUCCESS;
+    fake.blocks[2] = 5 * WR_SEC;
+    fake.count = 3;
+    uint64_t began = fake.now;
+    WaitOutcome o = wr_retry(&w, VK_ERROR_INITIALIZATION_FAILED);
+    CHECK(o.result == VK_SUCCESS && o.tries == 3, "done: %d after %u", o.result, o.tries);
+    CHECK(fake.now - began == 65 * WR_SEC, "after 65 s: %llu", (unsigned long long)(fake.now - began));
+    CHECK(fake.lastTimeout == WR_DEFAULT_CAP_NS, "waits of the cap: %llu", (unsigned long long)fake.lastTimeout);
+}
+
+/* A whole wait, then -3 every 300 ms: the cap counts from the whole wait. */
+static void testCapAfterWholeWait(void) {
+    fakeReset();
+    WaitOp w = op(UINT64_MAX, true);
+    w.capNs = 2 * WR_SEC;
+    fake.full = true;
+    fake.results[0] = VK_TIMEOUT;
+    fake.results[1] = VK_ERROR_INITIALIZATION_FAILED;
+    fake.blocks[1] = 300 * WR_MS;
+    fake.count = 2;
+    uint64_t began = fake.now;
+    WaitOutcome o = wr_retry(&w, VK_ERROR_INITIALIZATION_FAILED);
+    CHECK(o.result == VK_ERROR_INITIALIZATION_FAILED && o.keptFailing, "the driver's error: %d", o.result);
+    CHECK(fake.now - began >= 4 * WR_SEC && fake.now - began < 4 * WR_SEC + 400 * WR_MS, "cap after the whole wait: %llu",
+          (unsigned long long)(fake.now - began));
+}
+
+/* A deadline past the cap, whole waits: waits of the cap, the last one to the deadline. */
+static void testDeadlinePastCap(void) {
+    fakeReset();
+    WaitOp w = op(100 * WR_SEC, true);
+    fake.full = true;
+    fake.results[0] = VK_TIMEOUT;
+    fake.count = 1;
+    WaitOutcome o = wr_retry(&w, VK_TIMEOUT);
+    CHECK(o.result == VK_TIMEOUT && o.tries == 4, "%d after %u", o.result, o.tries);
+    CHECK(fake.now == w.start + 100 * WR_SEC && fake.lastTimeout == 10 * WR_SEC, "at the deadline: %llu, last wait %llu",
+          (unsigned long long)(fake.now - w.start), (unsigned long long)fake.lastTimeout);
+}
+
+/* A deadline past the cap, early VK_TIMEOUTs only: VK_TIMEOUT after the cap. */
+static void testEarlyTimeoutPastCap(void) {
+    fakeReset();
+    WaitOp w = op(100 * WR_SEC, true);
+    w.capNs = 3 * WR_SEC;
+    fake.results[0] = VK_TIMEOUT;
+    fake.blocks[0] = 500 * WR_MS;
+    fake.count = 1;
+    WaitOutcome o = wr_retry(&w, VK_TIMEOUT);
+    CHECK(o.result == VK_TIMEOUT && fake.now - w.start >= 3 * WR_SEC && fake.now - w.start < 4 * WR_SEC, "%d after %llu ms", o.result,
+          (unsigned long long)((fake.now - w.start) / WR_MS));
+}
+
+static void testWaitParse(void) {
+    CHECK(wr_parse_cap(NULL, 7) == 7 && wr_parse_cap("", 7) == 7 && wr_parse_cap("x", 7) == 7 && wr_parse_cap("5s", 7) == 7, "not numbers");
+    CHECK(wr_parse_cap("0", 7) == 0 && wr_parse_cap("30", 7) == 30 * WR_SEC, "seconds");
+    CHECK(wr_parse_cap("18446744074", 7) == UINT64_MAX && wr_parse_cap("99999999999999999999999", 7) == UINT64_MAX, "saturated");
+    CHECK(wr_parse_cap("18446744073", 7) == 18446744073ull * WR_SEC, "the largest that fits");
+    bool raised;
+    CHECK(qs_parse_limit_ms(NULL, &raised) == QS_DEFAULT_MS && !raised, "default");
+    CHECK(qs_parse_limit_ms("0", &raised) == 0 && !raised, "off");
+    CHECK(qs_parse_limit_ms("50", &raised) == QS_MIN_MS && raised, "raised to the minimum");
+    CHECK(qs_parse_limit_ms("100", &raised) == 100 && !raised, "the minimum");
+    CHECK(qs_parse_limit_ms("2500", &raised) == 2500 && !raised, "a number");
+    CHECK(qs_parse_limit_ms("5x", &raised) == QS_DEFAULT_MS, "not a number");
+    CHECK(qs_parse_limit_ms("99999999999999999999999", &raised) > 1000000000u, "large");
+}
+
 /* ---- stuck queries ---- */
 
 static void testQueryRuns(void) {
@@ -423,6 +518,12 @@ int main(void) {
     testNoPoll();
     testLegalErrorFromRetry();
     testNapGrowth();
+    testHugeTimeout();
+    testWholeWaitsGoOn();
+    testCapAfterWholeWait();
+    testDeadlinePastCap();
+    testEarlyTimeoutPastCap();
+    testWaitParse();
     testQueryRuns();
     testQueryWriteVisible();
     testQueryVisibleDue();

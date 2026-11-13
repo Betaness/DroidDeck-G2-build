@@ -369,6 +369,8 @@ static bool named(const char* const* names, uint32_t count, const char* name) {
     return false;
 }
 
+static void keepQueueFns(const Device* device);
+
 static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo* info, const VkAllocationCallbacks* allocator,
                                         VkDevice* out) {
     Instance* instance = icd_instance_of(physical);
@@ -501,6 +503,7 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDevic
                      device->GetFenceFdKHR && device->ImportFenceFdKHR && device->ImportSemaphoreFdKHR;
     instance->GetPhysicalDeviceMemoryProperties(physical, &device->memory);
     pthread_mutex_init(&device->queueLock, NULL);
+    keepQueueFns(device);
     mali_device_created(device);
     placed_device_created(device);
     if (placed && !device->placed)
@@ -572,6 +575,22 @@ static void VKAPI_CALL DestroyDevice(VkDevice handle, const VkAllocationCallback
 
 /* ---- the acquire queue ---- */
 
+/* The driver's queue functions, the same for every device (libhybris hands out the Android loader's
+ * trampolines), for a queue past MAX_QUEUES: not registered, and never the acquire queue. */
+enum { Q_SUBMIT, Q_SUBMIT2, Q_SUBMIT2_KHR, Q_BIND_SPARSE, Q_WAIT_IDLE, Q_COUNT };
+static PFN_vkVoidFunction anyQueueFns[Q_COUNT];
+#define ANY_QUEUE(index, type) ((type)__atomic_load_n(&anyQueueFns[index], __ATOMIC_ACQUIRE))
+
+static void keepQueueFns(const Device* device) {
+    const PFN_vkVoidFunction fns[Q_COUNT] = {(PFN_vkVoidFunction)device->QueueSubmit, (PFN_vkVoidFunction)device->QueueSubmit2,
+                                             (PFN_vkVoidFunction)device->QueueSubmit2KHR, (PFN_vkVoidFunction)device->QueueBindSparse,
+                                             (PFN_vkVoidFunction)device->QueueWaitIdle};
+    for (int i = 0; i < Q_COUNT; i++) {
+        void* expected = NULL;
+        if (fns[i]) __atomic_compare_exchange_n((void**)&anyQueueFns[i], &expected, (void*)fns[i], false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    }
+}
+
 static bool locks(Device* device, VkQueue queue) {
     return queue == device->internalQueue;
 }
@@ -595,18 +614,23 @@ VkResult icd_queue_wait_idle(Device* device, VkQueue queue) {
 /* The application's submissions: the acquire queue's lock, and guards.c's lost device and
  * submitted recordings. */
 static VkResult VKAPI_CALL LockedQueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    if (guards_device_lost()) return VK_ERROR_DEVICE_LOST;
     Device* device = icd_device_of_queue(queue, NULL);
-    if (!device || guards_device_lost()) return VK_ERROR_DEVICE_LOST;
-    VkResult result = icd_queue_submit(device, queue, count, submits, fence);
+    PFN_vkQueueSubmit any = ANY_QUEUE(Q_SUBMIT, PFN_vkQueueSubmit);
+    if (!device && !any) return VK_ERROR_DEVICE_LOST;
+    VkResult result = device ? icd_queue_submit(device, queue, count, submits, fence) : any(queue, count, submits, fence);
     if (result == VK_SUCCESS) guards_submitted(count, submits);
     return result;
 }
 
 static VkResult lockedSubmit2(VkQueue queue, uint32_t count, const VkSubmitInfo2* submits, VkFence fence, bool khr) {
+    if (guards_device_lost()) return VK_ERROR_DEVICE_LOST;
     Device* device = icd_device_of_queue(queue, NULL);
-    if (!device || guards_device_lost()) return VK_ERROR_DEVICE_LOST;
-    PFN_vkQueueSubmit2 submit = khr && device->QueueSubmit2KHR ? device->QueueSubmit2KHR : device->QueueSubmit2;
-    bool locked = locks(device, queue);
+    PFN_vkQueueSubmit2 submit2 = device ? device->QueueSubmit2 : ANY_QUEUE(Q_SUBMIT2, PFN_vkQueueSubmit2);
+    PFN_vkQueueSubmit2 submit2KHR = device ? device->QueueSubmit2KHR : ANY_QUEUE(Q_SUBMIT2_KHR, PFN_vkQueueSubmit2);
+    PFN_vkQueueSubmit2 submit = khr && submit2KHR ? submit2KHR : submit2;
+    if (!submit) return VK_ERROR_DEVICE_LOST;
+    bool locked = device && locks(device, queue);
     if (locked) pthread_mutex_lock(&device->queueLock);
     VkResult result = submit(queue, count, submits, fence);
     if (locked) pthread_mutex_unlock(&device->queueLock);
@@ -623,8 +647,10 @@ static VkResult VKAPI_CALL LockedQueueSubmit2KHR(VkQueue queue, uint32_t count, 
 }
 
 static VkResult VKAPI_CALL LockedQueueBindSparse(VkQueue queue, uint32_t count, const VkBindSparseInfo* infos, VkFence fence) {
+    if (guards_device_lost()) return VK_ERROR_DEVICE_LOST;
     Device* device = icd_device_of_queue(queue, NULL);
-    if (!device || guards_device_lost()) return VK_ERROR_DEVICE_LOST;
+    PFN_vkQueueBindSparse any = ANY_QUEUE(Q_BIND_SPARSE, PFN_vkQueueBindSparse);
+    if (!device) return any ? any(queue, count, infos, fence) : VK_ERROR_DEVICE_LOST;
     if (!locks(device, queue)) return device->QueueBindSparse(queue, count, infos, fence);
     pthread_mutex_lock(&device->queueLock);
     VkResult result = device->QueueBindSparse(queue, count, infos, fence);
@@ -639,12 +665,13 @@ typedef struct {
 
 static VkResult queueIdle(void* ctx, uint64_t timeout) {
     IdleWait* w = ctx;
-    return icd_queue_wait_idle(w->device, w->queue);
+    return w->device ? icd_queue_wait_idle(w->device, w->queue) : ANY_QUEUE(Q_WAIT_IDLE, PFN_vkQueueWaitIdle)(w->queue);
 }
 
 static VkResult VKAPI_CALL LockedQueueWaitIdle(VkQueue queue) {
+    if (guards_device_lost()) return VK_ERROR_DEVICE_LOST;
     IdleWait w = {icd_device_of_queue(queue, NULL), queue};
-    if (!w.device) return VK_ERROR_DEVICE_LOST;
+    if (!w.device && !ANY_QUEUE(Q_WAIT_IDLE, PFN_vkQueueWaitIdle)) return VK_ERROR_DEVICE_LOST;
     uint64_t start = icd_now_ns();
     VkResult result = queueIdle(&w, UINT64_MAX);
     return result == VK_SUCCESS ? result : guards_retry_wait(GUARDS_WAIT_QUEUE_IDLE, queueIdle, NULL, &w, UINT64_MAX, start, result);
@@ -661,7 +688,7 @@ static VkResult deviceIdle(void* ctx, uint64_t timeout) {
 
 static VkResult VKAPI_CALL DeviceWaitIdle(VkDevice handle) {
     IdleWait w = {icd_device(handle), VK_NULL_HANDLE};
-    if (!w.device) return VK_ERROR_DEVICE_LOST;
+    if (!w.device || guards_device_lost()) return VK_ERROR_DEVICE_LOST;
     uint64_t start = icd_now_ns();
     VkResult result = deviceIdle(&w, UINT64_MAX);
     return result == VK_SUCCESS ? result : guards_retry_wait(GUARDS_WAIT_DEVICE_IDLE, deviceIdle, NULL, &w, UINT64_MAX, start, result);
@@ -687,7 +714,7 @@ static PFN_vkVoidFunction ownDeviceProc(VkDevice handle, const char* name) {
         if (!strcmp(name, "vkQueueSubmit2KHR")) return device->QueueSubmit2KHR ? (PFN_vkVoidFunction)LockedQueueSubmit2KHR : NULL;
         if (!strcmp(name, "vkQueueBindSparse")) return device->QueueBindSparse ? (PFN_vkVoidFunction)LockedQueueBindSparse : NULL;
     }
-    if (device && (device->lockQueue || guards_wait_retry_on()) && !strcmp(name, "vkQueueWaitIdle"))
+    if (device && (device->lockQueue || guards_want_waits()) && !strcmp(name, "vkQueueWaitIdle"))
         return (PFN_vkVoidFunction)LockedQueueWaitIdle;
     return NULL;
 }

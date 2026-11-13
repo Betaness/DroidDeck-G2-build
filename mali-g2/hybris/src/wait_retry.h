@@ -31,7 +31,7 @@ typedef struct WaitOp {
     void* ctx;
     uint64_t timeout; /* the caller's; UINT64_MAX: none */
     uint64_t start;   /* when the caller's call began */
-    uint64_t capNs;   /* how long a wait without a deadline is retried */
+    uint64_t capNs;   /* how long answers that are not whole waits are retried */
     uint64_t (*now)(void);
     void (*nap)(uint64_t ns);
 } WaitOp;
@@ -63,18 +63,35 @@ static inline bool wr_needed(VkResult r, uint64_t took, uint64_t timeout) {
     return timeout == UINT64_MAX || took < timeout - WR_SLACK_NS;
 }
 
+static inline uint64_t wr_after(uint64_t t, uint64_t ns) {
+    return ns > UINT64_MAX - t ? UINT64_MAX : t + ns;
+}
+
+/* DROIDDECK_HYBRIS_WAIT_RETRY_S in ns: seconds, saturated; `fallback` when it is not a number. */
+static inline uint64_t wr_parse_cap(const char* text, uint64_t fallback) {
+    if (!text || *text < '0' || *text > '9') return fallback;
+    uint64_t s = 0;
+    for (; *text >= '0' && *text <= '9'; text++) {
+        uint64_t digit = (uint64_t)(*text - '0');
+        if (s > (UINT64_MAX / WR_SEC - digit) / 10) return UINT64_MAX;
+        s = s * 10 + digit;
+    }
+    return *text ? fallback : s * WR_SEC;
+}
+
 /* Waits again after the driver's answer `first`. Each round polls first (what was signalled
- * meanwhile ends it with VK_SUCCESS; a legal error ends it with that error), then waits until the
- * end: the caller's deadline, after which the caller gets VK_TIMEOUT; or, without one, capNs from
- * now, after which the caller gets the driver's last illegal result (VK_TIMEOUT if it only timed
- * out early). A driver that answers at once is given naps of 0.5 ms, doubling up to 20 ms. */
+ * meanwhile ends it with VK_SUCCESS; a legal error ends it with that error), then waits capNs, or
+ * until the caller's deadline when that is sooner (after the deadline the caller gets VK_TIMEOUT). A
+ * whole wait (one that used its whole timeout and ended with VK_TIMEOUT: the driver waits as it
+ * should) is followed by another; after capNs of answers that are not, the caller gets the
+ * driver's last illegal result (VK_TIMEOUT if it only timed out early). A driver that answers at
+ * once is given naps of 0.5 ms, doubling up to 20 ms. */
 static inline WaitOutcome wr_retry(const WaitOp* w, VkResult first) {
     WaitOutcome out = {first, 0, 0, false};
     const uint64_t began = w->now();
     const bool deadline = w->timeout != UINT64_MAX && w->timeout <= UINT64_MAX - w->start;
-    uint64_t end;
-    if (deadline) end = w->start + w->timeout;
-    else end = w->capNs > UINT64_MAX - began ? UINT64_MAX : began + w->capNs;
+    const uint64_t due = deadline ? w->start + w->timeout : UINT64_MAX;
+    uint64_t failingSince = began;
     VkResult bad = first;
     uint64_t nap = WR_NAP_FIRST_NS;
     for (;;) {
@@ -84,23 +101,36 @@ static inline WaitOutcome wr_retry(const WaitOp* w, VkResult first) {
             break;
         }
         uint64_t now = w->now();
-        if (now >= end) {
-            out.result = deadline ? VK_TIMEOUT : bad;
+        if (now >= due) {
+            out.result = VK_TIMEOUT;
             break;
         }
+        uint64_t failing = now - failingSince;
+        if (failing >= w->capNs) {
+            out.result = bad;
+            break;
+        }
+        uint64_t segment = due - now < w->capNs ? due - now : w->capNs;
         out.tries++;
-        r = w->wait(w->ctx, end - now);
+        r = w->wait(w->ctx, segment);
         if (r != VK_TIMEOUT && wr_legal(r)) {
             out.result = r;
             break;
         }
-        if (r != VK_TIMEOUT) bad = r;
         uint64_t after = w->now();
+        if (r == VK_TIMEOUT && after - now + WR_SLACK_NS >= segment) {
+            bad = VK_TIMEOUT;
+            failingSince = after;
+            nap = WR_NAP_FIRST_NS;
+            continue;
+        }
+        if (r != VK_TIMEOUT) bad = r;
         if (after - now >= WR_QUICK_NS) {
             nap = WR_NAP_FIRST_NS;
             continue;
         }
-        if (after < end) w->nap(end - after < nap ? end - after : nap);
+        uint64_t stop = wr_after(failingSince, w->capNs) < due ? wr_after(failingSince, w->capNs) : due;
+        if (after < stop) w->nap(stop - after < nap ? stop - after : nap);
         nap = nap * 2 > WR_NAP_LAST_NS ? WR_NAP_LAST_NS : nap * 2;
     }
     out.retriedNs = w->now() - began;

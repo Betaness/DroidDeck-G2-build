@@ -34,7 +34,7 @@ run "query watch off" - DROIDDECK_HYBRIS_QUERY_STUCK_MS=0 GV_VISIBLE=0
 run "heap cap 3072" 'device-local heap 0 reported as 3072 MB' DROIDDECK_HYBRIS_HEAP_MAX_MB=3072 GV_HEAP_MB=3072
 run "heap cap off" 'heap cap: off' DROIDDECK_HYBRIS_HEAP_MAX_MB=0
 run "wait retry off" - DROIDDECK_HYBRIS_WAIT_RETRY=0
-run "crash guard on" 'crash guard on' DROIDDECK_HYBRIS_CRASH_GUARD=1
+run "crash guard on" 'crash guard: on' DROIDDECK_HYBRIS_CRASH_GUARD=1
 run "everything on" 'answered as visible after' DROIDDECK_HYBRIS_CRASH_GUARD=1 DROIDDECK_HYBRIS_QUERY_VISIBLE=1 GV_VISIBLE=1 \
     DROIDDECK_HYBRIS_HEAP_MAX_MB=2048 GV_HEAP_MB=2048
 exit $failed

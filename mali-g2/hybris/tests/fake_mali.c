@@ -48,3 +48,29 @@ int fake_mali_trap(void* ctx) {
     __asm__ volatile("brk #0x3e8");
     return 1;
 }
+
+/* Two more driver frames with frame records, the second 256 KB down the stack, then a read. */
+__attribute__((noinline)) static int faultDeep(void* ctx) {
+    volatile char pad[256 * 1024];
+    pad[0] = 1;
+    pad[sizeof(pad) - 1] = 1;
+    return *(volatile int*)ctx + pad[0];
+}
+
+__attribute__((noinline)) static int faultNested(void* ctx) {
+    return faultDeep(ctx) + 1;
+}
+
+int fake_mali_nested(void* ctx) {
+    return faultNested(ctx) + 1;
+}
+
+#if defined(__aarch64__)
+/* A read of x0 with x29 cleared: code built without frame records, using x29 as it likes. */
+__asm__(".text\n.globl fake_mali_nofp\n.type fake_mali_nofp, %function\nfake_mali_nofp:\n"
+        "    mov x29, #0\n    ldr w0, [x0]\n    ret\n.size fake_mali_nofp, .-fake_mali_nofp\n");
+
+/* A read of x0 with sp at x1 and x29 at x2: driver code on a stack of its own. */
+__asm__(".text\n.globl fake_mali_other_stack\n.type fake_mali_other_stack, %function\nfake_mali_other_stack:\n"
+        "    mov sp, x1\n    mov x29, x2\n    ldr w0, [x0]\n    ret\n.size fake_mali_other_stack, .-fake_mali_other_stack\n");
+#endif

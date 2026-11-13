@@ -1,29 +1,25 @@
 /*
  * [mali-g2] Protections whose behaviour follows MaliBridge's (re-implemented, not copied; see the
- * notes' MALIBRIDGE-VS-HYBRIS-2026-11-12.md, E), each with its own switch:
+ * notes' MALIBRIDGE-VS-HYBRIS-2026-11-12.md, E), each with its own switch. Each prints one line with
+ * its state the first time it is consulted ("hybris-icd: <name>: on, ..." or "...: off ...").
  *
- *   - Heap cap (heap_cap.h), on by default: on a device with 12800 MB of RAM or less, device-local
- *     heaps are reported as half the RAM rounded down to 512 MB, 2048..4096 MB, and no more than was
- *     free (MemAvailable) at the process's first query, 2048 MB at least. A VK_EXT_memory_budget
- *     budget the driver fills is held under the reported size (r56p0 has no such extension).
+ *   - Heap cap (heap_cap.h), on by default on devices with 12800 MB of RAM or less.
  *     DROIDDECK_HYBRIS_HEAP_MAX_MB=<MB> sets the cap instead (0: none);
  *     DROIDDECK_HYBRIS_HEAP_FOLLOW_FREE=0 keeps the default cap whatever is free.
  *   - Wait retry (wait_retry.h), on by default: vkWaitForFences, vkWaitSemaphores(KHR),
  *     vkQueueWaitIdle and vkDeviceWaitIdle (icd.c), vkGetQueryPoolResults with WAIT_BIT, and this
- *     library's own fence waits (wsi.c). A result a wait may not return (VK_ERROR_INITIALIZATION_FAILED
- *     after an interrupted ppoll), or a VK_TIMEOUT before the caller's deadline, is waited on again
- *     until the deadline; without one for DROIDDECK_HYBRIS_WAIT_RETRY_S (default 30) seconds.
+ *     library's own fence waits (wsi.c). DROIDDECK_HYBRIS_WAIT_RETRY_S (default 30) is the cap;
  *     DROIDDECK_HYBRIS_WAIT_RETRY=0 turns it off.
- *   - Stuck occlusion queries (query_stuck.h): an occlusion query answered "not ready" for
- *     DROIDDECK_HYBRIS_QUERY_STUCK_MS (default 500; 0: not watched) since the first such answer after
- *     its last reset is counted and logged ("hybris-icd: query stuck: ..."); the answers are not
- *     changed. DROIDDECK_HYBRIS_QUERY_VISIBLE=1 answers such a query as visible (1 sample) when its
- *     End was recorded in a primary submitted that long ago (qs_visible_due).
+ *   - Stuck occlusion queries (query_stuck.h): counted and logged after
+ *     DROIDDECK_HYBRIS_QUERY_STUCK_MS (default 500, at least 100; 0: not watched).
+ *     DROIDDECK_HYBRIS_QUERY_VISIBLE=1 answers such a query as visible (qs_visible_due).
  *   - Crash guard (crash_guard.c), off by default: DROIDDECK_HYBRIS_CRASH_GUARD=1 contains a Mali
  *     fault inside vkCreateGraphicsPipelines / vkCreateComputePipelines (the call fails with
- *     VK_ERROR_UNKNOWN and null pipelines) and vkEndCommandBuffer (it returns VK_SUCCESS, and every
- *     queue submission after it fails with VK_ERROR_DEVICE_LOST, so the buffer never reaches the
- *     GPU: DXVK throws on a failed vkEndCommandBuffer, and stops submitting after a lost device).
+ *     VK_ERROR_UNKNOWN and null pipelines) and vkEndCommandBuffer (it returns VK_SUCCESS and the
+ *     device is lost for the process from then on: submissions, waits, vkQueuePresentKHR and
+ *     vkAcquireNextImageKHR return VK_ERROR_DEVICE_LOST without reaching the driver, so the buffer
+ *     never reaches the GPU and no new wait waits for a submission that was refused. DXVK throws on
+ *     a failed vkEndCommandBuffer, and stops submitting after a lost device).
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
@@ -104,7 +100,7 @@ static void readHeapCap(void) {
         int64_t mb = heapcap_parse_mb(set);
         if (mb >= 0) {
             heapCapBytes = (uint64_t)mb << 20;
-            if (mb) LOG("heap cap: device-local heaps reported as %lld MB at most (DROIDDECK_HYBRIS_HEAP_MAX_MB)", (long long)mb);
+            if (mb) LOG("heap cap: on, device-local heaps reported as %lld MB at most (DROIDDECK_HYBRIS_HEAP_MAX_MB)", (long long)mb);
             else LOG("heap cap: off (DROIDDECK_HYBRIS_HEAP_MAX_MB=0)");
             return;
         }
@@ -118,11 +114,13 @@ static void readHeapCap(void) {
         return;
     }
     const char* follow = getenv("DROIDDECK_HYBRIS_HEAP_FOLLOW_FREE");
+    bool followFree = !(follow && !strcmp(follow, "0"));
     uint64_t freeMb = heapcap_meminfo_kb(text, "MemAvailable") >> 10;
-    uint32_t mb = follow && !strcmp(follow, "0") ? cap : heapcap_follow_free(cap, freeMb);
+    uint32_t mb = followFree ? heapcap_follow_free(cap, freeMb) : cap;
     heapCapBytes = (uint64_t)mb << 20;
-    LOG("heap cap: %llu MB of RAM (%u or less), %llu MB free: device-local heaps reported as %u MB at most "
-        "(DROIDDECK_HYBRIS_HEAP_MAX_MB=0 turns this off)", (unsigned long long)ramMb, HEAPCAP_RAM_MAX_MB, (unsigned long long)freeMb, mb);
+    LOG("heap cap: on, %llu MB of RAM (%u or less), %llu MB free%s: device-local heaps reported as %u MB at most "
+        "(DROIDDECK_HYBRIS_HEAP_MAX_MB=0 turns this off)", (unsigned long long)ramMb, HEAPCAP_RAM_MAX_MB, (unsigned long long)freeMb,
+        followFree ? "" : " (not followed: DROIDDECK_HYBRIS_HEAP_FOLLOW_FREE=0)", mb);
 }
 
 static void capHeaps(VkPhysicalDeviceMemoryProperties* memory, VkPhysicalDeviceMemoryBudgetPropertiesEXT* budget) {
@@ -162,13 +160,25 @@ static uint64_t waitCapNs = WR_DEFAULT_CAP_NS;
 static void readWaitConfig(void) {
     const char* on = getenv("DROIDDECK_HYBRIS_WAIT_RETRY");
     waitRetry = !(on && *on == '0');
-    const char* cap = getenv("DROIDDECK_HYBRIS_WAIT_RETRY_S");
-    if (cap && *cap >= '0' && *cap <= '9') waitCapNs = strtoull(cap, NULL, 10) * WR_SEC;
+    waitCapNs = wr_parse_cap(getenv("DROIDDECK_HYBRIS_WAIT_RETRY_S"), WR_DEFAULT_CAP_NS);
+    if (!waitRetry) {
+        LOG("wait retry: off (DROIDDECK_HYBRIS_WAIT_RETRY=0)");
+        return;
+    }
+    char cap[64] = "without a limit on such answers";
+    if (waitCapNs != UINT64_MAX)
+        snprintf(cap, sizeof(cap), "for at most %llu s of such answers in a row", (unsigned long long)(waitCapNs / WR_SEC));
+    LOG("wait retry: on, a wait answered with a result a wait may not return, or with VK_TIMEOUT before its deadline, is waited "
+        "on again until the deadline, %s (DROIDDECK_HYBRIS_WAIT_RETRY_S; DROIDDECK_HYBRIS_WAIT_RETRY=0 turns this off)", cap);
 }
 
 bool guards_wait_retry_on(void) {
     pthread_once(&waitOnce, readWaitConfig);
     return waitRetry;
+}
+
+bool guards_want_waits(void) {
+    return guards_wait_retry_on() || crash_guard_on();
 }
 
 static const char* const waitNames[GUARDS_WAIT_KINDS] = {"vkWaitForFences", "vkWaitSemaphores", "vkQueueWaitIdle", "vkDeviceWaitIdle",
@@ -223,6 +233,7 @@ VkResult icd_wait_fences(Device* device, uint32_t count, const VkFence* fences, 
 }
 
 static VkResult VKAPI_CALL WaitForFences(VkDevice handle, uint32_t count, const VkFence* fences, VkBool32 all, uint64_t timeout) {
+    if (guards_device_lost()) return VK_ERROR_DEVICE_LOST;
     return waitFences(NEXT(N_WAIT_FENCES, PFN_vkWaitForFences), handle, count, fences, all, timeout);
 }
 
@@ -250,10 +261,12 @@ static VkResult waitSemaphores(PFN_vkWaitSemaphores next, VkDevice handle, const
 }
 
 static VkResult VKAPI_CALL WaitSemaphores(VkDevice handle, const VkSemaphoreWaitInfo* info, uint64_t timeout) {
+    if (guards_device_lost()) return VK_ERROR_DEVICE_LOST;
     return waitSemaphores(NEXT(N_WAIT_SEMAPHORES, PFN_vkWaitSemaphores), handle, info, timeout);
 }
 
 static VkResult VKAPI_CALL WaitSemaphoresKHR(VkDevice handle, const VkSemaphoreWaitInfo* info, uint64_t timeout) {
+    if (guards_device_lost()) return VK_ERROR_DEVICE_LOST;
     return waitSemaphores(NEXT(N_WAIT_SEMAPHORES_KHR, PFN_vkWaitSemaphores), handle, info, timeout);
 }
 
@@ -271,7 +284,7 @@ static pthread_once_t queryOnce = PTHREAD_ONCE_INIT;
 static uint64_t stuckLimitNs;
 static bool queryVisible;
 static QsTables* recordings; /* for the visible answer only */
-static pthread_mutex_t poolLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_rwlock_t poolLock = PTHREAD_RWLOCK_INITIALIZER;
 static QueryPool* pools[POOL_BUCKETS];
 static uint32_t poolCount;
 static struct {
@@ -281,11 +294,16 @@ static struct {
 
 static void readQueryConfig(void) {
     const char* ms = getenv("DROIDDECK_HYBRIS_QUERY_STUCK_MS");
-    uint64_t limit = ms && *ms >= '0' && *ms <= '9' ? strtoull(ms, NULL, 10) : 500;
-    if (limit && limit < 100) limit = 100;
+    bool raised;
+    uint64_t limit = qs_parse_limit_ms(ms, &raised);
     stuckLimitNs = limit * WR_MS;
     const char* visible = getenv("DROIDDECK_HYBRIS_QUERY_VISIBLE");
-    if (stuckLimitNs && visible && *visible && *visible != '0') {
+    bool wantVisible = visible && *visible && *visible != '0';
+    if (!stuckLimitNs) {
+        LOG("query stuck: off (DROIDDECK_HYBRIS_QUERY_STUCK_MS=0)%s", wantVisible ? "; DROIDDECK_HYBRIS_QUERY_VISIBLE=1 needs it" : "");
+        return;
+    }
+    if (wantVisible) {
         QsTables* t = calloc(1, sizeof(*t));
         if (t) {
             pthread_mutex_init(&t->lock, NULL);
@@ -293,9 +311,15 @@ static void readQueryConfig(void) {
             queryVisible = true;
         }
     }
+    char note[128] = "";
+    if (raised) snprintf(note, sizeof(note), " (DROIDDECK_HYBRIS_QUERY_STUCK_MS=%.40s raised to the minimum)", ms);
     if (queryVisible)
-        LOG("query stuck: an occlusion query answered not ready for %llu ms, ended in a primary submitted that long ago, is answered "
-            "as visible (DROIDDECK_HYBRIS_QUERY_VISIBLE=1)", (unsigned long long)limit);
+        LOG("query stuck: on, an occlusion query answered not ready for %llu ms%s is counted, and answered as visible when it ended in "
+            "a primary submitted that long ago (DROIDDECK_HYBRIS_QUERY_VISIBLE=1)", (unsigned long long)limit, note);
+    else
+        LOG("query stuck: on, an occlusion query answered not ready for %llu ms%s is counted, the answers unchanged%s "
+            "(DROIDDECK_HYBRIS_QUERY_STUCK_MS=0 turns this off)", (unsigned long long)limit, note,
+            wantVisible ? " (no memory for DROIDDECK_HYBRIS_QUERY_VISIBLE)" : "");
 }
 
 static bool queryStuckOn(void) {
@@ -315,10 +339,10 @@ static uint32_t poolBucket(uint64_t handle) {
 static QueryPool* poolOf(VkQueryPool pool) {
     if (!pool || !__atomic_load_n(&poolCount, __ATOMIC_RELAXED)) return NULL;
     uint64_t handle = (uint64_t)pool;
-    pthread_mutex_lock(&poolLock);
+    pthread_rwlock_rdlock(&poolLock);
     QueryPool* p = pools[poolBucket(handle)];
     while (p && p->handle != handle) p = p->next;
-    pthread_mutex_unlock(&poolLock);
+    pthread_rwlock_unlock(&poolLock);
     return p;
 }
 
@@ -351,18 +375,18 @@ static VkResult VKAPI_CALL CreateQueryPool(VkDevice handle, const VkQueryPoolCre
     if (!p) return result;
     p->handle = (uint64_t)*pool;
     p->count = info->queryCount;
-    pthread_mutex_lock(&poolLock);
+    pthread_rwlock_wrlock(&poolLock);
     p->next = pools[poolBucket(p->handle)];
     pools[poolBucket(p->handle)] = p;
     __atomic_add_fetch(&poolCount, 1, __ATOMIC_RELAXED);
-    pthread_mutex_unlock(&poolLock);
+    pthread_rwlock_unlock(&poolLock);
     return result;
 }
 
 static void VKAPI_CALL DestroyQueryPool(VkDevice handle, VkQueryPool pool, const VkAllocationCallbacks* allocator) {
     QueryPool* gone = NULL;
     if (pool) {
-        pthread_mutex_lock(&poolLock);
+        pthread_rwlock_wrlock(&poolLock);
         for (QueryPool** link = &pools[poolBucket((uint64_t)pool)]; *link; link = &(*link)->next) {
             if ((*link)->handle != (uint64_t)pool) continue;
             gone = *link;
@@ -370,7 +394,7 @@ static void VKAPI_CALL DestroyQueryPool(VkDevice handle, VkQueryPool pool, const
             __atomic_sub_fetch(&poolCount, 1, __ATOMIC_RELAXED);
             break;
         }
-        pthread_mutex_unlock(&poolLock);
+        pthread_rwlock_unlock(&poolLock);
     }
     free(gone);
     NEXT(N_DESTROY_QUERY_POOL, PFN_vkDestroyQueryPool)(handle, pool, allocator);
@@ -447,6 +471,7 @@ static VkResult VKAPI_CALL GetQueryPoolResults(VkDevice handle, VkQueryPool pool
                                                VkDeviceSize stride, VkQueryResultFlags flags) {
     PFN_vkGetQueryPoolResults next = NEXT(N_GET_QUERY_POOL_RESULTS, PFN_vkGetQueryPoolResults);
     bool wait = flags & VK_QUERY_RESULT_WAIT_BIT;
+    if (wait && guards_device_lost()) return VK_ERROR_DEVICE_LOST;
     uint64_t start = wait ? icd_now_ns() : 0;
     VkResult r = next(handle, pool, first, count, size, data, stride, flags);
     if (wait && !wr_legal(r)) {
@@ -587,8 +612,8 @@ VkResult guards_end_command_buffer(PFN_vkEndCommandBuffer next, VkCommandBuffer 
     VkResult result = (VkResult)crash_guard_call("vkEndCommandBuffer", endCall, &call, &faulted);
     if (!faulted) return result;
     if (!__atomic_exchange_n(&lost, 1, __ATOMIC_ACQ_REL))
-        LOG("crash guard: queue submissions fail with VK_ERROR_DEVICE_LOST from now on (command buffer %p was not recorded)",
-            (void*)commandBuffer);
+        LOG("crash guard: submissions, waits, presents and acquires fail with VK_ERROR_DEVICE_LOST from now on (command buffer %p "
+            "was not recorded)", (void*)commandBuffer);
     return VK_SUCCESS;
 }
 
@@ -605,13 +630,13 @@ PFN_vkVoidFunction guards_instance_proc(const char* name) {
     if (!strcmp(name, fn)) return wrapped(handle, name, index, (PFN_vkVoidFunction)(wrapper))
 
 PFN_vkVoidFunction guards_device_proc(VkDevice handle, const char* name) {
-    bool stuck = queryStuckOn();
-    if (guards_wait_retry_on()) {
+    bool stuck = queryStuckOn(), waits = guards_want_waits();
+    if (waits) {
         WRAP("vkWaitForFences", N_WAIT_FENCES, WaitForFences);
         WRAP("vkWaitSemaphores", N_WAIT_SEMAPHORES, WaitSemaphores);
         WRAP("vkWaitSemaphoresKHR", N_WAIT_SEMAPHORES_KHR, WaitSemaphoresKHR);
     }
-    if (guards_wait_retry_on() || stuck) WRAP("vkGetQueryPoolResults", N_GET_QUERY_POOL_RESULTS, GetQueryPoolResults);
+    if (waits || stuck) WRAP("vkGetQueryPoolResults", N_GET_QUERY_POOL_RESULTS, GetQueryPoolResults);
     if (!stuck) return NULL;
     WRAP("vkCreateQueryPool", N_CREATE_QUERY_POOL, CreateQueryPool);
     WRAP("vkDestroyQueryPool", N_DESTROY_QUERY_POOL, DestroyQueryPool);

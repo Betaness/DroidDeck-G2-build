@@ -19,6 +19,24 @@
 #include <string.h>
 #include <vulkan/vulkan_core.h>
 
+#define QS_MIN_MS 100u
+#define QS_DEFAULT_MS 500u
+
+/* DROIDDECK_HYBRIS_QUERY_STUCK_MS: the limit in ms, 0 for none, at least QS_MIN_MS (*raised set when
+ * a smaller one was asked for); the default when it is not a number. */
+static inline uint64_t qs_parse_limit_ms(const char* text, bool* raised) {
+    *raised = false;
+    if (!text || *text < '0' || *text > '9') return QS_DEFAULT_MS;
+    uint64_t ms = 0;
+    for (; *text >= '0' && *text <= '9'; text++) ms = ms > 1000000000u ? ms : ms * 10 + (uint64_t)(*text - '0');
+    if (*text) return QS_DEFAULT_MS;
+    if (ms && ms < QS_MIN_MS) {
+        *raised = true;
+        ms = QS_MIN_MS;
+    }
+    return ms;
+}
+
 #define QS_LOAD(p) __atomic_load_n((p), __ATOMIC_RELAXED)
 #define QS_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_RELAXED)
 

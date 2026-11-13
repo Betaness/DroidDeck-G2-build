@@ -833,6 +833,7 @@ static VkResult waitForRelease(Swapchain* sc, int fd, VkSemaphore* signalSemapho
 }
 
 static VkResult acquire(Swapchain* sc, uint64_t timeout, VkSemaphore semaphore, VkFence fence, uint32_t* imageIndex) {
+    if (guards_device_lost()) return VK_ERROR_DEVICE_LOST;
     if (sc->retired) return VK_ERROR_OUT_OF_DATE_KHR;
     Device* device = sc->device;
     int releaseFd = -1;
@@ -1939,7 +1940,10 @@ static VkResult VKAPI_CALL AcquireNextImage2KHR(VkDevice handle, const VkAcquire
 static VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info) {
     uint32_t family = 0;
     Device* device = icd_device_of_queue(queue, &family);
-    if (!device) return VK_ERROR_DEVICE_LOST;
+    if (!device || guards_device_lost()) {
+        for (uint32_t i = 0; info->pResults && i < info->swapchainCount; i++) info->pResults[i] = VK_ERROR_DEVICE_LOST;
+        return VK_ERROR_DEVICE_LOST;
+    }
     sweepLayers();
     VkResult overall = VK_SUCCESS;
     bool waitedSemaphores = false;
