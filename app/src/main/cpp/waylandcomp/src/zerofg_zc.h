@@ -19,7 +19,9 @@ enum {
 };
 /* What goes to the display with this drain goes into vortek_present's batch; ZeroFG applies the batch first
  * when it shows frames in transactions of its own. S and B wait on the event loop for their times (a timer,
- * S's completion); the next frame for the layer, hiding it or its swapchain going settles them first. */
+ * S's completion), the pairs of later frames behind them; a frame of the layer shown at once (ZFG_DIRECT and
+ * the skips that restart the rhythm) lets the waiting pairs go first, hiding the layer or its swapchain going
+ * drops them. */
 int zfg_present(const struct vku_frame *f, int acquire_fd, void *token);
 
 void zfg_init(struct wl_event_loop *loop);
@@ -49,6 +51,8 @@ void zfg_set_mode(int mode);
 void zfg_rates(float *real, float *shown);
 /* Any thread. The highest refresh rate the session lets the panel run at (0: not given; the refresh rate). */
 void zfg_set_peak_hz(float hz);
+/* Any thread. The panel's rates the layer's vote may pick from (up to 16; none: whole fractions of the peak). */
+void zfg_set_modes(const float *hz, int n);
 /* Any thread. A new game session: ZeroFG, off after a failure, may run again; the failure is forgotten. */
 void zfg_new_session(void);
 /* Any thread. Why ZeroFG stopped in this session, or the last size or mode it could not be built for: 1 with

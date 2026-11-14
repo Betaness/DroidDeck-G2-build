@@ -67,6 +67,7 @@ struct zfg_slots zfg_schedule(int64_t arrival, int64_t prev_b, int64_t period, i
             r.no_s = 1;
             r.s = 0;
             r.b = lo + half > prev_b + gap ? lo + half : prev_b + gap;
+            if (r.b > hi + step) r.b = lo + half;
         }
     }
     return r;
@@ -84,18 +85,50 @@ int64_t zfg_apply_at(int64_t desired, int64_t latch, int64_t margin) {
     return desired - (latch > 0 ? latch : 0) - (margin > 0 ? margin : 0);
 }
 
-int zfg_vote_div(int64_t period, float peak_hz, int prev_k) {
-    if (period <= 0 || peak_hz <= 0.0f) return 0;
+static int vote_even(double c, double out, double tol) {
+    if (c < out * (1.0 - tol)) return 0;
+    const double m = floor(c / out + 0.5);
+    return m >= 1.0 && fabs(c - m * out) <= tol * c;
+}
+
+float zfg_vote_pick(int64_t period, const float *modes, int n, float peak_hz, float prev) {
+    if (period <= 0 || peak_hz <= 0.0f) return 0.0f;
     const double out = 2e9 / (double)period, peak = peak_hz;
-    int k = (int)floor(peak / out);
-    if (k < 1) k = 1;
-    if (prev_k <= 0 || prev_k == k) return k;
-    if (prev_k > k) return out <= peak / prev_k * 1.02 ? prev_k : k;
-    const int roomy = (int)floor(peak / (out * 1.05));
-    return roomy > prev_k ? roomy : prev_k;
+    float cand[16];
+    int nc = 0;
+    for (int i = 0; modes && i < n && nc < 16; i++)
+        if (modes[i] > 1.0f && modes[i] <= peak + 0.5) cand[nc++] = modes[i];
+    if (!nc)
+        for (int k = 1; k <= 8; k++) cand[nc++] = (float)(peak / k);
+    float best = 0.0f, top = 0.0f;
+    int kept = 0;
+    for (int i = 0; i < nc; i++) {
+        if (cand[i] > top) top = cand[i];
+        if (prev > 0.0f && fabs(cand[i] - prev) < 0.5 && vote_even(cand[i], out, 0.05)) kept = 1;
+        if (vote_even(cand[i], out, 0.03) && (best <= 0.0f || cand[i] < best)) best = cand[i];
+    }
+    if (kept) return prev;
+    return best > 0.0f ? best : top;
 }
 
 int zfg_too_fast(int64_t period, float peak_hz, int was_fast) {
     if (period <= 0 || peak_hz <= 0.0f) return 0;
     return 2e9 / (double)period > (double)peak_hz * (was_fast ? 1.03 : 1.05);
+}
+
+int zfg_fast_update(struct zfg_fast *f, int64_t now, int64_t period, float refresh_hz, float peak_hz) {
+    if (period <= 0) {
+        f->on = 0;
+        f->over_since = 0;
+        return 0;
+    }
+    const double real = 1e9 / (double)period;
+    const int was = f->on;
+    const int over_run = refresh_hz > 0.0f && 2.0 * real > (double)refresh_hz * (was ? 1.03 : 1.05);
+    if (!over_run) f->over_since = 0;
+    else if (!f->over_since) f->over_since = now;
+    f->on = zfg_too_fast(period, peak_hz, was) ||
+            (refresh_hz > 0.0f && real > (double)refresh_hz * (was ? 1.0 : 1.02)) ||
+            (over_run && now - f->over_since >= ZFG_FAST_GRACE_NS);
+    return f->on;
 }

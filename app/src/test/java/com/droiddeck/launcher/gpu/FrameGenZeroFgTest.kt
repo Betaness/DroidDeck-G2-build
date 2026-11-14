@@ -106,6 +106,16 @@ class FrameGenZeroFgTest {
         assertTrue(FakeCompositor.calls.toString(), "peak 120.0" in FakeCompositor.calls)
     }
 
+    @Test fun thePanelsRatesGoToTheVoteWhenGiven() {
+        assertNull(FrameGen.apply(context, FrameGen.zeroFg(FrameGen.ZEROFG_REALLY_ZERO), 120f, 144f,
+            floatArrayOf(60f, 90f, 120f, 144f)))
+        assertEquals(listOf("engine 2", "zerofg 0", "tuning 120.0", "peak 144.0", "modes 60.0,90.0,120.0,144.0",
+            "armed true 2 0"), FakeCompositor.calls)
+        FakeCompositor.calls.clear()
+        assertNull(FrameGen.apply(context, FrameGen.Mode(FrameGen.ENGINE_DDFG, 2), 120f, 144f, floatArrayOf(60f)))
+        assertTrue(FakeCompositor.calls.toString(), FakeCompositor.calls.none { it.startsWith("modes") })
+    }
+
     @Test fun aFailureInTheSessionIsSaidNotRemembered() {
         FakeCompositor.failure = "off for this session: ZeroFG's GPU device was lost"
         val said = FrameGen.apply(context, FrameGen.zeroFg(FrameGen.ZEROFG_ZERO), 120f)
@@ -178,6 +188,7 @@ class FrameGenZeroFgTest {
             @JvmStatic @Implementation fun nativeSetDdFgTuning(model: Int, perfPreset: Int) { calls += "ddfg $model $perfPreset" }
             @JvmStatic @Implementation fun nativeZeroFgProblem(): String? = problem
             @JvmStatic @Implementation fun nativeSetZeroFgPeakHz(hz: Float) { calls += "peak $hz" }
+            @JvmStatic @Implementation fun nativeSetZeroFgModes(hz: FloatArray) { calls += "modes ${hz.joinToString(",")}" }
             @JvmStatic @Implementation fun nativeZeroFgFailure(): String? = failure
             @JvmStatic @Implementation fun nativeZeroFgNewSession() { calls += "new session" }
         }

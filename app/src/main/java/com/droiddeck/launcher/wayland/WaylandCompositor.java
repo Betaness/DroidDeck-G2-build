@@ -360,6 +360,9 @@ public final class WaylandCompositor {
     /** The highest refresh rate the session lets the panel run at (ZeroFG's frame-rate vote). */
     public static native void nativeSetZeroFgPeakHz(float hz);
 
+    /** The panel's rates up to that peak, which ZeroFG's frame-rate vote picks from (up to 16). */
+    public static native void nativeSetZeroFgModes(float[] hz);
+
     /** A new game session: ZeroFG, off after a failure in the last one, may run again. */
     public static native void nativeZeroFgNewSession();
 

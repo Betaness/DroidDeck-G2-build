@@ -45,7 +45,10 @@ struct zfg_slots {
  * arrived at `arrival`. s is half a period after the previous real frame's target (prev_b; 0: none), kept
  * between arrival + lead and arrival + lead + slack and at least one refresh after prev_b; b is half a period
  * after s, at least one refresh. When s would have to pass arrival + lead + slack to stay a refresh after
- * prev_b, there is no S: b is half a period after arrival + lead, at least one refresh after prev_b. */
+ * prev_b, there is no S: b is half a period after arrival + lead, at least one refresh after prev_b, but never
+ * later than b of a pair with S could be (arrival + lead + slack + max(half a period, a refresh)): real frames
+ * that come faster than the refresh rate do not push the targets later and later; one of them is then
+ * replaced on the screen by the next. */
 struct zfg_slots zfg_schedule(int64_t arrival, int64_t prev_b, int64_t period, int64_t lead, int64_t slack,
                               int64_t refresh);
 
@@ -60,15 +63,28 @@ int64_t zfg_latch_deadline(int64_t target, int64_t refresh_period, int64_t latch
  * before it. SurfaceFlinger keeps every later transaction of the process behind one whose time has not come. */
 int64_t zfg_apply_at(int64_t desired, int64_t latch, int64_t margin);
 
-/* The layer's frame-rate vote is peak / k: k is the largest whole number for which peak / k still has a
- * refresh for every output at twice the real rate (at least 1). The previous k (0: none) stays while twice
- * the real rate is at most 2 % above its rate, or until the next k fits with 5 % to spare. 0 while the
- * period or the peak rate is unknown. */
-int zfg_vote_div(int64_t period, float peak_hz, int prev_k);
+/* The layer's frame-rate vote: the lowest of the panel's rates (`modes`, n of them; none given: the peak rate
+ * over 1 .. 8) that is a whole multiple of twice the real rate within 3 %, so every output keeps the same
+ * number of refreshes; where none is, the highest rate up to the peak (the smallest unevenness). The previous
+ * vote (0: none) stays while it is still such a multiple within 5 %. Rates above the peak are not voted. 0
+ * while the period or the peak rate is unknown. */
+float zfg_vote_pick(int64_t period, const float *modes, int n, float peak_hz, float prev);
 
 /* Twice the real rate is more than 5 % above the peak refresh rate; once it was (was_fast), until it is 3 %
- * above or less. 0 when either is unknown. Between the refresh rate and that, S frames that find no
- * refresh of their own are left out (zfg_schedule). */
+ * above or less. 0 when either is unknown. */
 int zfg_too_fast(int64_t period, float peak_hz, int was_fast);
+
+/* `fast`: real frames go to the display as they come, without S. Twice the real rate above the peak rate
+ * (zfg_too_fast); or the real rate itself more than 2 % above the running refresh rate (until it is no
+ * longer above it): not every real frame can have a refresh of its own; or twice the real rate more than
+ * 5 % above the running refresh rate (until 3 % or less) for ZFG_FAST_GRACE_NS: the panel did not come up
+ * to the peak rate after the vote (a power or thermal cap, the system's refresh policy). Below that, S frames
+ * that find no refresh of their own are left out (zfg_schedule). refresh_hz 0: unknown, the peak rate alone. */
+#define ZFG_FAST_GRACE_NS 2000000000LL
+struct zfg_fast {
+    int on;
+    int64_t over_since; /* twice the real rate above the running refresh rate since then; 0: not */
+};
+int zfg_fast_update(struct zfg_fast *f, int64_t now, int64_t period, float refresh_hz, float peak_hz);
 
 #endif

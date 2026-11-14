@@ -23,6 +23,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/ioctl.h>
+#include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
@@ -31,6 +32,7 @@ void droiddeck_log(const char *tag, const char *fmt, ...) __attribute__((format(
 #define ZLOG(...) droiddeck_log("zerofg", __VA_ARGS__)
 
 #define ZJOBS 3
+#define ZPEND 4 /* pairs waiting for the display */
 #define ZSRC_MAX 16
 #define ZOUT_MAX (SC_VORTEK_LAYERS * SC_VORTEK_POOL)
 #define ZREADS 16
@@ -65,7 +67,7 @@ static struct {
     X(CreateQueryPool) X(DestroyQueryPool) X(GetQueryPoolResults) X(CreateFence) X(DestroyFence) X(ResetFences)  \
     X(GetFenceStatus) X(CreateSemaphore) X(DestroySemaphore) X(ImportSemaphoreFdKHR) X(GetSemaphoreFdKHR)        \
     X(QueueSubmit) X(DestroyDevice) X(GetAndroidHardwareBufferPropertiesANDROID) X(CreateImage) X(DestroyImage)   \
-    X(AllocateMemory) X(FreeMemory) X(BindImageMemory) X(CreateImageView) X(DestroyImageView)
+    X(AllocateMemory) X(FreeMemory) X(BindImageMemory) X(CreateImageView) X(DestroyImageView) X(WaitForFences)
 #define X(n) PFN_vk##n n;
     ZDEV_FUNCS(X)
 #undef X
@@ -109,6 +111,7 @@ struct zjob {
     struct wl_event_source *watch;
     int put, put_slot, put_idx; /* a pool buffer that goes back when the job is done */
     int done_stale;         /* done_sem was signalled and not exported: made anew when the job is done */
+    int acq_probe, done_probe; /* B's acquire fence and the job's completion, for their signal times (stats) */
 };
 
 struct want {
@@ -140,7 +143,8 @@ static struct {
     /* knobs, read when ZeroFG turns on */
     int k_mode, k_priority, k_dpt, k_vote, k_compat, k_trace;
     int64_t k_margin, k_latch; /* k_latch -1: one refresh */
-    int active, fast;
+    int active;
+    struct zfg_fast fast;
     int64_t last_use_ns, slot_ns[SC_VORTEK_LAYERS];
     struct {
         int valid, slot, fence; /* fence: the game's acquire fence while no generation has waited for it */
@@ -152,7 +156,7 @@ static struct {
     int64_t last_arrival, lead, prev_b;
     struct zfg_period period;
     float vote;
-    int vote_slot, vote_k;
+    int vote_slot;
     int64_t vote_ns;
     const char *said_filter;
     int said_on;
@@ -163,27 +167,32 @@ static struct {
 
 static struct {
     int64_t start_ns;
-    unsigned real, gen, skip[SK_COUNT], ready_n, after_target, gpu_n;
-    int64_t ready_sum, ready_max;
+    unsigned real, gen, skip[SK_COUNT], ready_n, after_target, gpu_n, acq_n, after_n, b_n, pend_max;
+    int64_t ready_sum, ready_max, acq_sum, acq_max, after_acq_sum, b_sum;
     float gpu[ZGPU_SAMPLES];
     double gpu_sum, gpu_max;
     unsigned long long total_gen;
 } S;
 
-/* The pair of the last real frame while it waits for its time on the screen. SurfaceFlinger keeps every later
- * transaction of the process behind one whose desired present time has not come, and behind one whose buffer
- * is not ready: S goes once it is complete, each shortly before its refresh, and B after S. */
-static struct {
-    int on;                 /* B waits */
-    int slot, dpt;
+/* Pairs of real frames waiting for their time on the screen, oldest first, all of one layer. SurfaceFlinger
+ * keeps every later transaction of the process behind one whose desired present time has not come, and behind
+ * one whose buffer is not ready: S goes once it is complete, each shortly before its refresh, and B after S.
+ * S can take longer than a real-frame period (it waits for B to be rendered): the next frames queue behind. */
+struct zpend {
     struct vku_frame f;     /* B */
     int acq_fd;
     void *token;
+    int dpt;
     int s_idx, s_fd;        /* S: pool buffer (-1: none) and completion fence */
     int geo[8];
-    int64_t s_desired, s_apply, b_desired, b_apply, b_deadline;
-} PD = {.acq_fd = -1, .s_idx = -1, .s_fd = -1};
+    int64_t s_desired, s_apply, s_last, b_desired, b_apply;
+};
+static struct {
+    int n, head, slot;
+    struct zpend q[ZPEND];
+} PD;
 static struct wl_event_source *g_timer;
+static int g_timer_fd = -1; /* CLOCK_MONOTONIC, absolute: S and B go to the display to the microsecond */
 
 static _Atomic int g_mode = ZFG_MODE_REALLYZERO;
 static _Atomic(const char *) g_unsupported;
@@ -207,6 +216,27 @@ static int fence_signalled(int fd) {
     return r != 0;
 }
 
+/* When a signalled sync_file signalled (CLOCK_MONOTONIC, the latest of its fences); 0: unknown or not yet. */
+static int64_t fence_time(int fd) {
+    if (fd < 0) return 0;
+    struct sync_file_info info;
+    memset(&info, 0, sizeof(info));
+    if (ioctl(fd, SYNC_IOC_FILE_INFO, &info) < 0 || info.status != 1 || !info.num_fences || info.num_fences > 8) return 0;
+    struct sync_fence_info fi[8];
+    memset(fi, 0, sizeof(fi));
+    info.sync_fence_info = (uint64_t)(uintptr_t)fi;
+    if (ioctl(fd, SYNC_IOC_FILE_INFO, &info) < 0 || info.status != 1) return 0;
+    uint64_t t = 0;
+    for (uint32_t i = 0; i < info.num_fences && i < 8; i++)
+        if (fi[i].timestamp_ns > t) t = fi[i].timestamp_ns;
+    return (int64_t)t;
+}
+
+static void close_fd(int *fd) {
+    if (*fd >= 0) close(*fd);
+    *fd = -1;
+}
+
 static void set_unsupported(const char *why) {
     if (atomic_load(&g_unsupported)) return;
     snprintf(g_unsupported_buf, sizeof(g_unsupported_buf), "%s", why);
@@ -225,6 +255,26 @@ void zfg_rates(float *real, float *shown) {
 }
 
 void zfg_set_peak_hz(float hz) { atomic_store(&g_peak_hz, hz > 1.0f ? hz : 0.0f); }
+
+static pthread_mutex_t g_modes_lock = PTHREAD_MUTEX_INITIALIZER;
+static float g_modes[16];
+static int g_modes_n;
+
+void zfg_set_modes(const float *hz, int n) {
+    pthread_mutex_lock(&g_modes_lock);
+    g_modes_n = 0;
+    for (int i = 0; hz && i < n && g_modes_n < 16; i++)
+        if (hz[i] > 1.0f) g_modes[g_modes_n++] = hz[i];
+    pthread_mutex_unlock(&g_modes_lock);
+}
+
+static int modes_get(float *out) {
+    pthread_mutex_lock(&g_modes_lock);
+    const int n = g_modes_n;
+    memcpy(out, g_modes, sizeof(g_modes));
+    pthread_mutex_unlock(&g_modes_lock);
+    return n;
+}
 
 /* NULL: nothing (any more). */
 static void note_failure(const char *fmt, const char *why) {
@@ -288,6 +338,20 @@ static void reads_drop_chain(uint32_t chain) {
     pthread_mutex_unlock(&g_reads_lock);
 }
 
+/* The read entry of a game image, taken out of the table (-1: none). */
+static int reads_take(uint32_t chain, uint32_t index) {
+    int fd = -1;
+    pthread_mutex_lock(&g_reads_lock);
+    for (int i = 0; i < ZREADS; i++)
+        if (g_reads[i].used && g_reads[i].chain == chain && g_reads[i].index == index) {
+            fd = g_reads[i].fd;
+            g_reads[i].used = 0;
+            break;
+        }
+    pthread_mutex_unlock(&g_reads_lock);
+    return fd;
+}
+
 static int merge_fences(int a, int b) {
     struct sync_merge_data d;
     memset(&d, 0, sizeof(d));
@@ -300,15 +364,7 @@ static int merge_fences(int a, int b) {
 }
 
 int zfg_release_fence(uint32_t chain, uint32_t index, int fence_fd) {
-    int read_fd = -1;
-    pthread_mutex_lock(&g_reads_lock);
-    for (int i = 0; i < ZREADS; i++)
-        if (g_reads[i].used && g_reads[i].chain == chain && g_reads[i].index == index) {
-            read_fd = g_reads[i].fd;
-            g_reads[i].used = 0;
-            break;
-        }
-    pthread_mutex_unlock(&g_reads_lock);
+    const int read_fd = reads_take(chain, index);
     if (read_fd < 0) return fence_fd;
     if (fence_signalled(read_fd)) {
         close(read_fd);
@@ -321,8 +377,10 @@ int zfg_release_fence(uint32_t chain, uint32_t index, int fence_fd) {
         close(read_fd);
         return merged;
     }
-    /* No merge: whichever fence signals first is waited for here and the other one is handed on. The display's
-     * signals within a refresh or so, so a stuck generation does not hold this thread. */
+    /* No merge: whichever fence signals first is waited for here and the other one is handed on. Only the
+     * display's release fences come here with a read entry (the binder thread); they signal within a refresh or
+     * so, so a stuck generation does not hold this thread. A pair that never reached the display gives its B back
+     * with the read entry alone (pend_cancel), which already covers B's acquire fence. */
     struct pollfd p[2] = {{.fd = fence_fd, .events = POLLIN}, {.fd = read_fd, .events = POLLIN}};
     int r;
     do { r = poll(p, 2, -1); } while (r < 0 && errno == EINTR);
@@ -445,7 +503,10 @@ static void dev_destroy(void) {
         VkSemaphore sems[4] = {j->acq_sem, j->prev_sem, j->rel_sem, j->done_sem};
         for (int k = 0; k < 4; k++)
             if (D.DestroySemaphore && sems[k]) D.DestroySemaphore(D.dev, sems[k], NULL);
+        close_fd(&j->acq_probe);
+        close_fd(&j->done_probe);
         memset(j, 0, sizeof(*j));
+        j->acq_probe = j->done_probe = -1;
     }
     if (D.DestroyQueryPool && D.qpool) D.DestroyQueryPool(D.dev, D.qpool, NULL);
     if (D.DestroyCommandPool && D.pool) D.DestroyCommandPool(D.dev, D.pool, NULL);
@@ -570,7 +631,10 @@ static int dev_create(char *why, size_t n) {
 #define MADE(call, h) ((call) == VK_SUCCESS || ((h) = VK_NULL_HANDLE, 0))
     for (int i = 0; i < ZJOBS; i++) {
         struct zjob *j = &Z.jobs[i];
+        close_fd(&j->acq_probe);
+        close_fd(&j->done_probe);
         memset(j, 0, sizeof(*j));
+        j->acq_probe = j->done_probe = -1;
         if (!MADE(D.AllocateCommandBuffers(D.dev, &cai, &j->cmd), j->cmd) ||
             !MADE(D.CreateFence(D.dev, &fci, NULL, &j->fence), j->fence) ||
             !MADE(D.CreateSemaphore(D.dev, &plain, NULL, &j->acq_sem), j->acq_sem) ||
@@ -723,6 +787,19 @@ static void job_finish(struct zjob *j) {
             if (ms > S.gpu_max) S.gpu_max = ms;
         }
     }
+    const int64_t ta = j->acq_probe >= 0 ? fence_time(j->acq_probe) : j->arrival_ns, td = fence_time(j->done_probe);
+    if (ta && j->arrival_ns) {
+        const int64_t rendered = ta > j->arrival_ns ? ta : j->arrival_ns, d = rendered - j->arrival_ns;
+        S.acq_n++;
+        S.acq_sum += d;
+        if (d > S.acq_max) S.acq_max = d;
+        if (td >= rendered) {
+            S.after_n++;
+            S.after_acq_sum += td - rendered;
+        }
+    }
+    close_fd(&j->acq_probe);
+    close_fd(&j->done_probe);
     j->serial = 0;
     if (j->put) {
         j->put = 0;
@@ -899,7 +976,14 @@ static struct zsrc *src_get(const struct vku_frame *f, const char **why) {
     /* A failed import stays in the table, so it is not tried again every frame. */
     free_e->ok = zimport(f->ahb, 1, &free_e->im, why) == 0;
     if (!free_e->ok) {
-        ZLOG("swapchain %u image %u cannot be used: %s", VP_CHAIN_ID(f->chain), f->index, *why);
+        static uint32_t said_chain;
+        if (said_chain != f->chain) {
+            said_chain = f->chain;
+            AHardwareBuffer_Desc desc;
+            AHardwareBuffer_describe(f->ahb, &desc);
+            ZLOG("swapchain %u (%ux%u, AHardwareBuffer format %#x) cannot be used: %s; its frames are shown as they are",
+                 VP_CHAIN_ID(f->chain), desc.width, desc.height, desc.format, *why);
+        }
         return NULL;
     }
     return free_e;
@@ -1010,12 +1094,14 @@ static int import_wait(VkSemaphore sem, int fd) {
 
 /* Records and submits the generation of S from a and b into o. Consumes acq_fd and prev_fd; *rel_fd (the
  * display's release fence of o) becomes -1 once the GPU waits for it. Returns 0 when submitted, with S's
- * completion fence in *done_fd; 1 when submitted but no fence came out of it: S cannot be shown and o stays in
- * use until the job is done; -1 when not submitted: the caller gives o back with *rel_fd. *skip says why. */
+ * completion fence in *done_fd; 1 when submitted but no fence came out of it: S cannot be shown, ZeroFG is off
+ * for the session, and o stays in use until the job is done (j->serial still set) or goes back now; -1 when
+ * not submitted: the caller gives o back with *rel_fd. *skip says why. */
 static int submit(struct zjob *j, struct zsrc *a, struct zsrc *b, struct zout *o, uint64_t seq_b, int acq_fd,
                   int prev_fd, int *rel_fd, int *done_fd, int *skip) {
     *done_fd = -1;
     int rel_keep = -1;
+    int acq_probe = acq_fd >= 0 ? fcntl(acq_fd, F_DUPFD_CLOEXEC, 0) : -1;
     const int st = j->done_sem ? record(j, a, b, o, seq_b) : ZFG_ST_VULKAN;
     if (st != ZFG_ST_OK) {
         static int said;
@@ -1059,18 +1145,27 @@ static int submit(struct zjob *j, struct zsrc *a, struct zsrc *b, struct zout *o
     if (rel_keep >= 0) close(rel_keep);
     j->serial = ++Z.serial;
     j->ready_ns = 0;
+    j->acq_probe = acq_probe;
+    acq_probe = -1;
     a->last_serial = b->last_serial = o->last_serial = j->serial;
     VkSemaphoreGetFdInfoKHR gi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, .semaphore = j->done_sem,
                                   .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
     int fd = -1;
     if (D.GetSemaphoreFdKHR(D.dev, &gi, &fd) != VK_SUCCESS) fd = -1;
     if (fd < 0) {
-        static int said;
-        if (!said) { said = 1; ZLOG("a generation's completion could not be exported as a sync_fd: its frame is left out"); }
+        /* Nothing can tell the game when this job has stopped reading a and b, nor SurfaceFlinger when it has
+         * written o. Waited for here, bounded, once: ZeroFG turns off for the session. Only a GPU stuck for longer
+         * leaves the game images going back before the job is done; o goes back once it is. */
         j->done_stale = 1;
+        const VkResult w = D.WaitForFences(D.dev, 1, &j->fence, VK_TRUE, 250000000ULL);
+        if (w == VK_SUCCESS) job_finish(j);
+        ZLOG("a generation's completion could not be exported as a sync_fd (%s)",
+             w == VK_SUCCESS ? "waited for it" : "it did not finish within 250 ms");
+        disable("a generation's completion could not be exported as a sync_fd", 0);
         *skip = SK_ERROR;
         return 1;
     }
+    j->done_probe = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     j->watch = wl_event_loop_add_fd(Z.loop, fd, WL_EVENT_READABLE, on_done, j);
     reads_set(a->chain, a->index, fcntl(fd, F_DUPFD_CLOEXEC, 0));
     reads_set(b->chain, b->index, fcntl(fd, F_DUPFD_CLOEXEC, 0));
@@ -1080,6 +1175,7 @@ fail:
     if (rel_keep >= 0) close(rel_keep);
     if (acq_fd >= 0) close(acq_fd);
     if (prev_fd >= 0) close(prev_fd);
+    if (acq_probe >= 0) close(acq_probe);
     return -1;
 }
 
@@ -1125,7 +1221,6 @@ static void vote_clear(void) {
     if (Z.vote_slot >= 0) sc_layer_vortek_frame_rate(Z.vote_slot, 0.0f);
     Z.vote_slot = -1;
     Z.vote = 0.0f;
-    Z.vote_k = 0;
 }
 
 static void stats_reset(int64_t now) {
@@ -1138,7 +1233,7 @@ static void stats_reset(int64_t now) {
 static void activate(int64_t now) {
     read_knobs();
     Z.active = 1;
-    Z.fast = 0;
+    Z.fast = (struct zfg_fast){0, 0};
     Z.last_arrival = 0;
     Z.lead = 0;
     zfg_period_reset(&Z.period);
@@ -1203,28 +1298,32 @@ static void stats_maybe_log(int64_t now, int dpt) {
     atomic_store(&g_rate_shown, shown);
     ZLOG("stats %.1fs real_fps=%.1f gen=%u gen_fps=%.1f skip=%u skip_first=%u skip_cut=%u skip_fast=%u skip_early=%u "
          "skip_late=%u skip_busy=%u skip_missed=%u skip_unsupported=%u skip_error=%u skip_prep=%u gpu_ms_med=%.2f "
-         "gpu_ms_avg=%.2f gpu_ms_max=%.2f gpu_n=%u ready_ms_avg=%.1f ready_ms_max=%.1f s_after_target=%u dpt=%d "
-         "period_ms=%.1f lead_ms=%.1f vote_hz=%.1f mode=%s size=%ux%u",
+         "gpu_ms_avg=%.2f gpu_ms_max=%.2f gpu_n=%u ready_ms_avg=%.1f ready_ms_max=%.1f s_after_target=%u "
+         "b_rendered_ms_avg=%.1f b_rendered_ms_max=%.1f s_after_b_ms_avg=%.1f b_target_ms_avg=%.1f queue_max=%u "
+         "dpt=%d period_ms=%.1f lead_ms=%.1f refresh_hz=%.1f vote_hz=%.1f fast=%d mode=%s size=%ux%u",
          secs, (double)real, S.gen, S.gen / secs, skipped, S.skip[SK_FIRST], S.skip[SK_CUT], S.skip[SK_FAST],
          S.skip[SK_EARLY], S.skip[SK_LATE], S.skip[SK_BUSY], S.skip[SK_MISSED], S.skip[SK_UNSUPPORTED],
          S.skip[SK_ERROR], S.skip[SK_PREP], med,
          S.gpu_n ? S.gpu_sum / S.gpu_n : 0.0, S.gpu_max, S.gpu_n,
-         S.ready_n ? (double)S.ready_sum / S.ready_n / 1e6 : 0.0, (double)S.ready_max / 1e6, S.after_target, dpt,
-         (double)period / 1e6, (double)Z.lead / 1e6, (double)Z.vote, mode_name(Z.built.mode), Z.built.w, Z.built.h);
+         S.ready_n ? (double)S.ready_sum / S.ready_n / 1e6 : 0.0, (double)S.ready_max / 1e6, S.after_target,
+         S.acq_n ? (double)S.acq_sum / S.acq_n / 1e6 : 0.0, (double)S.acq_max / 1e6,
+         S.after_n ? (double)S.after_acq_sum / S.after_n / 1e6 : 0.0, S.b_n ? (double)S.b_sum / S.b_n / 1e6 : 0.0,
+         S.pend_max, dpt, (double)period / 1e6, (double)Z.lead / 1e6, (double)refresh_hz(), (double)Z.vote,
+         Z.fast.on, mode_name(Z.built.mode), Z.built.w, Z.built.h);
     stats_reset(now);
 }
 
 static void vote_update(int slot, int64_t period, float peak, int64_t now) {
     if (!Z.k_vote) return;
-    const int k = zfg_vote_div(period, peak, Z.vote_slot == slot ? Z.vote_k : 0);
-    if (k <= 0) return;
-    const float v = peak / (float)k;
+    float modes[16];
+    const int n = modes_get(modes);
+    const float v = zfg_vote_pick(period, modes, n, peak, Z.vote_slot == slot ? Z.vote : 0.0f);
+    if (v <= 0.0f) return;
     if (Z.vote_slot == slot && (v == Z.vote || now - Z.vote_ns < 1000000000LL)) return;
     if (Z.vote_slot >= 0 && Z.vote_slot != slot) sc_layer_vortek_frame_rate(Z.vote_slot, 0.0f);
     sc_layer_vortek_frame_rate(slot, v);
     Z.vote_slot = slot;
     Z.vote = v;
-    Z.vote_k = k;
     Z.vote_ns = now;
 }
 
@@ -1238,8 +1337,11 @@ static void say_on(int dpt) {
          "is the one on the screen (no copy); desired present time %s, frame-rate vote %s, margin %lld ms, "
          "SurfaceFlinger latch %s",
          mode_name(Z.built.mode), Z.built.w, Z.built.h, Z.built.in == VK_FORMAT_B8G8R8A8_UNORM ? "B8G8R8A8" : "R8G8B8A8",
-         Z.backend ? Z.backend : "?", Z.resize_ms, dpt ? "on" : Z.k_dpt ? "unavailable (no ASurfaceTransaction_setDesiredPresentTime)" : "off (DROIDDECK_ZEROFG_DPT=0)",
-         Z.k_vote ? "the peak rate over a whole number, at least 2x the real rate (seamless switches only)"
+         Z.backend ? Z.backend : "?", Z.resize_ms,
+         dpt ? "on" : Z.k_dpt ? "unavailable (no ASurfaceTransaction_setDesiredPresentTime): S and B are handed over at their times"
+                     : "off (DROIDDECK_ZEROFG_DPT=0): S and B are handed over at their times",
+         Z.k_vote ? "the lowest panel rate that is a whole multiple of 2x the real rate, else the peak rate "
+                    "(seamless switches only)"
                   : "off (DROIDDECK_ZEROFG_VOTE=0)",
          (long long)(Z.k_margin / 1000000), latch);
 }
@@ -1253,19 +1355,27 @@ static void say_on(int dpt) {
 
 static void pend_arm(int64_t when, int64_t now) {
     if (!g_timer) return;
-    int64_t ms = (when - now + 999999) / 1000000;
-    if (ms < 1) ms = 1;
-    wl_event_source_timer_update(g_timer, (int)ms);
+    if (g_timer_fd < 0) {
+        int64_t ms = (when - now + 999999) / 1000000;
+        if (ms < 1) ms = 1;
+        wl_event_source_timer_update(g_timer, (int)ms);
+        return;
+    }
+    if (when <= now) when = now + 1000;
+    const struct itimerspec its = {.it_value = {.tv_sec = (time_t)(when / 1000000000LL), .tv_nsec = (long)(when % 1000000000LL)}};
+    timerfd_settime(g_timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
 }
 
-/* S to the display; its completion fence has signalled. */
-static void pend_apply_s(void) {
+static struct zpend *pend_at(int i) { return &PD.q[(PD.head + i) % ZPEND]; }
+
+/* S of the oldest pair to the display; its completion fence has signalled. */
+static void pend_apply_s(struct zpend *p) {
     vortek_present_batch_flush();
-    const int fd = PD.s_fd, keep = fd >= 0 ? fcntl(fd, F_DUPFD_CLOEXEC, 0) : -1;
-    PD.s_fd = -1;
+    const int fd = p->s_fd, keep = fd >= 0 ? fcntl(fd, F_DUPFD_CLOEXEC, 0) : -1;
+    p->s_fd = -1;
     struct ASurfaceTransaction *ts = sc_layer_tx_begin();
-    if (ts && PD.dpt) sc_layer_tx_desired_present(ts, PD.s_desired);
-    const int rs = ts ? sc_layer_present_vortek_pooled(PD.slot, -1, PD.s_idx, fd, PD.geo, ts) : -1;
+    if (ts && p->dpt) sc_layer_tx_desired_present(ts, p->s_desired);
+    const int rs = ts ? sc_layer_present_vortek_pooled(p->f.slot, -1, p->s_idx, fd, p->geo, ts) : -1;
     if (!ts && fd >= 0) close(fd);
     if (rs == 0) {
         sc_layer_tx_apply(ts);
@@ -1274,31 +1384,36 @@ static void pend_apply_s(void) {
         S.total_gen++;
     } else {
         sc_layer_tx_discard(ts);
-        sc_layer_vortek_pool_put(PD.slot, PD.s_idx, keep);
+        sc_layer_vortek_pool_put(p->f.slot, p->s_idx, keep);
         S.skip[SK_ERROR]++;
     }
-    PD.s_idx = -1;
+    p->s_idx = -1;
 }
 
 /* S stays off the screen: its buffer goes back with the generation's completion as its release fence. */
-static void pend_drop_s(int why) {
-    if (PD.s_idx < 0) return;
-    sc_layer_vortek_pool_put(PD.slot, PD.s_idx, PD.s_fd);
-    PD.s_fd = -1;
-    PD.s_idx = -1;
+static void pend_drop_s(struct zpend *p, int why) {
+    if (p->s_idx < 0) return;
+    sc_layer_vortek_pool_put(p->f.slot, p->s_idx, p->s_fd);
+    p->s_fd = -1;
+    p->s_idx = -1;
     if (why >= 0) S.skip[why]++;
 }
 
+/* B of the oldest pair to the display; the pair leaves the queue. */
 static void pend_apply_b(void) {
+    struct zpend *p = pend_at(0);
+    const struct vku_frame f = p->f;
+    const int acq = p->acq_fd, dpt = p->dpt;
+    const int64_t desired = p->b_desired;
+    void *token = p->token;
+    p->acq_fd = -1;
+    PD.head = (PD.head + 1) % ZPEND;
+    PD.n--;
     vortek_present_batch_flush();
-    PD.on = 0;
-    const struct vku_frame *f = &PD.f;
-    const int acq = PD.acq_fd;
-    PD.acq_fd = -1;
     struct ASurfaceTransaction *tb = sc_layer_tx_begin();
-    if (tb && PD.dpt && PD.b_desired) sc_layer_tx_desired_present(tb, PD.b_desired);
-    const int r = tb ? sc_layer_present_vortek(f->slot, -1, f->ahb, f->buf_w, f->buf_h, acq, PD.token, f->x, f->y, f->w,
-                                               f->h, f->scene_w, f->scene_h, tb)
+    if (tb && dpt && desired) sc_layer_tx_desired_present(tb, desired);
+    const int r = tb ? sc_layer_present_vortek(f.slot, -1, f.ahb, f.buf_w, f.buf_h, acq, token, f.x, f.y, f.w, f.h,
+                                               f.scene_w, f.scene_h, tb)
                      : -1;
     if (!tb && acq >= 0) close(acq);
     if (r == 0) {
@@ -1306,45 +1421,68 @@ static void pend_apply_b(void) {
         return;
     }
     sc_layer_tx_discard(tb);
-    vortek_present_release(f->chain, f->index, -1);
-    if (Z.prev.valid && Z.prev.chain == f->chain && Z.prev.index == f->index) forget_prev();
+    vortek_present_release(f.chain, f.index, -1);
+    if (Z.prev.valid && Z.prev.chain == f.chain && Z.prev.index == f.index) forget_prev();
 }
 
-/* S once it is complete and its apply time has come, as long as B's has not; then B at its apply time. force:
- * everything now (a newer frame for the layer is here, or ZeroFG stops), S only if it is complete. */
+/* The waiting pairs in order: S once it is complete and its apply time has come, as long as a refresh is left
+ * before B's; then B at its apply time. The oldest `force` pairs go now (a newer pair needs the place, a frame
+ * is shown at once after them, or ZeroFG stops), S only if it is complete. */
 static void pend_run(int force) {
-    if (!PD.on) return;
-    const int64_t now = now_ns();
-    if (PD.s_idx >= 0) {
-        const int ready = PD.s_fd >= 0 && fence_signalled(PD.s_fd);
-        if (ready && (force || now >= PD.s_apply)) pend_apply_s();
-        else if (force || now >= PD.b_deadline) pend_drop_s(SK_MISSED);
-        else {
-            /* on_done comes back here once S is complete */
-            pend_arm(ready ? PD.s_apply : PD.b_deadline, now);
+    while (PD.n) {
+        struct zpend *p = pend_at(0);
+        const int now_all = force > 0;
+        const int64_t now = now_ns();
+        if (p->s_idx >= 0) {
+            const int ready = p->s_fd >= 0 && fence_signalled(p->s_fd), late = now >= p->s_last;
+            if (ready && !late && (now_all || now >= p->s_apply)) pend_apply_s(p);
+            else if (late || now_all) pend_drop_s(p, SK_MISSED);
+            else {
+                /* on_done comes back here once S is complete */
+                pend_arm(ready ? p->s_apply : p->s_last, now);
+                return;
+            }
+        }
+        if (!now_all && now < p->b_apply) {
+            pend_arm(p->b_apply, now);
             return;
         }
+        pend_apply_b();
+        if (force > 0) force--;
     }
-    if (force || now >= PD.b_apply) pend_apply_b();
-    else pend_arm(PD.b_apply, now);
 }
 
 static void pend_flush(int show_s) {
-    if (!PD.on) return;
-    if (!show_s) pend_drop_s(-1);
-    pend_run(1);
+    if (!show_s)
+        for (int i = 0; i < PD.n; i++) pend_drop_s(pend_at(i), -1);
+    pend_run(ZPEND);
 }
 
-/* The pair never reaches the screen (the layer is hidden, the swapchain or the window is gone): S's buffer goes
- * back to the pool, B back to the game once rendered and read. */
-static void pend_cancel(void) {
-    if (!PD.on) return;
-    pend_drop_s(-1);
-    PD.on = 0;
-    const int acq = PD.acq_fd;
-    PD.acq_fd = -1;
-    vortek_present_release(PD.f.chain, PD.f.index, acq);
-    if (Z.prev.valid && Z.prev.chain == PD.f.chain && Z.prev.index == PD.f.index) forget_prev();
+/* Pairs that never reach the screen (the layer is hidden, the swapchain (chain; 0: any) or the window is
+ * gone): S's buffer goes back to the pool, B back to the game once rendered and read. A read entry of B is
+ * from a generation that waited for B's acquire fence or ran after one that did, so it alone is B's release
+ * fence then; nothing waits here. */
+static void pend_cancel(uint32_t chain) {
+    int kept = 0;
+    for (int i = 0; i < PD.n; i++) {
+        struct zpend *p = pend_at(i);
+        if (chain && p->f.chain != chain) {
+            if (kept != i) *pend_at(kept) = *p;
+            kept++;
+            continue;
+        }
+        pend_drop_s(p, -1);
+        int acq = p->acq_fd;
+        p->acq_fd = -1;
+        const int read_fd = reads_take(p->f.chain, p->f.index);
+        if (read_fd >= 0) {
+            if (acq >= 0) close(acq);
+            acq = read_fd;
+        }
+        vortek_present_release(p->f.chain, p->f.index, acq);
+        if (Z.prev.valid && Z.prev.chain == p->f.chain && Z.prev.index == p->f.index) forget_prev();
+    }
+    PD.n = kept;
 }
 
 static int on_timer(void *data) {
@@ -1353,31 +1491,41 @@ static int on_timer(void *data) {
     return 0;
 }
 
-/* B (and S, s_idx >= 0) wait for their times. Takes acquire_fd and s_fd. */
-static void pend_set(const struct vku_frame *f, int acquire_fd, void *token, int s_idx, int s_fd, const int geo[8],
-                     struct zfg_slots t, int64_t refresh_ns, int64_t latch, int dpt) {
-    /* the main window moved to another layer while that layer's pair waited */
-    pend_flush(1);
-    PD.on = 1;
+static int on_timer_fd(int fd, uint32_t mask, void *data) {
+    (void)mask; (void)data;
+    uint64_t n;
+    while (read(fd, &n, sizeof(n)) < 0 && errno == EINTR) {}
+    pend_run(0);
+    return 0;
+}
+
+/* B (and S, s_idx >= 0) wait for their times behind the pairs before them. Takes acquire_fd and s_fd. Without a
+ * desired present time (dpt 0) they are handed over at the same times, so S still has a refresh before B. */
+static void pend_push(const struct vku_frame *f, int acquire_fd, void *token, int s_idx, int s_fd, const int geo[8],
+                      struct zfg_slots t, int64_t refresh_ns, int64_t latch, int dpt) {
+    /* the main window moved to another layer while that layer's pairs waited */
+    if (PD.n && PD.slot != f->slot) pend_flush(1);
+    if (PD.n >= ZPEND) pend_run(1);
+    struct zpend *p = pend_at(PD.n);
+    PD.n++;
     PD.slot = f->slot;
-    PD.dpt = dpt;
-    PD.f = *f;
-    PD.acq_fd = acquire_fd;
-    PD.token = token;
-    PD.s_idx = s_idx;
-    PD.s_fd = s_fd;
-    memcpy(PD.geo, geo, sizeof(PD.geo));
-    PD.s_desired = s_idx >= 0 ? zfg_desired(t.s, refresh_ns) : 0;
-    PD.b_desired = zfg_desired(t.b, refresh_ns);
-    if (dpt) {
-        PD.s_apply = s_idx >= 0 ? zfg_apply_at(PD.s_desired, latch, Z.k_margin) : 0;
-        PD.b_apply = zfg_apply_at(PD.b_desired, latch, Z.k_margin);
-        PD.b_deadline = PD.b_apply;
-    } else {
-        /* no desired present time: each goes as soon as it may, S only while it can still come before B */
-        PD.s_apply = PD.b_apply = 0;
-        PD.b_deadline = zfg_latch_deadline(t.b, refresh_ns, latch);
-    }
+    if ((unsigned)PD.n > S.pend_max) S.pend_max = (unsigned)PD.n;
+    p->f = *f;
+    p->dpt = dpt;
+    p->acq_fd = acquire_fd;
+    p->token = token;
+    p->s_idx = s_idx;
+    p->s_fd = s_fd;
+    memcpy(p->geo, geo, sizeof(p->geo));
+    p->s_desired = s_idx >= 0 ? zfg_desired(t.s, refresh_ns) : 0;
+    p->b_desired = zfg_desired(t.b, refresh_ns);
+    p->s_apply = s_idx >= 0 ? zfg_apply_at(p->s_desired, latch, Z.k_margin) : 0;
+    p->b_apply = zfg_apply_at(p->b_desired, latch, Z.k_margin);
+    /* An S handed over after the commit a refresh before B's (in the worst phase: latch + margin before B's
+     * desired present time, less a refresh) would be taken by SurfaceFlinger with B and never seen. An S ready
+     * by its own apply time always goes. */
+    p->s_last = p->b_apply + Z.k_margin - refresh_ns;
+    if (p->s_last < p->s_apply + 1000000) p->s_last = p->s_apply + 1000000;
     pend_run(0);
 }
 
@@ -1389,10 +1537,18 @@ static void skip_direct(int why) {
     if (why == SK_UNSUPPORTED || why == SK_ERROR) vote_clear();
 }
 
+static int present(const struct vku_frame *f, int acquire_fd, void *token);
+
 int zfg_present(const struct vku_frame *f, int acquire_fd, void *token) {
     if (!f || f->slot < 0 || f->slot >= SC_VORTEK_LAYERS || !f->ahb || !Z.loop) return ZFG_DIRECT;
-    /* The pair still waiting on this layer goes first, whatever happens to this frame. */
-    if (PD.on && PD.slot == f->slot) pend_flush(1);
+    if (PD.n && PD.slot == f->slot) pend_run(0);
+    const int r = present(f, acquire_fd, token);
+    /* The caller shows the frame at once: the pairs still waiting on this layer go first. */
+    if (r == ZFG_DIRECT && PD.n && PD.slot == f->slot) pend_flush(1);
+    return r;
+}
+
+static int present(const struct vku_frame *f, int acquire_fd, void *token) {
     session_check();
     if (!vkp_framegen_zerofg_armed()) {
         if (Z.active) deactivate("frame generation turned off");
@@ -1496,11 +1652,10 @@ int zfg_present(const struct vku_frame *f, int acquire_fd, void *token) {
     const uint64_t seq = ++Z.seq;
     const int dpt = Z.k_dpt && sc_layer_can_desire_present();
     struct zfg_slots t = {0, 0, 0};
-    if (period > 0) {
+    if (period > 0)
         t = zfg_schedule(now, Z.prev_b, period, zfg_target_lead(Z.lead, period, Z.k_margin, latch, refresh_ns),
                          zfg_slack(period, refresh_ns), refresh_ns);
-        Z.fast = zfg_too_fast(period, peak, Z.fast);
-    }
+    zfg_fast_update(&Z.fast, now, period, refresh, peak);
 
     int why = -1;
     struct zsrc *a = Z.prev.src;
@@ -1509,9 +1664,8 @@ int zfg_present(const struct vku_frame *f, int acquire_fd, void *token) {
         why = SK_FIRST;
     else if (gap) why = SK_CUT;
     else if (period <= 0) why = SK_FIRST;
-    else if (Z.fast) why = SK_FAST;
+    else if (Z.fast.on) why = SK_FAST;
     else if (t.no_s) why = SK_EARLY;
-    else if (jobs_running() >= 2) why = SK_LATE;
     struct zjob *j = NULL;
     for (int i = 0; why < 0 && i < ZJOBS && !j; i++)
         if (!Z.jobs[i].serial) j = &Z.jobs[i];
@@ -1542,7 +1696,7 @@ int zfg_present(const struct vku_frame *f, int acquire_fd, void *token) {
         j->s_deadline_ns = zfg_latch_deadline(t.s, refresh_ns, latch);
         int skip = SK_ERROR;
         const int sr = submit(j, a, b, o, seq, acq, prev_fd, &rel_fd, &done_fd, &skip);
-        if (sr < 0) {
+        if (sr < 0 || (sr > 0 && !j->serial)) {
             sc_layer_vortek_pool_put(f->slot, idx, rel_fd);
             rel_fd = -1;
         } else if (sr > 0) {
@@ -1566,8 +1720,10 @@ int zfg_present(const struct vku_frame *f, int acquire_fd, void *token) {
 
     if (why >= 0) S.skip[why]++;
     /* No S for this pair (early, late, busy): B keeps the rhythm. */
-    const int later = why < 0 || ((why == SK_EARLY || why == SK_LATE || why == SK_BUSY) && dpt && Z.prev_b && period > 0);
+    const int later = why < 0 || ((why == SK_EARLY || why == SK_LATE || why == SK_BUSY) && Z.prev_b && period > 0);
     if (!later) {
+        /* shown at once: after the pairs still waiting */
+        if (PD.n && PD.slot == f->slot) pend_flush(1);
         const int r = sc_layer_present_vortek(f->slot, f->z, f->ahb, f->buf_w, f->buf_h, acquire_fd, token, f->x, f->y,
                                               f->w, f->h, f->scene_w, f->scene_h, vortek_present_batch());
         if (r != 0) {
@@ -1590,14 +1746,16 @@ int zfg_present(const struct vku_frame *f, int acquire_fd, void *token) {
     if (later) {
         /* z now, in this drain's batch; S and B later at whatever z the layer has then */
         sc_layer_vortek_z(f->slot, f->z, vortek_present_batch());
-        pend_set(f, acquire_fd, token, why < 0 ? idx : -1, why < 0 ? done_fd : -1, geo, t, refresh_ns, latch, dpt);
+        S.b_n++;
+        S.b_sum += t.b - now;
+        pend_push(f, acquire_fd, token, why < 0 ? idx : -1, why < 0 ? done_fd : -1, geo, t, refresh_ns, latch, dpt);
     }
     say_on(dpt);
     if (Z.k_trace)
-        ZLOG("trace t=%.4f seq %llu iv %.2f period %.2f lead %.2f %s s %+.2f b %+.2f", (double)now / 1e9,
+        ZLOG("trace t=%.4f seq %llu iv %.2f period %.2f lead %.2f %s s %+.2f b %+.2f queue %d", (double)now / 1e9,
              (unsigned long long)seq, (double)iv / 1e6, (double)period / 1e6, (double)Z.lead / 1e6,
              why < 0 ? "gen" : skip_names[why], t.s ? (double)(t.s - now) / 1e6 : 0.0,
-             t.b ? (double)(t.b - now) / 1e6 : 0.0);
+             t.b ? (double)(t.b - now) / 1e6 : 0.0, PD.n);
     stats_maybe_log(now, dpt);
     return ZFG_SHOWN;
 }
@@ -1607,18 +1765,25 @@ int zfg_present(const struct vku_frame *f, int acquire_fd, void *token) {
 void zfg_init(struct wl_event_loop *loop) {
     Z.loop = loop;
     for (int i = 0; i < ZOUT_MAX; i++) Z.out[i].slot = -1;
-    g_timer = wl_event_loop_add_timer(loop, on_timer, NULL);
+    for (int i = 0; i < ZJOBS; i++) Z.jobs[i].acq_probe = Z.jobs[i].done_probe = -1;
+    g_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    g_timer = g_timer_fd >= 0 ? wl_event_loop_add_fd(loop, g_timer_fd, WL_EVENT_READABLE, on_timer_fd, NULL) : NULL;
+    if (!g_timer) {
+        if (g_timer_fd >= 0) close(g_timer_fd);
+        g_timer_fd = -1;
+        g_timer = wl_event_loop_add_timer(loop, on_timer, NULL);
+    }
 }
 
 void zfg_layer_hidden(int slot) {
-    if (PD.on && PD.slot == slot) pend_cancel();
+    if (PD.n && PD.slot == slot) pend_cancel(0);
     if (Z.prev.valid && Z.prev.slot == slot) forget_prev();
     if (Z.vote_slot == slot) vote_clear();
 }
 
 void zfg_chain_gone(uint32_t chain) {
     if (!chain) return;
-    if (PD.on && PD.f.chain == chain) pend_cancel();
+    pend_cancel(chain);
     if (Z.prev.valid && Z.prev.chain == chain) forget_prev();
     for (int i = 0; i < ZSRC_MAX; i++)
         if (Z.src[i].chain == chain) Z.src[i].dead = 1;
@@ -1629,7 +1794,7 @@ void zfg_chain_gone(uint32_t chain) {
 /* The pools are about to go: imports of pool buffers go now, or once the jobs that write them are done (our
  * own references keep those buffers until then). */
 void zfg_idle(void) {
-    pend_cancel();
+    pend_cancel(0);
     forget_prev();
     if (!Z.dev_owned) return;
     /* the pools go with every buffer in them, also those a job still writes */
@@ -1652,7 +1817,7 @@ static void pools_trim(void) {
 /* Off for the session: everything goes, the device last, once nothing runs on it. 1: done. */
 static int teardown(void) {
     if (Z.state >= 0) return 1;
-    pend_cancel();
+    pend_cancel(0);
     forget_prev();
     if (atomic_load(&Z.prep) == 1) return 0;
     if (atomic_load(&Z.prep) == 2) {

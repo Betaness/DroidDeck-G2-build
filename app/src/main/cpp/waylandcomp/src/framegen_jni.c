@@ -82,6 +82,16 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetZeroFgPeakHz(JNIE
 }
 
 JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetZeroFgModes(JNIEnv *env, jclass clazz, jfloatArray hz) {
+    (void)clazz;
+    float modes[16];
+    jsize n = hz ? (*env)->GetArrayLength(env, hz) : 0;
+    if (n > 16) n = 16;
+    if (n > 0) (*env)->GetFloatArrayRegion(env, hz, 0, n, modes);
+    zfg_set_modes(modes, (int)n);
+}
+
+JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeZeroFgNewSession(JNIEnv *env, jclass clazz) {
     (void)env; (void)clazz;
     zfg_new_session();

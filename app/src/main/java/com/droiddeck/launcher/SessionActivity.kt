@@ -1321,6 +1321,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 val zeroFgBefore = FrameGen.engine(this@SessionActivity) == FrameGen.ENGINE_ZEROFG
                 FrameGen.set(this@SessionActivity, mode)
                 readPrefs()
+                if (zeroFgBefore && mode.engine != FrameGen.ENGINE_ZEROFG) noteZeroFgOff()
                 if (zeroFgBefore || mode.engine == FrameGen.ENGINE_ZEROFG) updateSessionVote()
                 applyFrameGen()
             },
@@ -2446,16 +2447,39 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     /** [mali-g2] The layers' frame-rate vote: the running rate, except with ZeroFG, whose own vote may have
-     *  lowered it; then the highest rate the session allows, so the panel comes back up after ZeroFG. */
-    private fun sessionVoteHz(hz: Float): Float =
+     *  lowered it; then the highest rate the session allows, so the panel comes back up after ZeroFG. For a while
+     *  after ZeroFG was turned off that rate too, while the panel still runs below it (ZeroFG's vote lowered it);
+     *  then the running rate again, as without ZeroFG. */
+    private fun sessionVoteHz(hz: Float): Float {
         if (FrameGen.engine(this) == FrameGen.ENGINE_ZEROFG && !(pipUi && mirrorRefreshLimit() <= 0))
-            runCatching { zeroFgPeakHz() }.getOrDefault(0f).takeIf { it > 1f } ?: hz
-        else hz
+            return runCatching { zeroFgPeakHz() }.getOrDefault(0f).takeIf { it > 1f } ?: hz
+        if (zeroFgOffAt != 0L && SystemClock.elapsedRealtime() - zeroFgOffAt < ZEROFG_OFF_RECOVER_MS &&
+            !(pipUi && mirrorRefreshLimit() <= 0)) {
+            val peak = runCatching { zeroFgPeakHz() }.getOrDefault(0f)
+            if (peak > hz + 0.5f) return peak
+        }
+        return hz
+    }
 
     private fun updateSessionVote() {
         if (!CompositorHost.isStarted) return
         val hz = refreshHz()
         CompositorHost.updatePacing(hz, outputFpsLimit(), sessionVoteHz(hz))
+    }
+
+    /** [mali-g2] When ZeroFG was turned off in this session (0: not lately). */
+    private var zeroFgOffAt = 0L
+
+    private fun noteZeroFgOff() {
+        val at = SystemClock.elapsedRealtime()
+        zeroFgOffAt = at
+        // after the recovery window: the running rate again, whatever the panel did
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (zeroFgOffAt == at) {
+                zeroFgOffAt = 0L
+                updateSessionVote()
+            }
+        }, ZEROFG_OFF_RECOVER_MS + 100L)
     }
 
     /** [mali-g2] The highest rate the session lets the panel run at: the requested mode, else the fastest mode of
@@ -2475,15 +2499,30 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         return minOf(hz, PerfMode.peakRefreshCap(this), mirrorCap)
     }
 
+    /** [mali-g2] The panel's rates ZeroFG's vote may pick from: those of the panel's current size up to [peak];
+     *  on a second screen or glasses, their rate alone. */
+    private fun zeroFgModesHz(peak: Float): FloatArray {
+        if (bottomGame?.takeIf { bottomOutputActive }?.hz?.let { it > 1f } == true || glassesScreen?.hz?.let { it > 1f } == true)
+            return floatArrayOf(peak)
+        val display = if (Build.VERSION.SDK_INT >= 30) display else @Suppress("DEPRECATION") windowManager.defaultDisplay
+        val current = display?.mode
+        return display?.supportedModes.orEmpty()
+            .filter { current == null || (it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight) }
+            .map { it.refreshRate }
+            .filter { it > 1f && it <= peak + 0.5f }
+            .distinct().sorted().toFloatArray()
+    }
+
     private fun applyFrameGen() {
         val hz = refreshHz()
         val pip = pipUi && mirrorRefreshLimit() <= 0
         val peak = runCatching { zeroFgPeakHz() }.getOrDefault(0f).takeIf { it > 1f } ?: hz
+        val modes = runCatching { zeroFgModesHz(peak) }.getOrNull()
         val request = frameGenRequests.incrementAndGet()
         Thread({
             val problem = synchronized(frameGenRequests) {
                 if (request != frameGenRequests.get()) return@Thread
-                if (pip) FrameGen.apply(this, FrameGen.Mode.OFF, hz) else FrameGen.apply(this, hz, peak)
+                if (pip) FrameGen.apply(this, FrameGen.Mode.OFF, hz) else FrameGen.apply(this, hz, peak, modes)
             }
             val state = Lossless.state(this)
             runOnUiThread {
@@ -5579,6 +5618,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         private const val FEX_MISSING = "droiddeck-fex: x86 Linux programs need"
         private const val UNBUFFERED_SOURCES = InputDevice.SOURCE_CLASS_JOYSTICK or InputDevice.SOURCE_CLASS_TRACKBALL or InputDevice.SOURCE_CLASS_POSITION
         private const val CURSOR_PAD_HOLD_MS = 1200L
+        /** [mali-g2] How long after ZeroFG is turned off the session keeps voting ZeroFG's peak rate (sessionVoteHz). */
+        private const val ZEROFG_OFF_RECOVER_MS = 10_000L
         private const val CURSOR_RESYNC_IDLE_TICKS = 33
         private const val PAD_MOUSE_CHECK_MS = 500L
         private const val PAD_SCROLL_POINTER_X = 0.985f

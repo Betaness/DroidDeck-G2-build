@@ -108,12 +108,13 @@ object FrameGen {
         else -> context.getString(R.string.frame_gen_off)
     }
 
-    fun apply(context: Context, refreshHz: Float, peakHz: Float = refreshHz): String? =
-        apply(context, mode(context), refreshHz, peakHz)
+    fun apply(context: Context, refreshHz: Float, peakHz: Float = refreshHz, modesHz: FloatArray? = null): String? =
+        apply(context, mode(context), refreshHz, peakHz, modesHz)
 
-    /** [peakHz]: the highest rate the session lets the panel run at; ZeroFG's frame-rate vote is a whole
-     *  fraction of it, so a vote that lowered the panel can raise it again. */
-    fun apply(context: Context, mode: Mode, refreshHz: Float, peakHz: Float = refreshHz): String? {
+    /** [peakHz]: the highest rate the session lets the panel run at; ZeroFG judges twice the real rate against
+     *  it, so a vote that lowered the panel can raise it again. [modesHz]: the panel's rates up to [peakHz], which
+     *  ZeroFG's frame-rate vote picks from (null: unchanged; none known: whole fractions of the peak). */
+    fun apply(context: Context, mode: Mode, refreshHz: Float, peakHz: Float = refreshHz, modesHz: FloatArray? = null): String? {
         when (mode.engine) {
             ENGINE_LSFG -> {
                 val status = Lossless.sync(context)
@@ -137,6 +138,7 @@ object FrameGen {
                 // ZeroFG has no flow scale; the refresh rate paces its frames.
                 WaylandCompositor.nativeSetFrameGenTuning(FLOW_SCALE_LSFG, refreshHz)
                 WaylandCompositor.nativeSetZeroFgPeakHz(maxOf(peakHz, refreshHz))
+                modesHz?.let { WaylandCompositor.nativeSetZeroFgModes(it) }
                 WaylandCompositor.nativeSetFrameGenArmed(true, 2, 0)
                 val problem = runCatching { WaylandCompositor.nativeZeroFgProblem() }.getOrNull()
                 if (problem != null) noteZeroFgProblem(context, problem)
