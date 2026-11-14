@@ -1706,12 +1706,15 @@ class GameEnvironmentTest(unittest.TestCase):
                           "Escape from Duckov/MonoBleedingEdge/EmbedRuntime/mono-2.0-bdwgc.dll")
             # Duckov.exe beside UnityPlayer.dll was enough before Mono detection; it still is.
             bare_duckov = game("Bare Duckov/Duckov.exe", "Bare Duckov/UnityPlayer.dll")
-            expected = {"FEX_TSOENABLED": "1", "FEX_DISABLEL2CACHE": "0", "FEX_DYNAMICL1CACHE": "0", "FEX_MONOHACKS": "0"}
-            for exe in (duckov, bare_duckov):
-                env, extra, notes = MODULE["engine_fixes"](exe, [])
-                self.assertEqual(env, expected, exe)
-                self.assertEqual((extra, notes), ([], self.UNITY_NOTES + ["Escape from Duckov: FEX MonoHacks off"]))
-            env = MODULE["engine_fixes"](duckov, [])[0]
+            expected = {"FEX_TSOENABLED": "1", "FEX_DISABLEL2CACHE": "0", "FEX_DYNAMICL1CACHE": "0", "FEX_MONOHACKS": "0",
+                        "WINE_ALERT_SPIN_US": "30"}
+            with patch.dict(os.environ):
+                os.environ.pop("WINE_ALERT_SPIN_US", None)
+                for exe in (duckov, bare_duckov):
+                    env, extra, notes = MODULE["engine_fixes"](exe, [])
+                    self.assertEqual(env, expected, exe)
+                    self.assertEqual((extra, notes), ([], self.UNITY_NOTES + ["Escape from Duckov: FEX MonoHacks off", self.ALERT_NOTE]))
+                env = MODULE["engine_fixes"](duckov, [])[0]
             preset = {"version": 1, "shared": {"FEX_TSOENABLED": "1", "FEX_DISABLEL2CACHE": "1", "FEX_MONOHACKS": "1"}}
             result = MODULE["apply_config"]({"FEX_DYNAMICL1CACHE": "1"}, preset, "3167020", env)
             self.assertEqual((result["FEX_DISABLEL2CACHE"], result["FEX_DYNAMICL1CACHE"], result["FEX_MONOHACKS"]), ("0", "0", "0"))
@@ -1726,6 +1729,58 @@ class GameEnvironmentTest(unittest.TestCase):
             self.assertEqual(MODULE["engine_fixes"](other_unity, [])[0], {"FEX_TSOENABLED": "1"})
             self.assertEqual(MODULE["engine_fixes"](other_duckov, []), ({}, [], []))
             self.assertEqual(MODULE["engine_fixes"](ava, []), ({}, [], []))
+
+    ALERT_NOTE = "Escape from Duckov: Wine alert waits poll 30 us before sleeping"
+
+    def test_duckov_alone_gets_the_alert_spin_and_keeps_a_value_it_already_has(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = self.unity_game(tmp)
+            duckov = game("Escape from Duckov/Duckov.exe", "Escape from Duckov/UnityPlayer.dll",
+                          "Escape from Duckov/MonoBleedingEdge/EmbedRuntime/mono-2.0-bdwgc.dll")
+            others = (game("Other/Other.exe", "Other/UnityPlayer.dll", "Other/MonoBleedingEdge/"),
+                      game("Plain/Plain.exe", "Plain/UnityPlayer.dll"), game("Not Unity/Duckov.exe"))
+            with patch.dict(os.environ):
+                os.environ.pop("WINE_ALERT_SPIN_US", None)
+                env, extra, notes = MODULE["engine_fixes"](duckov, [])
+                self.assertEqual((env["WINE_ALERT_SPIN_US"], notes[-1]), ("30", self.ALERT_NOTE))
+                for exe in others:
+                    self.assertNotIn("WINE_ALERT_SPIN_US", MODULE["engine_fixes"](exe, [])[0], exe)
+                # The shared profile does not turn it off; a per-game value does, removal included.
+                preset = {"version": 1, "shared": {"WINE_ALERT_SPIN_US": "0"}}
+                self.assertEqual(MODULE["apply_config"]({}, preset, "3167020", env)["WINE_ALERT_SPIN_US"], "30")
+                preset["games"] = {"3167020": {"WINE_ALERT_SPIN_US": "0"}}
+                self.assertEqual(MODULE["apply_config"]({}, preset, "3167020", env)["WINE_ALERT_SPIN_US"], "0")
+                preset["games"] = {"3167020": {"WINE_ALERT_SPIN_US": None}}
+                self.assertNotIn("WINE_ALERT_SPIN_US", MODULE["apply_config"]({}, preset, "3167020", env))
+            for value in ("0", "100", ""):
+                with patch.dict(os.environ, {"WINE_ALERT_SPIN_US": value}):
+                    env, extra, notes = MODULE["engine_fixes"](duckov, [])
+                    self.assertNotIn("WINE_ALERT_SPIN_US", env)
+                    self.assertNotIn(self.ALERT_NOTE, notes)
+                    self.assertEqual(env["FEX_MONOHACKS"], "0")
+                    self.assertEqual(MODULE["apply_config"]({"WINE_ALERT_SPIN_US": value}, {"version": 1}, "3167020", env)
+                                     ["WINE_ALERT_SPIN_US"], value)
+
+    def test_a_duckov_launch_hands_the_alert_spin_to_proton(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            duckov = Path(self.unity_game(tmp)("Escape from Duckov/Duckov.exe", "Escape from Duckov/UnityPlayer.dll"))
+            probe = home / "proton"
+            probe.write_text("#!" + sys.executable + "\nimport os\nprint(os.environ.get('WINE_ALERT_SPIN_US', 'unset'))\n")
+            probe.chmod(0o755)
+            base = {k: v for k, v in os.environ.items() if k != "WINE_ALERT_SPIN_US"}
+            base.update(HOME=tmp, STEAM_COMPAT_DATA_PATH=str(home / "compatdata/3167020"))
+
+            def launch(**extra):
+                return subprocess.run([sys.executable, str(BIN / "droiddeck-game-env"), str(probe), "waitforexitandrun", str(duckov)],
+                                      env={**base, **extra}, text=True, capture_output=True, check=True)
+
+            first = launch()
+            self.assertEqual(first.stdout.strip().splitlines()[-1], "30")
+            self.assertIn("droiddeck-game-env: " + self.ALERT_NOTE, first.stderr)
+            kept = launch(WINE_ALERT_SPIN_US="0")
+            self.assertEqual(kept.stdout.strip().splitlines()[-1], "0")
+            self.assertNotIn(self.ALERT_NOTE, kept.stderr)
 
     def test_a_new_fix_only_needs_registering(self):
         with tempfile.TemporaryDirectory() as tmp:
