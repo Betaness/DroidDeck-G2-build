@@ -4,6 +4,8 @@ import android.content.Context
 import android.system.Os
 import android.util.Log
 import com.droiddeck.launcher.R
+import com.droiddeck.launcher.core.DeviceSupport
+import com.droiddeck.launcher.session.SessionState
 import com.droiddeck.launcher.wayland.WaylandCompositor
 
 object FrameGen {
@@ -66,10 +68,18 @@ object FrameGen {
         if (prefs.getString("zerofg_problem", null) != value) prefs.edit().putString("zerofg_problem", value).apply()
     }
 
+    /** Why ZeroFG stopped in this session, or the size it could not be built for, as the compositor last said;
+     *  null: nothing. Forgotten when a session starts (CompositorHost.newSession). */
+    @Volatile var zeroFgFailure: String? = null
+
+    /** ZeroFG runs only on frames shown zero-copy: this session's path, or outside a session this device's. */
+    fun zeroFgPathOk(context: Context): Boolean =
+        if (SessionState.running) SessionState.zeroCopy != false else DeviceSupport.ownMaliPath(context)
+
     /** The compositor reads these when ZeroFG turns on (waylandcomp/ZEROFG.md). */
     val ZEROFG_ENV = listOf(
         "DROIDDECK_ZEROFG_MODE", "DROIDDECK_ZEROFG_PRIORITY", "DROIDDECK_ZEROFG_DPT", "DROIDDECK_ZEROFG_VOTE",
-        "DROIDDECK_ZEROFG_MARGIN_MS", "DROIDDECK_ZEROFG_BACKEND", "DROIDDECK_ZEROFG_TRACE",
+        "DROIDDECK_ZEROFG_MARGIN_MS", "DROIDDECK_ZEROFG_LATCH_MS", "DROIDDECK_ZEROFG_BACKEND", "DROIDDECK_ZEROFG_TRACE",
     )
 
     /** Each ZeroFG knob's value in [env] (KEY=value lines, the last one counts); null: not given. */
@@ -98,9 +108,12 @@ object FrameGen {
         else -> context.getString(R.string.frame_gen_off)
     }
 
-    fun apply(context: Context, refreshHz: Float): String? = apply(context, mode(context), refreshHz)
+    fun apply(context: Context, refreshHz: Float, peakHz: Float = refreshHz): String? =
+        apply(context, mode(context), refreshHz, peakHz)
 
-    fun apply(context: Context, mode: Mode, refreshHz: Float): String? {
+    /** [peakHz]: the highest rate the session lets the panel run at; ZeroFG's frame-rate vote is a whole
+     *  fraction of it, so a vote that lowered the panel can raise it again. */
+    fun apply(context: Context, mode: Mode, refreshHz: Float, peakHz: Float = refreshHz): String? {
         when (mode.engine) {
             ENGINE_LSFG -> {
                 val status = Lossless.sync(context)
@@ -123,12 +136,23 @@ object FrameGen {
                 WaylandCompositor.nativeSetZeroFgMode(nativeZeroFgMode(mode))
                 // ZeroFG has no flow scale; the refresh rate paces its frames.
                 WaylandCompositor.nativeSetFrameGenTuning(FLOW_SCALE_LSFG, refreshHz)
+                WaylandCompositor.nativeSetZeroFgPeakHz(maxOf(peakHz, refreshHz))
                 WaylandCompositor.nativeSetFrameGenArmed(true, 2, 0)
                 val problem = runCatching { WaylandCompositor.nativeZeroFgProblem() }.getOrNull()
                 if (problem != null) noteZeroFgProblem(context, problem)
                 if (!problem.isNullOrBlank()) {
                     Log.w(TAG, "ZeroFG: $problem")
                     return context.getString(R.string.zerofg_problem, problem)
+                }
+                if (SessionState.running && SessionState.zeroCopy == false) {
+                    Log.w(TAG, "ZeroFG: this session does not show games zero-copy")
+                    return context.getString(R.string.zerofg_needs_zero_copy)
+                }
+                val failure = runCatching { WaylandCompositor.nativeZeroFgFailure() }.getOrNull()
+                zeroFgFailure = failure
+                if (failure != null) {
+                    Log.w(TAG, "ZeroFG: $failure")
+                    return context.getString(R.string.zerofg_failed, failure)
                 }
             }
             ENGINE_DDFG -> {

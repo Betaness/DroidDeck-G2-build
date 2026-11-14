@@ -205,6 +205,8 @@ void vortek_present_batch_flush(void) {
     if (g_batch) batch_apply();
 }
 
+struct ASurfaceTransaction *vortek_present_batch(void) { return batch(); }
+
 /* A layer gets one buffer per transaction: a second one would replace the first unseen, and the
  * first's token would come back with a release fence that is not its own. */
 static void batch_touch(int slot) {
@@ -406,7 +408,7 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
     const char *why = NULL;
     /* Both paths below consume the fence; the frame-governor report wants it too. */
     const int feed_fd = fsf_enabled() && vf.main_window && acquire_fd >= 0 ? fcntl(acquire_fd, F_DUPFD_CLOEXEC, 0) : -1;
-    const int zfg = zfg_present(&vf, acquire_fd, token_of(m->chain, m->index), batch());
+    const int zfg = zfg_present(&vf, acquire_fd, token_of(m->chain, m->index));
     const int up = zfg == ZFG_SHOWN ? VKU_SHOWN : zfg == ZFG_TAKEN ? VKU_TAKEN : vku_present(&vf, acquire_fd, batch(), &why);
     int r = 0;
     if (up == VKU_DIRECT)

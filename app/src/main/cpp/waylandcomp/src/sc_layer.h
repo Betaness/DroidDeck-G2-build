@@ -44,12 +44,14 @@ int sc_layer_present_overlay(struct vkp_image *src, const int geo[8], int transl
 
 void sc_layer_hide(void);
 /* [mali-g2] Vortek zero-copy: an AHB shown over the X window at x,y,w,h of the scene, on Vortek
- * layer `slot` (0 .. SC_VORTEK_LAYERS - 1) at z `z`. `batch`: a transaction from sc_layer_tx_begin
- * that the caller applies with sc_layer_tx_apply, so changes to several layers reach the screen in
- * the same frame (one buffer per layer and batch); NULL applies a transaction of its own. */
+ * layer `slot` (0 .. SC_VORTEK_LAYERS - 1) at z `z` (< 0: the layer's z). `batch`: a transaction from
+ * sc_layer_tx_begin that the caller applies with sc_layer_tx_apply, so changes to several layers reach the
+ * screen in the same frame (one buffer per layer and batch); NULL applies a transaction of its own.
+ * sc_layer_tx_discard deletes a transaction without applying it. */
 struct ASurfaceTransaction;
 struct ASurfaceTransaction *sc_layer_tx_begin(void);
 void sc_layer_tx_apply(struct ASurfaceTransaction *batch);
+void sc_layer_tx_discard(struct ASurfaceTransaction *tx);
 int sc_layer_present_vortek(int slot, int z, AHardwareBuffer *ahb, int buf_w, int buf_h, int acquire_fd, void *token,
                             int x, int y, int w, int h, int scene_w, int scene_h, struct ASurfaceTransaction *batch);
 /* [mali-g2] Zero-copy upscaling: Vortek layer `slot` shows buffers of its own pool (SC_VORTEK_POOL,
@@ -66,8 +68,9 @@ int sc_layer_vortek_pool_trim(int slot);
 int sc_layer_present_vortek_pooled(int slot, int z, int idx, int acquire_fd, const int r[8],
                                    struct ASurfaceTransaction *batch);
 /* [mali-g2] ZeroFG (zerofg_zc.c): the pool buffer's AHardwareBuffer (NULL: none); the layer's frame-rate vote
- * in place of the session's from its next buffer (0: the session's again); and a transaction's desired
- * present time (CLOCK_MONOTONIC ns; -1: no ASurfaceTransaction_setDesiredPresentTime). */
+ * in place of the session's from its next buffer (0: the session's again; this vote changes the panel's mode
+ * only where that is seamless); and a transaction's desired present time (CLOCK_MONOTONIC ns; -1: no
+ * ASurfaceTransaction_setDesiredPresentTime). */
 AHardwareBuffer *sc_layer_vortek_pool_ahb(int slot, int idx);
 void sc_layer_vortek_frame_rate(int slot, float fps);
 int sc_layer_can_desire_present(void);

@@ -63,6 +63,8 @@
     <string name="frame_gen_zerofg_really">ZeroFG ReallyZero 2×</string>
     <string name="frame_gen_zerofg_zero">ZeroFG Zero 2×</string>
     <string name="zerofg_problem">ZeroFG cannot run here: %1$s</string>
+    <string name="zerofg_needs_zero_copy">ZeroFG needs games shown zero-copy (the Vortek GPU path)</string>
+    <string name="zerofg_failed">ZeroFG: %1$s</string>
     <string name="lsfg_needs_steam">Needs Lossless Scaling on Steam</string>
     <string name="lsfg_needs_install">Install Lossless Scaling in Steam or import Lossless.dll</string>
     <string name="lsfg_import">Import Lossless.dll…</string>

@@ -34,6 +34,8 @@ int vku_present(const struct vku_frame *f, int acquire_fd, struct ASurfaceTransa
 void vku_init(struct wl_event_loop *loop);
 /* The layer is hidden or goes to another window: a frame still waiting for its game is dropped. */
 void vku_layer_hidden(int slot);
+/* [mali-g2] ZeroFG shows this layer's frames from now on: the same for a pass still waiting. */
+void vku_cancel_pending(int slot);
 /* Whether layer `slot` has a frame upscaled once its fences signal (vku_present returned VKU_TAKEN
  * without dropping it); it is shown unless the next frame for the layer overtakes it. */
 int vku_pending(int slot);

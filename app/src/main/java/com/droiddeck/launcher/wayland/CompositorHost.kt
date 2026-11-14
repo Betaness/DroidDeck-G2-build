@@ -70,16 +70,17 @@ object CompositorHost {
         return true
     }
 
-    private fun pace(refreshHz: Float, fpsLimit: Int) {
+    /** [voteHz]: the layers' frame-rate vote without an fps limit (with ZeroFG: a rate its own vote did not lower). */
+    private fun pace(refreshHz: Float, fpsLimit: Int, voteHz: Float = refreshHz) {
         WaylandCompositor.nativeSetFpsLimit(fpsLimit)
-        WaylandCompositor.nativeSetLayerFrameRate(if (fpsLimit > 0) fpsLimit.toFloat() else refreshHz)
+        WaylandCompositor.nativeSetLayerFrameRate(if (fpsLimit > 0) fpsLimit.toFloat() else voteHz)
         WaylandCompositor.nativeSetOutputRefreshRate(refreshHz)
         SessionState.refreshHz = refreshHz
     }
 
     @Synchronized
-    fun updatePacing(refreshHz: Float, fpsLimit: Int) {
-        if (started) pace(refreshHz, fpsLimit)
+    fun updatePacing(refreshHz: Float, fpsLimit: Int, voteHz: Float = refreshHz) {
+        if (started) pace(refreshHz, fpsLimit, voteHz)
     }
 
     @Synchronized
@@ -136,7 +137,11 @@ object CompositorHost {
     }
 
     fun newSession() {
-        if (started) WaylandCompositor.nativeResetFirstFrame()
+        com.droiddeck.launcher.gpu.FrameGen.zeroFgFailure = null
+        if (started) {
+            WaylandCompositor.nativeResetFirstFrame()
+            WaylandCompositor.nativeZeroFgNewSession()
+        }
     }
 
     val isStarted: Boolean get() = started

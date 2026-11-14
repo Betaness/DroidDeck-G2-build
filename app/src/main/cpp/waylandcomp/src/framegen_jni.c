@@ -74,3 +74,22 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeZeroFgProblem(JNIEnv
     const char *r = zfg_unsupported();
     return (*env)->NewStringUTF(env, r ? r : "");
 }
+
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetZeroFgPeakHz(JNIEnv *env, jclass clazz, jfloat hz) {
+    (void)env; (void)clazz;
+    zfg_set_peak_hz((float)hz);
+}
+
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeZeroFgNewSession(JNIEnv *env, jclass clazz) {
+    (void)env; (void)clazz;
+    zfg_new_session();
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeZeroFgFailure(JNIEnv *env, jclass clazz) {
+    (void)clazz;
+    char buf[200];
+    return zfg_failure(buf, sizeof(buf)) ? (*env)->NewStringUTF(env, buf) : NULL;
+}

@@ -44,6 +44,9 @@ void vortek_present_released(void *token, int release_fd);
 void vortek_present_release(uint32_t chain, uint32_t index, int fence_fd);
 /* Applies the layer changes batched so far in this drain (ZeroFG shows frames in transactions of its own after them). */
 void vortek_present_batch_flush(void);
+/* This drain's batch as it is now (NULL outside a drain); a flush ends it, so it is not kept across one. */
+struct ASurfaceTransaction;
+struct ASurfaceTransaction *vortek_present_batch(void);
 /* Inside the compositor a chain is a key that also names its presenter (vortek_present.c); the
  * presenter's own id, as its log lines give it. */
 #define VP_CHAIN_ID(key) ((uint32_t)(key) & 0xffffffu)

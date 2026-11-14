@@ -1,5 +1,6 @@
 #ifndef ZEROFG_ZC_H
 #define ZEROFG_ZC_H
+#include <stddef.h>
 #include <stdint.h>
 
 /* [mali-g2] ZeroFG frame generation on the zero-copy main window (../ZEROFG.md). For each real frame B of
@@ -13,19 +14,22 @@ struct wl_event_loop;
 
 enum {
     ZFG_DIRECT = 0, /* not handled: acquire_fd untouched, the caller shows the frame */
-    ZFG_SHOWN = 1,  /* B (and S before it) went to the display; acquire_fd consumed */
+    ZFG_SHOWN = 1,  /* B (and S before it) went, or go at their times, to the display; acquire_fd consumed */
     ZFG_TAKEN = 2,  /* B could not be shown: acquire_fd consumed, the game image released */
 };
-/* `batch`: vortek_present's transaction for this drain (may be NULL). ZeroFG applies it first when it
- * shows frames in transactions of its own. */
-int zfg_present(const struct vku_frame *f, int acquire_fd, void *token, struct ASurfaceTransaction *batch);
+/* What goes to the display with this drain goes into vortek_present's batch; ZeroFG applies the batch first
+ * when it shows frames in transactions of its own. S and B wait on the event loop for their times (a timer,
+ * S's completion); the next frame for the layer, hiding it or its swapchain going settles them first. */
+int zfg_present(const struct vku_frame *f, int acquire_fd, void *token);
 
 void zfg_init(struct wl_event_loop *loop);
 void zfg_layer_hidden(int slot);
 void zfg_chain_gone(uint32_t chain);
-/* Waits for the generations in flight and drops the imports of pool buffers (the pools are about to go). */
+/* The pools are about to go: drops the imports of pool buffers, those still written once their jobs are done;
+ * the frames waiting for their time never reach the screen. Does not wait. */
 void zfg_idle(void);
-/* From the 10 s stats timer: frees the engine and the pool buffers after a while without use. */
+/* From the 10 s stats timer: frees the engine and the imports after a while without use, and everything,
+ * the device too, once ZeroFG is off for the session; never while a generation still runs. */
 void zfg_tick(void);
 /* Whether ZeroFG wrote into layer `slot`'s pool lately (vku_tick keeps that pool). */
 int zfg_layer_recent(int slot);
@@ -43,5 +47,12 @@ int zfg_checked(void);
 void zfg_set_mode(int mode);
 /* Any thread. Real frames and real + generated frames per second over the last stats window (0: off). */
 void zfg_rates(float *real, float *shown);
+/* Any thread. The highest refresh rate the session lets the panel run at (0: not given; the refresh rate). */
+void zfg_set_peak_hz(float hz);
+/* Any thread. A new game session: ZeroFG, off after a failure, may run again; the failure is forgotten. */
+void zfg_new_session(void);
+/* Any thread. Why ZeroFG stopped in this session, or the last size or mode it could not be built for: 1 with
+ * the text in out; 0: nothing. */
+int zfg_failure(char *out, size_t n);
 
 #endif

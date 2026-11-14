@@ -45,6 +45,9 @@ object SessionState {
 
     @Volatile
     var running = false
+    /** [mali-g2] Whether this session shows games zero-copy (the Vortek path); null before the first session. */
+    @Volatile
+    var zeroCopy: Boolean? = null
     @Volatile
     var activityDisplayId = 0
     @Volatile

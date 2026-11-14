@@ -946,6 +946,10 @@ void vku_layer_hidden(int slot) {
     if (slot >= 0 && slot < SC_VORTEK_LAYERS) cancel_pending(slot);
 }
 
+void vku_cancel_pending(int slot) {
+    if (slot >= 0 && slot < SC_VORTEK_LAYERS) cancel_pending(slot);
+}
+
 void vku_chain_gone(uint32_t chain) {
     if (!chain) return;
     for (int i = 0; i < SC_VORTEK_LAYERS; i++)

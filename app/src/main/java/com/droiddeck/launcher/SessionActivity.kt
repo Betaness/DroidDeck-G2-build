@@ -1131,8 +1131,11 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                     if (drawerOpen) {
                         drawerOpenedAt = System.currentTimeMillis()
                         syncLossless()
-                        if (CompositorHost.isStarted) runCatching { WaylandCompositor.nativeZeroFgProblem() }.getOrNull()
-                            ?.let { FrameGen.noteZeroFgProblem(this@SessionActivity, it) }
+                        if (CompositorHost.isStarted) {
+                            runCatching { WaylandCompositor.nativeZeroFgProblem() }.getOrNull()
+                                ?.let { FrameGen.noteZeroFgProblem(this@SessionActivity, it) }
+                            runCatching { WaylandCompositor.nativeZeroFgFailure() }.onSuccess { FrameGen.zeroFgFailure = it }
+                        }
                         releasePads()
                         androidx.compose.runtime.withFrameNanos { }
                         val requested = focusDrawer()
@@ -1315,8 +1318,10 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 applyOutputPacing()
             },
             onFrameGenPick = { mode ->
+                val zeroFgBefore = FrameGen.engine(this@SessionActivity) == FrameGen.ENGINE_ZEROFG
                 FrameGen.set(this@SessionActivity, mode)
                 readPrefs()
+                if (zeroFgBefore || mode.engine == FrameGen.ENGINE_ZEROFG) updateSessionVote()
                 applyFrameGen()
             },
             onImportLossless = {
@@ -2434,20 +2439,51 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (CompositorHost.isStarted) {
             val hz = refreshHz()
             val changed = kotlin.math.abs(SessionState.refreshHz - hz) > 0.1f
-            CompositorHost.updatePacing(hz, outputFpsLimit())
+            CompositorHost.updatePacing(hz, outputFpsLimit(), sessionVoteHz(hz))
             pushCardboard(activeCardboard)
             if (changed && ::surfaceView.isInitialized) applyFrameGen()
         }
     }
 
+    /** [mali-g2] The layers' frame-rate vote: the running rate, except with ZeroFG, whose own vote may have
+     *  lowered it; then the highest rate the session allows, so the panel comes back up after ZeroFG. */
+    private fun sessionVoteHz(hz: Float): Float =
+        if (FrameGen.engine(this) == FrameGen.ENGINE_ZEROFG && !(pipUi && mirrorRefreshLimit() <= 0))
+            runCatching { zeroFgPeakHz() }.getOrDefault(0f).takeIf { it > 1f } ?: hz
+        else hz
+
+    private fun updateSessionVote() {
+        if (!CompositorHost.isStarted) return
+        val hz = refreshHz()
+        CompositorHost.updatePacing(hz, outputFpsLimit(), sessionVoteHz(hz))
+    }
+
+    /** [mali-g2] The highest rate the session lets the panel run at: the requested mode, else the fastest mode of
+     *  the panel's current size, after the caps; on a second screen or glasses, their rate. */
+    private fun zeroFgPeakHz(): Float {
+        if (bottomGame?.takeIf { bottomOutputActive }?.hz?.let { it > 1f } == true || glassesScreen?.hz?.let { it > 1f } == true)
+            return refreshHz()
+        val display = if (Build.VERSION.SDK_INT >= 30) display else @Suppress("DEPRECATION") windowManager.defaultDisplay
+        val wanted = window.attributes.preferredDisplayModeId
+        val modes = display?.supportedModes.orEmpty()
+        val current = display?.mode
+        val hz = modes.firstOrNull { wanted != 0 && it.modeId == wanted }?.refreshRate
+            ?: modes.filter { current == null || (it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight) }
+                .maxOfOrNull { it.refreshRate }
+            ?: return 0f
+        val mirrorCap = mirrorRefreshLimit().takeIf { it > 0 }?.toFloat() ?: Float.POSITIVE_INFINITY
+        return minOf(hz, PerfMode.peakRefreshCap(this), mirrorCap)
+    }
+
     private fun applyFrameGen() {
         val hz = refreshHz()
         val pip = pipUi && mirrorRefreshLimit() <= 0
+        val peak = runCatching { zeroFgPeakHz() }.getOrDefault(0f).takeIf { it > 1f } ?: hz
         val request = frameGenRequests.incrementAndGet()
         Thread({
             val problem = synchronized(frameGenRequests) {
                 if (request != frameGenRequests.get()) return@Thread
-                if (pip) FrameGen.apply(this, FrameGen.Mode.OFF, hz) else FrameGen.apply(this, hz)
+                if (pip) FrameGen.apply(this, FrameGen.Mode.OFF, hz) else FrameGen.apply(this, hz, peak)
             }
             val state = Lossless.state(this)
             runOnUiThread {

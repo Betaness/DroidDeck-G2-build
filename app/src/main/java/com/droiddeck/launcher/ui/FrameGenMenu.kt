@@ -30,8 +30,11 @@ internal fun FrameGenMenu(
         item(FrameGen.Mode.OFF, focus = firstItemFocus)
         for (m in 2..4) item(FrameGen.Mode(FrameGen.ENGINE_DDFG, m))
         val zeroFgProblem = remember(host.open) { FrameGen.zeroFgProblem(context) }
+        val zeroCopy = remember(host.open) { FrameGen.zeroFgPathOk(context) }
+        val zeroFgFailure = remember(host.open) { FrameGen.zeroFgFailure }
+        val zeroFgDetail = zeroFgProblem ?: (if (zeroCopy) zeroFgFailure else stringResource(R.string.zerofg_needs_zero_copy))
         FrameGen.ZEROFG_MENU.forEachIndexed { i, m ->
-            item(m, enabled = zeroFgProblem == null, detail = zeroFgProblem?.takeIf { i == 0 })
+            item(m, enabled = zeroFgProblem == null && zeroCopy, detail = zeroFgDetail?.takeIf { i == 0 })
         }
         val lsfg = (2..4).map { FrameGen.Mode(FrameGen.ENGINE_LSFG, it) } +
             FrameGen.ADAPTIVE_TARGETS.map { FrameGen.Mode(FrameGen.ENGINE_LSFG, target = it) }

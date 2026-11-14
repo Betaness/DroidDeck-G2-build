@@ -357,6 +357,15 @@ public final class WaylandCompositor {
     /** Why ZeroFG cannot run on this GPU; empty: it can; null: not checked yet. */
     public static native String nativeZeroFgProblem();
 
+    /** The highest refresh rate the session lets the panel run at (ZeroFG's frame-rate vote). */
+    public static native void nativeSetZeroFgPeakHz(float hz);
+
+    /** A new game session: ZeroFG, off after a failure in the last one, may run again. */
+    public static native void nativeZeroFgNewSession();
+
+    /** Why ZeroFG stopped in this session, or the size it could not be built for; null: nothing. */
+    public static native String nativeZeroFgFailure();
+
     public static native void nativeSetFrameGenEngine(int kind);
 
     public static native void nativeSetFrameGenArmed(boolean armed, int multiplier, int targetFps);

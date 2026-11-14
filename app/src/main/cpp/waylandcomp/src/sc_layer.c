@@ -132,6 +132,7 @@ static int load_api(void) {
 
 #define ASC_FRAME_RATE_COMPAT_DEFAULT 0
 #define ASC_CHANGE_FRAME_RATE_ALWAYS  1
+#define ASC_CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS 0
 
 static _Atomic float g_fps_want;
 
@@ -613,7 +614,10 @@ static void apply_frame_rate(ASurfaceTransaction *tx, struct layer *l) {
     if (want == l->fps_applied) return;
     if (!api.setFrameRateStrategy && !api.setFrameRate) return;
     if (api.setFrameRateStrategy) {
-        api.setFrameRateStrategy(tx, l->sc, want, ASC_FRAME_RATE_COMPAT_DEFAULT, ASC_CHANGE_FRAME_RATE_ALWAYS);
+        /* ZeroFG's vote moves the panel only where that does not interrupt the picture */
+        api.setFrameRateStrategy(tx, l->sc, want, ASC_FRAME_RATE_COMPAT_DEFAULT,
+                                 l->fps_override > 0.0f ? ASC_CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS
+                                                        : ASC_CHANGE_FRAME_RATE_ALWAYS);
     } else {
         api.setFrameRate(tx, l->sc, want, ASC_FRAME_RATE_COMPAT_DEFAULT);
     }
@@ -850,6 +854,10 @@ void sc_layer_tx_apply(struct ASurfaceTransaction *batch) {
     api.txDelete(batch);
 }
 
+void sc_layer_tx_discard(struct ASurfaceTransaction *tx) {
+    if (tx) api.txDelete(tx);
+}
+
 int sc_layer_present_vortek(int slot, int z, AHardwareBuffer *ahb, int buf_w, int buf_h, int acquire_fd, void *token,
                             int x, int y, int w, int h, int scene_w, int scene_h, struct ASurfaceTransaction *batch) {
     struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
@@ -857,6 +865,7 @@ int sc_layer_present_vortek(int slot, int z, AHardwareBuffer *ahb, int buf_w, in
     if (!l || !ahb || !token || w <= 0 || h <= 0) goto unavailable;
     /* l->z is the z the SurfaceControl has, or gets when the caller's batch is applied. */
     if (ensure_sc(l) != 0) goto unavailable;
+    if (z < 0) z = l->z;
     int restack = l->z != z;
     if (vkp_update_map(scene_w, scene_h) != 0) goto unavailable;
     if (!vkp_map_window(buf_w, buf_h, x, y, w, h, scene_w, scene_h, r)) goto unavailable;

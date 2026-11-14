@@ -938,6 +938,7 @@ class SessionService : Service() {
         vortekEnv = emptyList()
         vortekMode = com.droiddeck.launcher.core.DeviceSupport.ownMaliPath(this) &&
             userEnv.lastOrNull { it.startsWith("BL_GPU_MODE=") }.let { it == null || it == "BL_GPU_MODE=" + VortekServerComponent.MODE }
+        SessionState.zeroCopy = vortekMode
         if (vortekMode) {
             guest.add("BL_GPU_MODE=" + VortekServerComponent.MODE)
             guest.add("VORTEK_SERVER_PATH=" + VortekServerComponent.GUEST_SOCKET)
