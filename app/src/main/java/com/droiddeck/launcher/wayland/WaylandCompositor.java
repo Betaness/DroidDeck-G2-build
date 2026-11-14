@@ -347,7 +347,15 @@ public final class WaylandCompositor {
 
     public static native void nativeSendSceneInput(int type, int a, int b);
 
-    public static final int FG_ENGINE_LSFG = 0, FG_ENGINE_DDFG = 1;
+    public static final int FG_ENGINE_LSFG = 0, FG_ENGINE_DDFG = 1, FG_ENGINE_ZEROFG = 2;
+
+    /** [mali-g2] ZeroFG's engines (zerofg_glue.h ZFG_MODE_*). */
+    public static final int ZEROFG_MODE_REALLY_ZERO = 0, ZEROFG_MODE_ZERO = 1;
+
+    public static native void nativeSetZeroFgMode(int mode);
+
+    /** Why ZeroFG cannot run on this GPU; empty: it can; null: not checked yet. */
+    public static native String nativeZeroFgProblem();
 
     public static native void nativeSetFrameGenEngine(int kind);
 

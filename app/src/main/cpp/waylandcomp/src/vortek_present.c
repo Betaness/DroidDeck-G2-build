@@ -15,6 +15,7 @@
 #include "droiddeck_ext.h"
 #include "frame_sched_feed.h"
 #include "vortek_upscale.h"
+#include "zerofg_zc.h"
 
 #define VP_MAX_CHAINS 32
 #define VP_MAX_IMAGES 8
@@ -166,6 +167,7 @@ static void send_to_chain(uint32_t type, uint32_t key, uint32_t index, int pass_
 }
 
 void vortek_present_release(uint32_t chain, uint32_t index, int fence_fd) {
+    fence_fd = zfg_release_fence(chain, index, fence_fd);
     send_to_chain(VP_MSG_RELEASE, chain, index, fence_fd);
     if (fence_fd >= 0) close(fence_fd);
 }
@@ -199,6 +201,10 @@ static void batch_apply(void) {
     g_batch_buffers = 0;
 }
 
+void vortek_present_batch_flush(void) {
+    if (g_batch) batch_apply();
+}
+
 /* A layer gets one buffer per transaction: a second one would replace the first unseen, and the
  * first's token would come back with a release fence that is not its own. */
 static void batch_touch(int slot) {
@@ -209,6 +215,7 @@ static void hide_slot(int i) {
     if (!g_show[i].chain) return;
     batch_touch(i);
     vku_layer_hidden(i);
+    zfg_layer_hidden(i);
     sc_layer_hide_vortek(i, batch());
     memset(&g_show[i], 0, sizeof(g_show[i]));
 }
@@ -290,6 +297,7 @@ static void drop_connection(int conn) {
     for (int i = 0; i < VP_MAX_CHAINS; i++)
         if (key_of_conn(g_chains[i].id, conn)) {
             vku_chain_gone(g_chains[i].id);
+            zfg_chain_gone(g_chains[i].id);
             chain_free(&g_chains[i]);
         }
     if (g_conns[conn].src) wl_event_source_remove(g_conns[conn].src);
@@ -308,6 +316,7 @@ static void on_create(int fd, const struct vp_msg *m) {
     if (c) {
         hide_chain(m->chain);
         vku_chain_gone(m->chain);
+        zfg_chain_gone(m->chain);
         chain_free(c);
     }
     c = chain_of(0);
@@ -397,7 +406,8 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
     const char *why = NULL;
     /* Both paths below consume the fence; the frame-governor report wants it too. */
     const int feed_fd = fsf_enabled() && vf.main_window && acquire_fd >= 0 ? fcntl(acquire_fd, F_DUPFD_CLOEXEC, 0) : -1;
-    const int up = vku_present(&vf, acquire_fd, batch(), &why);
+    const int zfg = zfg_present(&vf, acquire_fd, token_of(m->chain, m->index), batch());
+    const int up = zfg == ZFG_SHOWN ? VKU_SHOWN : zfg == ZFG_TAKEN ? VKU_TAKEN : vku_present(&vf, acquire_fd, batch(), &why);
     int r = 0;
     if (up == VKU_DIRECT)
         r = sc_layer_present_vortek(slot, z, c->ahb[m->index], (int)c->w, (int)c->h, acquire_fd,
@@ -525,6 +535,7 @@ static void on_msg(int conn, int fd, const struct vp_msg *msg, int got_fd) {
             if (got_fd >= 0) close(got_fd);
             hide_chain(m->chain);
             vku_chain_gone(m->chain);
+            zfg_chain_gone(m->chain);
             struct vp_chain *c = chain_of(m->chain);
             if (c) chain_free(c);
             break;
@@ -605,6 +616,7 @@ void vortek_present_init(struct wl_event_loop *loop) {
     }
     g_loop = loop;
     vku_init(loop);
+    zfg_init(loop);
     g_listen_fd = fd;
     g_listen_src = wl_event_loop_add_fd(loop, fd, WL_EVENT_READABLE, on_listen, NULL);
 }

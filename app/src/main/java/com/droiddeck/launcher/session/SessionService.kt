@@ -934,6 +934,7 @@ class SessionService : Service() {
         // [mali-g2] No Adreno: the guest's Vulkan goes through Vortek to the vendor driver (VortekServerComponent),
         // and the session runs without gamescope. BL_GPU_MODE=<anything else> in droiddeck-env turns it off.
         val userEnv = extraEnv()
+        com.droiddeck.launcher.gpu.FrameGen.applyZeroFgEnv(userEnv)
         vortekEnv = emptyList()
         vortekMode = com.droiddeck.launcher.core.DeviceSupport.ownMaliPath(this) &&
             userEnv.lastOrNull { it.startsWith("BL_GPU_MODE=") }.let { it == null || it == "BL_GPU_MODE=" + VortekServerComponent.MODE }

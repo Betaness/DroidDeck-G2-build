@@ -1131,6 +1131,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                     if (drawerOpen) {
                         drawerOpenedAt = System.currentTimeMillis()
                         syncLossless()
+                        if (CompositorHost.isStarted) runCatching { WaylandCompositor.nativeZeroFgProblem() }.getOrNull()
+                            ?.let { FrameGen.noteZeroFgProblem(this@SessionActivity, it) }
                         releasePads()
                         androidx.compose.runtime.withFrameNanos { }
                         val requested = focusDrawer()

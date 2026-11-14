@@ -44,5 +44,9 @@ void vku_idle(void);
 void vku_tick(void);
 /* " | zero-copy upscale ..." for the perf line, or "" when nothing was upscaled; resets the counters. */
 void vku_perf_take(char *out, size_t n);
+/* [mali-g2] For ZeroFG (zerofg_zc.c): whether a filter is selected that zero-copy upscaling runs (its name in
+ * *name), and whether layer `slot` showed an upscaled frame lately. */
+int vku_filter_selected(const char **name);
+int vku_layer_recent(int slot);
 
 #endif

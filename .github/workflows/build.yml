@@ -358,6 +358,12 @@ jobs:
           mkdir -p mali-g2/vortek/out
           cc -O2 -Wall -Werror -Imali-g2/vortek/src -o mali-g2/vortek/out/covered_pacing_test mali-g2/vortek/tests/covered_pacing_test.c -lm
           mali-g2/vortek/out/covered_pacing_test
+      - name: ZeroFG pacing test (mali-g2)
+        run: |
+          set -euo pipefail
+          W=app/src/main/cpp/waylandcomp
+          cc -O2 -Wall -Wextra -Werror -I$W/src -o mali-g2/vortek/out/zerofg_pace_test $W/tests/zerofg_pace_test.c $W/src/zerofg_pace.c -lm
+          mali-g2/vortek/out/zerofg_pace_test
       - uses: actions/upload-artifact@v4
         with:
           name: vortek-client

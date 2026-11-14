@@ -1,5 +1,6 @@
 #include <jni.h>
 #include "framegen_bridge.h"
+#include "zerofg_zc.h"
 
 JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetFrameGenEngine(JNIEnv *env, jclass clazz, jint kind) {
@@ -58,4 +59,18 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeFrameGenStats(JNIEnv
     jfloatArray arr = (*env)->NewFloatArray(env, 6);
     if (arr) (*env)->SetFloatArrayRegion(env, arr, 0, 6, st);
     return arr;
+}
+
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetZeroFgMode(JNIEnv *env, jclass clazz, jint mode) {
+    (void)env; (void)clazz;
+    zfg_set_mode((int)mode);
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeZeroFgProblem(JNIEnv *env, jclass clazz) {
+    (void)clazz;
+    if (!zfg_checked() && !zfg_unsupported()) return NULL;
+    const char *r = zfg_unsupported();
+    return (*env)->NewStringUTF(env, r ? r : "");
 }

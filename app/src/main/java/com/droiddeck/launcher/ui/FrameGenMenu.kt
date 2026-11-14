@@ -1,6 +1,7 @@
 package com.droiddeck.launcher.ui
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -28,6 +29,10 @@ internal fun FrameGenMenu(
             }
         item(FrameGen.Mode.OFF, focus = firstItemFocus)
         for (m in 2..4) item(FrameGen.Mode(FrameGen.ENGINE_DDFG, m))
+        val zeroFgProblem = remember(host.open) { FrameGen.zeroFgProblem(context) }
+        FrameGen.ZEROFG_MENU.forEachIndexed { i, m ->
+            item(m, enabled = zeroFgProblem == null, detail = zeroFgProblem?.takeIf { i == 0 })
+        }
         val lsfg = (2..4).map { FrameGen.Mode(FrameGen.ENGINE_LSFG, it) } +
             FrameGen.ADAPTIVE_TARGETS.map { FrameGen.Mode(FrameGen.ENGINE_LSFG, target = it) }
         lsfg.forEachIndexed { i, m -> item(m, enabled = lossless.ready, detail = need.takeIf { i == 0 }) }

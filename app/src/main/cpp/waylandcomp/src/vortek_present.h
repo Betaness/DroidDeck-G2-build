@@ -42,6 +42,8 @@ unsigned vortek_present_stats_take(void);
 void vortek_present_released(void *token, int release_fd);
 /* VP_MSG_RELEASE for a game image with its release fence (consumed; -1: none). Any thread. */
 void vortek_present_release(uint32_t chain, uint32_t index, int fence_fd);
+/* Applies the layer changes batched so far in this drain (ZeroFG shows frames in transactions of its own after them). */
+void vortek_present_batch_flush(void);
 /* Inside the compositor a chain is a key that also names its presenter (vortek_present.c); the
  * presenter's own id, as its log lines give it. */
 #define VP_CHAIN_ID(key) ((uint32_t)(key) & 0xffffffu)

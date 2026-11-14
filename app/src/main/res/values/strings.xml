@@ -60,6 +60,9 @@
     <string name="frame_gen_ddfg">DD-FG %1$d×</string>
     <string name="frame_gen_lsfg">LSFG %1$d×</string>
     <string name="frame_gen_lsfg_adaptive">LSFG Adaptive %1$d</string>
+    <string name="frame_gen_zerofg_really">ZeroFG ReallyZero 2×</string>
+    <string name="frame_gen_zerofg_zero">ZeroFG Zero 2×</string>
+    <string name="zerofg_problem">ZeroFG cannot run here: %1$s</string>
     <string name="lsfg_needs_steam">Needs Lossless Scaling on Steam</string>
     <string name="lsfg_needs_install">Install Lossless Scaling in Steam or import Lossless.dll</string>
     <string name="lsfg_import">Import Lossless.dll…</string>

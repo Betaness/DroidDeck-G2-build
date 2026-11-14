@@ -3,6 +3,7 @@
 #include "effects_chain.h"
 #include "sc_layer.h"
 #include "vortek_present.h"
+#include "zerofg_zc.h"
 
 #include <android/hardware_buffer.h>
 #include <errno.h>
@@ -967,9 +968,22 @@ void vku_tick(void) {
     const int64_t t = now_ns();
     for (int i = 0; i < SC_VORTEK_LAYERS; i++) {
         if (!G.layers[i].last_ns || G.layers[i].pending || t - G.layers[i].last_ns < VKU_IDLE_NS) continue;
+        if (zfg_layer_recent(i)) continue;
         if (sc_layer_vortek_pool_trim(i) == 0) G.layers[i].last_ns = 0;
     }
     if (G.mid.img && t - G.mid.used_ns > VKU_IDLE_NS && !in_flight(G.mid.last_serial)) mid_destroy();
+}
+
+int vku_filter_selected(const char **name) {
+    int sharp = 0;
+    const char *why = NULL;
+    const int filter = filter_mode(&sharp, &why);
+    if (name) *name = filter_names[filter];
+    return filter != F_OFF;
+}
+
+int vku_layer_recent(int slot) {
+    return slot >= 0 && slot < SC_VORTEK_LAYERS && G.layers[slot].last_ns && now_ns() - G.layers[slot].last_ns < VKU_IDLE_NS;
 }
 
 void vku_perf_take(char *out, size_t n) {

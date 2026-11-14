@@ -65,6 +65,13 @@ void sc_layer_vortek_pool_put(int slot, int idx, int release_fd);
 int sc_layer_vortek_pool_trim(int slot);
 int sc_layer_present_vortek_pooled(int slot, int z, int idx, int acquire_fd, const int r[8],
                                    struct ASurfaceTransaction *batch);
+/* [mali-g2] ZeroFG (zerofg_zc.c): the pool buffer's AHardwareBuffer (NULL: none); the layer's frame-rate vote
+ * in place of the session's from its next buffer (0: the session's again); and a transaction's desired
+ * present time (CLOCK_MONOTONIC ns; -1: no ASurfaceTransaction_setDesiredPresentTime). */
+AHardwareBuffer *sc_layer_vortek_pool_ahb(int slot, int idx);
+void sc_layer_vortek_frame_rate(int slot, float fps);
+int sc_layer_can_desire_present(void);
+int sc_layer_tx_desired_present(struct ASurfaceTransaction *tx, int64_t when_ns);
 void sc_layer_hide_all_vortek(void);
 void sc_layer_hide_vortek_unused(unsigned in_use);
 /* [mali-g2] Vortek layer `slot`'s ASurfaceControl (NULL before its first frame) and name. */

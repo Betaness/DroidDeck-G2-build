@@ -24,6 +24,7 @@
 #include "sc_layer.h"
 #include "ahb_swapchain.h"
 #include "vortek_present.h"
+#include "zerofg_zc.h"
 #include "vortek_upscale.h"
 #include "viewporter-server-protocol.h"
 #include "banner-desktop-v1-server-protocol.h"
@@ -3901,6 +3902,7 @@ static int on_stats_timer(void *data) {
         const unsigned drops = sc_layer_drops_take();
         char upscale[240];
         vku_tick();
+        zfg_tick();
         vku_perf_take(upscale, sizeof(upscale));
 #define PERF_MS(sum, n) ((n) ? (double)(sum) / 1e6 / (double)(n) : 0.0)
         if (g_perf.scenes || vp.presents || g_perf.releases || drops || vp.uploads || upscale[0])

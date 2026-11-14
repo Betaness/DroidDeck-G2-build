@@ -42,6 +42,8 @@ add_library(droiddeckwayland SHARED
         src/framegen_jni.c
         src/hudframes.c
         src/hudframes_jni.c
+        src/zerofg_zc.c
+        src/zerofg_pace.c
 )
 target_compile_options(droiddeckwayland PRIVATE
         $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers>)
@@ -96,10 +98,30 @@ else()
     message(STATUS "droiddeckwayland: frame-generation engines NOT built in (standalone build): stub")
     target_sources(droiddeckwayland PRIVATE src/framegen_engine_stub.c)
 endif()
+# [mali-g2] ZeroFG v1.1.0 (../thirdparty/zerofg, Apache-2.0) with its shipped SPIR-V, for zerofg_zc.c (ZEROFG.md).
+set(DROIDDECK_ZEROFG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/zerofg)
+add_library(droiddeck_zerofg STATIC
+        ${DROIDDECK_ZEROFG_DIR}/src/zerofg.cc
+        ${DROIDDECK_ZEROFG_DIR}/src/df/df_context.cc
+        ${DROIDDECK_ZEROFG_DIR}/src/rc7/rc7_context.cc
+        ${DROIDDECK_ZEROFG_DIR}/src/hud/hud_layer.cc
+        src/zerofg_glue.cpp
+)
+set_target_properties(droiddeck_zerofg PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden)
+target_compile_features(droiddeck_zerofg PRIVATE cxx_std_20)
+target_compile_definitions(droiddeck_zerofg PRIVATE VK_NO_PROTOTYPES)
+target_compile_options(droiddeck_zerofg PRIVATE -O2)
+target_include_directories(droiddeck_zerofg PRIVATE
+        ${DROIDDECK_ZEROFG_DIR}/include
+        ${DROIDDECK_ZEROFG_DIR}/src
+        ${DROIDDECK_ZEROFG_DIR}/shaders/prebuilt/rc3
+)
+
 add_library(wayland-server SHARED IMPORTED)
 set_target_properties(wayland-server PROPERTIES IMPORTED_LOCATION
         ${CMAKE_CURRENT_SOURCE_DIR}/prebuilt/lib/libwayland-server.so)
 target_link_libraries(droiddeckwayland
+        droiddeck_zerofg
         wayland-server
         adrenotools
         dl

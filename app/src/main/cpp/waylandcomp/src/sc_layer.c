@@ -5,6 +5,7 @@
 #include "vk_present.h"
 #include "vortek_present.h"
 #include "vortek_upscale.h"
+#include "zerofg_zc.h"
 #include <android/hardware_buffer.h>
 #include <android/native_window.h>
 #include <android/rect.h>
@@ -67,6 +68,7 @@ static struct {
     void (*setHdrMetadata_cta861_3)(ASurfaceTransaction *, ASurfaceControl *, const struct droiddeck_hdr_cta861_3 *);
     const void *(*getNativeHandle)(const AHardwareBuffer *);
     void (*setDesiredHdrHeadroom)(ASurfaceTransaction *, ASurfaceControl *, float);
+    void (*setDesiredPresentTime)(ASurfaceTransaction *, int64_t);
     int state;
 } api;
 
@@ -108,6 +110,7 @@ static int load_api(void) {
     SYM(setHdrMetadata_smpte2086, "ASurfaceTransaction_setHdrMetadata_smpte2086");
     SYM(setHdrMetadata_cta861_3, "ASurfaceTransaction_setHdrMetadata_cta861_3");
     SYM(setDesiredHdrHeadroom, "ASurfaceTransaction_setDesiredHdrHeadroom");
+    SYM(setDesiredPresentTime, "ASurfaceTransaction_setDesiredPresentTime");
 #undef SYM
     if (!api.createFromWindow || !api.release || !api.txCreate || !api.txDelete || !api.txApply ||
         !api.setBuffer || !api.setZOrder || !api.setVisibility || !api.setGeometry ||
@@ -173,6 +176,7 @@ struct layer {
     uint64_t logged_mod;
     int votes_rate;
     float fps_applied;
+    float fps_override;
     int recreate_pending;
 
     int32_t ds_applied;
@@ -605,7 +609,7 @@ static void apply_geometry(ASurfaceTransaction *tx, struct layer *l, const int r
 }
 
 static void apply_frame_rate(ASurfaceTransaction *tx, struct layer *l) {
-    float want = l->votes_rate ? atomic_load(&g_fps_want) : 0.0f;
+    float want = l->votes_rate ? (l->fps_override > 0.0f ? l->fps_override : atomic_load(&g_fps_want)) : 0.0f;
     if (want == l->fps_applied) return;
     if (!api.setFrameRateStrategy && !api.setFrameRate) return;
     if (api.setFrameRateStrategy) {
@@ -912,6 +916,24 @@ int sc_layer_vortek_pool_take(int slot, int w, int h, struct vkp_image **img, in
     return idx;
 }
 
+AHardwareBuffer *sc_layer_vortek_pool_ahb(int slot, int idx) {
+    struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
+    return l && idx >= 0 && idx < POOL_MAX ? l->slots[idx].ahb : NULL;
+}
+
+void sc_layer_vortek_frame_rate(int slot, float fps) {
+    struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
+    if (l) l->fps_override = fps > 0.0f ? fps : 0.0f;
+}
+
+int sc_layer_can_desire_present(void) { return load_api() == 0 && api.setDesiredPresentTime != NULL; }
+
+int sc_layer_tx_desired_present(struct ASurfaceTransaction *tx, int64_t when_ns) {
+    if (!tx || !sc_layer_can_desire_present()) return -1;
+    api.setDesiredPresentTime(tx, when_ns);
+    return 0;
+}
+
 void sc_layer_vortek_pool_put(int slot, int idx, int release_fd) {
     struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
     if (!l || idx < 0 || idx >= POOL_MAX || idx == l->cur_slot) {
@@ -1214,6 +1236,7 @@ void sc_layer_window_gone(void) {
     if (api.state != 1) return;
     layers_init();
     vku_idle(); /* its passes may still be writing pool buffers */
+    zfg_idle();
     for (int i = SC_LAYER_COUNT - 1; i >= 0; i--) retire_sc(&g_layers[i]);
     drain_and_free_pools();
 }

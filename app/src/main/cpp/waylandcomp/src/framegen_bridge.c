@@ -2,6 +2,7 @@
 #include "framegen_bridge.h"
 #include "framegen_engine.h"
 #include "vk_loader.h"
+#include "zerofg_zc.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -86,7 +87,7 @@ static int64_t now_ns(void) {
 
 
 void vkp_framegen_set_engine(int kind) {
-    if (kind != VKP_FG_ENGINE_LSFG && kind != VKP_FG_ENGINE_DDFG) kind = VKP_FG_ENGINE_LSFG;
+    if (kind != VKP_FG_ENGINE_LSFG && kind != VKP_FG_ENGINE_DDFG && kind != VKP_FG_ENGINE_ZEROFG) kind = VKP_FG_ENGINE_LSFG;
     atomic_store(&g_kind, kind);
     atomic_store(&g_failed_kind, -1);
     atomic_store(&g_cfg_dirty, 1);
@@ -141,17 +142,31 @@ static void mark_failed(int kind) {
 }
 
 int vkp_framegen_problem(void) {
-    if (!g_dev_ready) return -1;
     int kind = atomic_load(&g_kind);
+    if (kind == VKP_FG_ENGINE_ZEROFG) return zfg_unsupported() ? 1 : 0;
+    if (!g_dev_ready) return -1;
     if (!fge_caps_ok(kind)) return 1;
     if (start_failed_for(kind)) return 2;
     if (g_engine_ok && g_engine_kind == kind && fge_unavailable()) return 2;
     return 0;
 }
-const char *vkp_framegen_caps_reason(void) { return fge_caps_reason(); }
+const char *vkp_framegen_caps_reason(void) {
+    if (atomic_load(&g_kind) == VKP_FG_ENGINE_ZEROFG) return zfg_unsupported();
+    return fge_caps_reason();
+}
 
 void vkp_framegen_stats(float out[6]) {
     float accepted = 0.0f, src = 0.0f, thermal = -1.0f;
+    if (atomic_load(&g_kind) == VKP_FG_ENGINE_ZEROFG) {
+        float real = 0.0f, shown = 0.0f;
+        zfg_rates(&real, &shown);
+        out[0] = out[1] = shown > real ? 1.0f : 0.0f;
+        out[2] = real;
+        out[3] = shown;
+        out[4] = -1.0f;
+        out[5] = -1.0f;
+        return;
+    }
     if (g_engine_ok) fge_telemetry(&accepted, &src, &thermal);
     out[0] = (float)g_planned;
     out[1] = (float)g_planned;
@@ -179,6 +194,7 @@ void vkp_framegen_device_ready(VkDevice dev, VkQueue queue, uint32_t qfam, int f
 #undef R
     g_vk.GetPhysicalDeviceMemoryProperties(g_pd, &g_memprops);
     fge_device_ready(g_gipa, g_inst, g_pd, dev, queue, qfam, features_enabled);
+    zfg_device_ready();
     g_dev_ready = vk.CreateImage && vk.CreateImageView && vk.CmdPipelineBarrier;
     FGLOG("engines ready on the compositor's device: LSFG Native %s (%s), DD-FG Native %s",
           fge_caps_ok(VKP_FG_ENGINE_LSFG) ? "available" : "unavailable", fge_caps_reason(),
@@ -263,7 +279,18 @@ static void refuse_format(VkFormat fmt, int kind, int w, int h, const char *what
 }
 
 int vkp_framegen_active(void) {
-    return atomic_load(&g_armed) && engine_usable();
+    return atomic_load(&g_armed) && atomic_load(&g_kind) != VKP_FG_ENGINE_ZEROFG && engine_usable();
+}
+
+int vkp_framegen_zerofg_armed(void) {
+    return atomic_load(&g_armed) && atomic_load(&g_kind) == VKP_FG_ENGINE_ZEROFG;
+}
+
+float vkp_framegen_refresh_hz(void) {
+    pthread_mutex_lock(&g_lock);
+    const float hz = g_refresh_hz;
+    pthread_mutex_unlock(&g_lock);
+    return hz;
 }
 
 int vkp_framegen_extra_images(void) {

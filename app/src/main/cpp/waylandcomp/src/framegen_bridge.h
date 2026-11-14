@@ -6,7 +6,9 @@
 #endif
 #include <vulkan/vulkan.h>
 
-enum { VKP_FG_ENGINE_LSFG = 0, VKP_FG_ENGINE_DDFG = 1 };
+/* ZEROFG runs on the zero-copy path (zerofg_zc.c), not in vkp_framegen_run: armed, it leaves the copy path
+ * without frame generation and zero-copy accepted. */
+enum { VKP_FG_ENGINE_LSFG = 0, VKP_FG_ENGINE_DDFG = 1, VKP_FG_ENGINE_ZEROFG = 2 };
 #define VKP_FG_MAX_GENERATIONS 3
 
 void vkp_framegen_set_engine(int kind);
@@ -25,6 +27,9 @@ void vkp_framegen_device_ready(VkDevice dev, VkQueue queue, uint32_t qfam, int f
 void vkp_framegen_device_lost(void);
 
 int vkp_framegen_active(void);
+int vkp_framegen_zerofg_armed(void);
+/* The panel's refresh rate from vkp_framegen_set_tuning (0: not given). */
+float vkp_framegen_refresh_hz(void);
 int vkp_framegen_extra_images(void);
 int vkp_framegen_run(VkCommandBuffer cmd, VkImage scene, VkImageView scene_view, int w, int h,
                      VkFormat fmt, VkImage gens[VKP_FG_MAX_GENERATIONS]);
