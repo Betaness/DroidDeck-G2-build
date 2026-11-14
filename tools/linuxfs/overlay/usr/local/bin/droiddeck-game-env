@@ -142,6 +142,21 @@ def duckov_mono_hacks(game):
 
 
 @fix
+def duckov_alert_spin(game):
+    """The ntdll.so of the semaphore-pool packs from fork rev 101 on (patch 0003) has NtWaitForAlertByThreadId
+    poll for WINE_ALERT_SPIN_US microseconds before it sleeps on the futex (default 0, no polling), and
+    NtAlertThreadByThreadId calls futex_wake only when the waiter sleeps; other ntdll builds ignore the variable.
+    Escape from Duckov at half resolution in game on a Xring O3 under Proton Experimental 11.0-20261112 (r101
+    pack), 30 against 0, n=2 each: 35.0 against 36.7 million main-thread cycles a frame (-4.6%, 9.89 against
+    10.31 ms), 89.2 against 88.9 fps (the game runs near 90 fps, where the main thread is not the only limit),
+    minimum 87.3 against 83.6 fps, SoC peak 86.5 against 88.5 C, and about 10% more CPU time on the game's
+    threads (waiting workers poll). Only Duckov was measured. A WINE_ALERT_SPIN_US the game already gets (from
+    droiddeck-env) is kept, and a per-game value wins."""
+    if is_duckov(game) and "WINE_ALERT_SPIN_US" not in os.environ:
+        return {"WINE_ALERT_SPIN_US": "30"}, [], "Escape from Duckov: Wine alert waits poll 30 us before sleeping"
+
+
+@fix
 def godot_vulkan(game):
     if is_godot(game) and not game.has_arg("--rendering-driver"):
         return {}, ["--rendering-driver", "vulkan"], "Godot: Vulkan renderer"
