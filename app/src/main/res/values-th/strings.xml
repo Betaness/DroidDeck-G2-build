@@ -2830,6 +2830,8 @@
     <string name="stores_hltb_hours">%1$s ชม.</string>
     <string name="stores_hltb_minutes">%1$d นาที</string>
     <string name="display_picture_position">ตำแหน่งภาพ</string>
+    <string name="game_fill_title">หน้าต่างเกม</string>
+    <string name="game_fill_hint">หน้าต่างเกมที่เล็กกว่าหน้าจอจะแสดงเต็มหน้าจอ สิ่งที่อยู่รอบๆ เช่น Steam จะถูกซ่อน</string>
     <string name="display_position_top">บน</string>
     <string name="display_position_bottom">ล่าง</string>
     <string name="display_position_center">กลาง (ค่าเริ่มต้น)</string>

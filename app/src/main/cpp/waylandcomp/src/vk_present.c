@@ -12,6 +12,7 @@
 #include "gpu_busy.h"
 #include "droiddeck_color.h"
 #include "quest_device.h"
+#include "scene_map.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -233,15 +234,18 @@ static pthread_cond_t g_req_condition = PTHREAD_COND_INITIALIZER;
 
 static volatile int g_mode = VKP_MODE_STRETCH, g_align = VKP_ALIGN_CENTER;
 
-static struct {
-    int scene_w, scene_h, out_w, out_h, mode, align;
-    float kx, ky, off_x, off_y;
-    int rx, ry, rw, rh;
-    int valid;
-} g_map;
+static struct scene_map g_map;
+_Static_assert(SCENE_MODE_STRETCH == VKP_MODE_STRETCH && SCENE_MODE_FIT == VKP_MODE_FIT &&
+               SCENE_MODE_INTEGER == VKP_MODE_INTEGER && SCENE_ALIGN_PICTURE_RIGHT == VKP_ALIGN_PICTURE_RIGHT &&
+               SCENE_ALIGN_BOTTOM == VKP_ALIGN_BOTTOM, "scene_map.h and vk_present.h disagree");
+/* [mali-g2] Game window fill (game_fill_server.c): the part of the X screen g_map shows. Compositor thread. */
+static struct { int on, rect[4], root_w, root_h, mode; unsigned gen; } g_crop;
+static unsigned g_map_crop_gen;
+static int g_map_cardboard;
 static pthread_mutex_t g_game_picture_lock = PTHREAD_MUTEX_INITIALIZER;
 static float g_game_picture_rect[4];
-static int g_game_picture_placed;
+static float g_game_picture_shown[2];
+static int g_game_picture_placed, g_game_picture_cropped;
 
 static int64_t g_swap_retry_at_ns;
 static int g_swap_fail_logged;
@@ -423,72 +427,95 @@ static const char *align_name(int a) {
 static void update_map(int scene_w, int scene_h) {
     int mode = g_mode, align = g_align;
     int W = (int)g_extent.width, H = (int)g_extent.height;
+    const int cardboard = vkp_cardboard_active();
     if (g_map.valid && g_map.scene_w == scene_w && g_map.scene_h == scene_h && g_map.out_w == W &&
-        g_map.out_h == H && g_map.mode == mode && g_map.align == align)
+        g_map.out_h == H && g_map.mode == mode && g_map.align == align && g_map_crop_gen == g_crop.gen &&
+        g_map_cardboard == cardboard)
         return;
-    g_map.scene_w = scene_w; g_map.scene_h = scene_h; g_map.out_w = W; g_map.out_h = H;
-    g_map.mode = mode; g_map.align = align;
-
-    int half = H / 2;
-    switch (align) {
-    case VKP_ALIGN_TOP:    g_map.rx = 0; g_map.ry = 0;    g_map.rw = W; g_map.rh = half; break;
-    case VKP_ALIGN_BOTTOM: g_map.rx = 0; g_map.ry = half; g_map.rw = W; g_map.rh = H - half; break;
-    default:               g_map.rx = 0; g_map.ry = 0;    g_map.rw = W; g_map.rh = H; break;
-    }
-    float sx = (float)g_map.rw / scene_w, sy = (float)g_map.rh / scene_h;
-    if (mode == VKP_MODE_STRETCH) {
-        g_map.kx = sx; g_map.ky = sy;
-        g_map.off_x = (float)g_map.rx; g_map.off_y = (float)g_map.ry;
-    } else {
-        float aspect;
-        if (mode == VKP_MODE_FILL) aspect = sx > sy ? sx : sy;
-        else if (mode == VKP_MODE_INTEGER) {
-            float m = sx < sy ? sx : sy;
-            aspect = (float)(int)m;
-            if (aspect < 1.0f) aspect = 1.0f;
-        } else aspect = sx < sy ? sx : sy;
-        g_map.kx = g_map.ky = aspect;
-        g_map.off_x = (float)(g_map.rx + (int)((g_map.rw - scene_w * aspect) * 0.5f));
-        g_map.off_y = (float)(g_map.ry + (int)((g_map.rh - scene_h * aspect) * 0.5f));
-    }
-    if (align == VKP_ALIGN_PICTURE_TOP) g_map.off_y = 0;
-    else if (align == VKP_ALIGN_PICTURE_BOTTOM) g_map.off_y = H - scene_h * g_map.ky;
-    else if (align == VKP_ALIGN_PICTURE_LEFT) g_map.off_x = 0;
-    else if (align == VKP_ALIGN_PICTURE_RIGHT) g_map.off_x = W - scene_w * g_map.kx;
-    g_map.valid = 1;
+    g_map_crop_gen = g_crop.gen;
+    g_map_cardboard = cardboard;
+    int crop[4];
+    /* The cardboard pass draws the whole scene itself, so it gets no crop. */
+    const int cropped = g_crop.on && !cardboard &&
+                        scene_map_root_rect(g_crop.rect, g_crop.root_w, g_crop.root_h, scene_w, scene_h, crop);
+    scene_map_compute(&g_map, scene_w, scene_h, W, H, mode, align, cropped ? crop : NULL, g_crop.mode);
+    if (!g_map.valid) return;
     pthread_mutex_lock(&g_game_picture_lock);
-    g_game_picture_placed = align == VKP_ALIGN_PICTURE_TOP || align == VKP_ALIGN_PICTURE_BOTTOM || align == VKP_ALIGN_PICTURE_LEFT || align == VKP_ALIGN_PICTURE_RIGHT;
-    g_game_picture_rect[0] = g_map.off_x;
-    g_game_picture_rect[1] = g_map.off_y;
-    g_game_picture_rect[2] = g_map.off_x + scene_w * g_map.kx;
-    g_game_picture_rect[3] = g_map.off_y + scene_h * g_map.ky;
+    g_game_picture_placed = align == VKP_ALIGN_PICTURE_TOP || align == VKP_ALIGN_PICTURE_BOTTOM ||
+                            align == VKP_ALIGN_PICTURE_LEFT || align == VKP_ALIGN_PICTURE_RIGHT || g_map.crop;
+    g_game_picture_cropped = g_map.crop;
+    memcpy(g_game_picture_rect, g_map.picture, sizeof(g_game_picture_rect));
+    g_game_picture_shown[0] = (float)g_map.crop_w;
+    g_game_picture_shown[1] = (float)g_map.crop_h;
     pthread_mutex_unlock(&g_game_picture_lock);
-    droiddeck_log("screen", "%s, %s: %dx%d scene shown %dx%d at %d,%d on the %dx%d output",
-               mode_name(mode), align_name(align), scene_w, scene_h,
-               (int)(scene_w * g_map.kx + 0.5f), (int)(scene_h * g_map.ky + 0.5f),
-               (int)g_map.off_x, (int)g_map.off_y, W, H);
+    const int pw = (int)(g_map.picture[2] - g_map.picture[0] + 0.5f), ph = (int)(g_map.picture[3] - g_map.picture[1] + 0.5f);
+    if (g_map.crop)
+        droiddeck_log("screen", "game window %s, %s: %dx%d at %d,%d of the %dx%d scene shown %dx%d at %d,%d on the %dx%d output",
+                      g_map.crop_mode == VKP_MODE_STRETCH ? "stretched" : "fitted", align_name(align), g_map.crop_w,
+                      g_map.crop_h, g_map.crop_x, g_map.crop_y, scene_w, scene_h, pw, ph, (int)g_map.picture[0],
+                      (int)g_map.picture[1], W, H);
+    else
+        droiddeck_log("screen", "%s, %s: %dx%d scene shown %dx%d at %d,%d on the %dx%d output",
+                      mode_name(mode), align_name(align), scene_w, scene_h,
+                      (int)(scene_w * g_map.kx + 0.5f), (int)(scene_h * g_map.ky + 0.5f),
+                      (int)g_map.off_x, (int)g_map.off_y, W, H);
 }
 
-int vkp_game_picture_rect(float rect[4]) {
+void vkp_set_scene_crop(int on, const int rect[4], int root_w, int root_h, int mode) {
+    const int stretch = mode == VKP_MODE_STRETCH ? VKP_MODE_STRETCH : VKP_MODE_FIT;
+    if (!on && !g_crop.on) return;
+    if (on && g_crop.on && !memcmp(g_crop.rect, rect, sizeof(g_crop.rect)) && g_crop.root_w == root_w &&
+        g_crop.root_h == root_h && g_crop.mode == stretch)
+        return;
+    g_crop.on = on;
+    if (on) {
+        memcpy(g_crop.rect, rect, sizeof(g_crop.rect));
+        g_crop.root_w = root_w;
+        g_crop.root_h = root_h;
+        g_crop.mode = stretch;
+    }
+    g_crop.gen++;
+    if (g_map.valid) update_map(g_map.scene_w, g_map.scene_h);
+}
+
+int vkp_scene_shown_rect(int r[4]) {
+    if (!g_map.valid || !g_map.crop) return 0;
+    r[0] = g_map.crop_x;
+    r[1] = g_map.crop_y;
+    r[2] = g_map.crop_x + g_map.crop_w;
+    r[3] = g_map.crop_y + g_map.crop_h;
+    return 1;
+}
+
+int vkp_game_picture_rect(float rect[4], float shown[2], int *cropped) {
     pthread_mutex_lock(&g_game_picture_lock);
     int active = g_game_picture_placed;
-    if (active) memcpy(rect, g_game_picture_rect, sizeof(g_game_picture_rect));
+    if (active) {
+        memcpy(rect, g_game_picture_rect, sizeof(g_game_picture_rect));
+        if (shown) memcpy(shown, g_game_picture_shown, sizeof(g_game_picture_shown));
+        if (cropped) *cropped = g_game_picture_cropped;
+    }
     pthread_mutex_unlock(&g_game_picture_lock);
     return active;
 }
 
 int vkp_output_to_scene(double ox, double oy, double *sx, double *sy) {
-    if (!g_map.valid || g_map.kx <= 0 || g_map.ky <= 0) return 0;
-    *sx = (ox - g_map.off_x) / g_map.kx;
-    *sy = (oy - g_map.off_y) / g_map.ky;
-    return 1;
+    return scene_map_to_scene(&g_map, ox, oy, sx, sy);
 }
 
 int vkp_scene_to_output(double sx, double sy, double *ox, double *oy) {
-    if (!g_map.valid || g_map.kx <= 0 || g_map.ky <= 0) return 0;
-    *ox = sx * g_map.kx + g_map.off_x;
-    *oy = sy * g_map.ky + g_map.off_y;
-    return 1;
+    return scene_map_to_output(&g_map, sx, sy, ox, oy);
+}
+
+/* The size the effects chain renders the scene at: as mapped, but no larger than the output when only
+ * a part of the scene is shown (the rest is cut off). */
+static void mapped_scene_size(int scene_w, int scene_h, int *mw, int *mh) {
+    *mw = (int)(scene_w * g_map.kx + 0.5f);
+    *mh = (int)(scene_h * g_map.ky + 0.5f);
+    if (g_map.crop) {
+        if (*mw > (int)g_extent.width) *mw = (int)g_extent.width;
+        if (*mh > (int)g_extent.height) *mh = (int)g_extent.height;
+    }
 }
 
 void vkp_output_size(int *w, int *h) {
@@ -1673,10 +1700,10 @@ static int map_draw(const struct vkp_draw *d, float kx, float ky, float off_x, f
 }
 
 static int draw_to_blit(const struct vkp_draw *d, VkImageBlit *blit) {
-    float R = (float)(g_map.rx + g_map.rw), B = (float)(g_map.ry + g_map.rh);
+    float R = g_map.clip[2], B = g_map.clip[3];
     if (R > (float)g_extent.width) R = (float)g_extent.width;
     if (B > (float)g_extent.height) B = (float)g_extent.height;
-    return map_draw(d, g_map.kx, g_map.ky, g_map.off_x, g_map.off_y, (float)g_map.rx, (float)g_map.ry, R, B, blit);
+    return map_draw(d, g_map.kx, g_map.ky, g_map.off_x, g_map.off_y, g_map.clip[0], g_map.clip[1], R, B, blit);
 }
 
 static int draw_to_scene_blit(const struct vkp_draw *d, int scene_w, int scene_h, VkImageBlit *blit) {
@@ -2236,9 +2263,11 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
     }
     const int pass = deep || ((fx || fg || cb || (hf && n > 0)) && ensure_scene_image(input_w, input_h) == 0);
     const int draw_n = pass ? pass_n : n;
-    if (pass && fx && !hf && vkp_effects_upscaling())
-        effects_source_note(scene_w, scene_h, draws, n, input_w, input_h,
-                            (int)(scene_w * g_map.kx + 0.5f), (int)(scene_h * g_map.ky + 0.5f));
+    if (pass && fx && !hf && vkp_effects_upscaling()) {
+        int mapped_w, mapped_h;
+        mapped_scene_size(scene_w, scene_h, &mapped_w, &mapped_h);
+        effects_source_note(scene_w, scene_h, draws, n, input_w, input_h, mapped_w, mapped_h);
+    }
     VkImage scene_img = deep ? g_fgscene.img : g_scene.img;
     const VkFormat scene_fmt = deep ? FG_HDR_FMT : SCENE_FMT;
     const VkFilter blit_filter = vkp_effects_blit_filter();
@@ -2344,7 +2373,8 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
     } else {
         VkImageLayout result_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         if (fx) {
-            int mapped_w = (int)(scene_w * g_map.kx + 0.5f), mapped_h = (int)(scene_h * g_map.ky + 0.5f);
+            int mapped_w, mapped_h;
+            mapped_scene_size(scene_w, scene_h, &mapped_w, &mapped_h);
             if (fg) { mapped_w = scene_w; mapped_h = scene_h; }
             vkp_effects_set_formats(scene_fmt, scene_fmt);
             result = vkp_effects_run(cmd, scene_img, input_w, input_h, mapped_w, mapped_h, &rw, &rh);
@@ -2764,17 +2794,17 @@ static int pass_begin_impl(int scene_w, int scene_h, const struct vkp_draw *draw
     const struct vkp_draw *pass_draws = draws;
     const int source_end = !hf && vkp_effects_upscaling()
                                ? effects_source_draw(scene_w, scene_h, draws, n, &source_draw) : 0;
+    int mapped_w, mapped_h;
+    mapped_scene_size(scene_w, scene_h, &mapped_w, &mapped_h);
     if (source_end) {
         input_w = source_draw.dw;
         input_h = source_draw.dh;
-        effects_source_note(scene_w, scene_h, draws, n, input_w, input_h,
-                            (int)(scene_w * g_map.kx + 0.5f), (int)(scene_h * g_map.ky + 0.5f));
+        effects_source_note(scene_w, scene_h, draws, n, input_w, input_h, mapped_w, mapped_h);
         pass_draws = &source_draw;
         pass_n = 1;
         overlay_start = source_end;
     } else if (!hf && vkp_effects_upscaling()) {
-        effects_source_note(scene_w, scene_h, draws, n, input_w, input_h,
-                            (int)(scene_w * g_map.kx + 0.5f), (int)(scene_h * g_map.ky + 0.5f));
+        effects_source_note(scene_w, scene_h, draws, n, input_w, input_h, mapped_w, mapped_h);
     }
     if (hf) {
         if (ensure_img(&g_hdrscene, scene_w, scene_h, HDR_FMT,
@@ -2849,7 +2879,6 @@ static int pass_begin_impl(int scene_w, int scene_h, const struct vkp_draw *draw
         if (vkp_effects_active()) vkp_effects_set_formats(VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM);
     }
 
-    int mapped_w = (int)(scene_w * g_map.kx + 0.5f), mapped_h = (int)(scene_h * g_map.ky + 0.5f);
     g_pass.rw = input_w; g_pass.rh = input_h;
     g_pass.result = vkp_effects_run(cmd, scene_img, input_w, input_h, mapped_w, mapped_h,
                                     &g_pass.rw, &g_pass.rh);

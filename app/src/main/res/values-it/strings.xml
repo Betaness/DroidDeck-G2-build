@@ -2888,6 +2888,8 @@
     <string name="stores_storage_low">Spazio insufficiente (%1$s liberi, ne servono %2$s)</string>
     <string name="stores_target_free_unknown">Spazio libero sconosciuto</string>
     <string name="display_picture_position">Posizione immagine</string>
+    <string name="game_fill_title">Finestra del gioco</string>
+    <string name="game_fill_hint">Una finestra di gioco più piccola dello schermo lo riempie. Ciò che la circonda, come Steam, viene nascosto.</string>
     <string name="display_position_top">In alto</string>
     <string name="display_position_bottom">In basso</string>
     <string name="display_position_center">Centro (predefinito)</string>

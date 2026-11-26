@@ -2888,6 +2888,8 @@
     <string name="stores_hltb_hours">%1$s h</string>
     <string name="stores_hltb_minutes">%1$d min</string>
     <string name="display_picture_position">Poziția imaginii</string>
+    <string name="game_fill_title">Fereastra jocului</string>
+    <string name="game_fill_hint">O fereastră de joc mai mică decât ecranul îl umple. Ce se află în jurul ei, de exemplu Steam, este ascuns.</string>
     <string name="display_position_top">Sus</string>
     <string name="display_position_bottom">Jos</string>
     <string name="display_position_center">Centru (implicit)</string>

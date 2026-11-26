@@ -2917,6 +2917,8 @@
     <string name="stores_hltb_hours">%1$s godz.</string>
     <string name="stores_hltb_minutes">%1$d min</string>
     <string name="display_picture_position">Pozycja obrazu</string>
+    <string name="game_fill_title">Okno gry</string>
+    <string name="game_fill_hint">Okno gry mniejsze niż ekran wypełnia cały ekran. To, co je otacza, np. Steam, zostaje ukryte.</string>
     <string name="display_position_top">Góra</string>
     <string name="display_position_bottom">Dół</string>
     <string name="display_position_center">Środek (domyślnie)</string>

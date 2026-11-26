@@ -3000,6 +3000,8 @@
     <string name="stores_storage_low">Недостаточно места (свободно %1$s, нужно %2$s)</string>
     <string name="stores_target_free_unknown">Свободное место неизвестно</string>
     <string name="display_picture_position">Положение изображения</string>
+    <string name="game_fill_title">Окно игры</string>
+    <string name="game_fill_hint">Окно игры меньше экрана растягивается на весь экран. То, что вокруг него, например Steam, скрывается.</string>
     <string name="display_position_top">Сверху</string>
     <string name="display_position_bottom">Снизу</string>
     <string name="display_position_center">По центру (по умолчанию)</string>

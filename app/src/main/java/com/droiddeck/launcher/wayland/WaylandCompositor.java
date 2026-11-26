@@ -261,6 +261,10 @@ public final class WaylandCompositor {
 
     public static native void nativeSetOutputSize(int width, int height);
 
+    /**
+     * Where the game picture is on the output when it is placed or cropped to a game window: left, top,
+     * right, bottom; with seven or more slots also the scene px shown (width, height) and 1 when cropped.
+     */
     public static native boolean nativeGamePictureRect(float[] out);
 
     public static native void nativeResizeOutput(int width, int height);
@@ -312,6 +316,9 @@ public final class WaylandCompositor {
     public static native void nativeHdrNoteHeadroomRequest(float ratio);
 
     public static native void nativeSetScaleMode(int fullscreenMode, int screenAlignment);
+
+    /** [mali-g2] Game window fill (session/GameFill.kt): the default mode and the games with their own. */
+    public static native void nativeSetGameFill(int defaultMode, int[] apps, int[] modes);
 
 
     public static native void nativeSetUpscaler(int mode);

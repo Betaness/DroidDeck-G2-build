@@ -245,6 +245,9 @@ class DrawerActions(
     val immersiveSteamVr: Boolean = false,
     val textureAnisotropy: Int? = 0,
     val textureLodBias: String? = TextureFiltering.LOD_BIAS_OFF,
+    /** [mali-g2] Game window fill: the selected game's own (null: the general one), else the general one. */
+    val gameFill: String? = null,
+    val gameFillAvailable: Boolean = false,
     val secondScreenMode: SecondScreenMode,
     val secondScreenNone: Boolean = true,
     val gameOnBottom: Boolean = false,
@@ -303,6 +306,7 @@ class DrawerActions(
     val onSteamVr: (String) -> Unit = {},
     val onTextureAnisotropy: (Int?) -> Unit = {},
     val onTextureLodBias: (String?) -> Unit = {},
+    val onGameFill: (String?) -> Unit = {},
     val onSecondScreenMode: (SecondScreenMode) -> Unit,
     val onSecondScreenDisplay: (Int) -> Unit,
     val onLaunchAndroidApp: (HomeApp.LaunchableApp, Int?) -> Unit,
@@ -742,6 +746,7 @@ internal fun SessionDrawer(open: Boolean, requestedPage: SessionDrawerPage, cont
                             Text(stringResource(R.string.fex_next_launch), fontSize = 12.sp,
                                 color = colors.onSurfaceVariant, modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp))
                             TextureFilteringGroup(host, a) { key -> focus.track(page, key) }
+                            if (a.steam && a.gameFillAvailable) GameFillGroup(host, a) { key -> focus.track(page, key) }
                             if (a.steam || a.direct) SettingsGroup(stringResource(R.string.game_settings_title)) {
                                 DrawerFexPresetRow(host, a, focus.track(page, "fex"))
                                 DrawerNoSteamRow(host, a, focus.track(page, "no-steam"))
@@ -1292,6 +1297,17 @@ private fun TextureFilteringGroup(host: MenuHost, a: DrawerActions, track: (Stri
     }
 }
 
+@Composable
+private fun GameFillGroup(host: MenuHost, a: DrawerActions, track: (String) -> Modifier) {
+    val choices: List<Pair<String?, String>> =
+        (if (a.selectedGameProfileId != null) listOf(null to stringResource(R.string.comp_game_use_general)) else emptyList()) +
+            gameFillChoices().map { (value, label) -> value as String? to label }
+    SettingsGroup(stringResource(R.string.drawer_page_display)) {
+        ChoiceRow(host, "game-fill", stringResource(R.string.game_fill_title), stringResource(R.string.game_fill_hint),
+            choices, a.gameFill, chipModifier = track("game-fill"), onPick = a.onGameFill)
+    }
+}
+
 private fun signed(v: Int) = if (v > 0) "+$v" else "$v"
 
 @Composable
@@ -1336,9 +1352,11 @@ private fun SelectedGameProfileGroup(host: MenuHost, a: DrawerActions, track: (S
             )
             return@SettingsGroup
         }
+        val gameFill = a.gameFill?.takeIf { a.gameFillAvailable }
         val hasOverrides = profile.hasOverrides ||
             a.textureAnisotropy != null ||
-            a.textureLodBias != null
+            a.textureLodBias != null ||
+            gameFill != null
         Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 11.dp)) {
             Text(
                 stringResource(
@@ -1397,6 +1415,10 @@ private fun SelectedGameProfileGroup(host: MenuHost, a: DrawerActions, track: (S
                     SessionPrefs.textureLodBiasChoices(LocalContext.current)
                         .firstOrNull { it.first == value }?.second.orEmpty(),
                 )
+            }
+            gameFill?.let { value ->
+                ProfileSummaryRow(stringResource(R.string.game_fill_title),
+                    gameFillChoices().firstOrNull { it.first == value }?.second.orEmpty())
             }
         }
     }

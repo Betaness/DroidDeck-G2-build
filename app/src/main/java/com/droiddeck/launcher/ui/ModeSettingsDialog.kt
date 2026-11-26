@@ -83,6 +83,8 @@ class ModeSettings(
     val syncBackend: String? = null,
     val picturePosition: String? = null,
     val stretch16x9: Boolean? = null,
+    /** [mali-g2] Game window fill (GameFill) for every game; null hides the row. */
+    val gameFill: String? = null,
     val steamClientArch: String? = null,
     val returnAfterGame: Boolean? = null,
     val shaderPrecache: Boolean? = null,
@@ -138,6 +140,7 @@ class ModeSettingsActions(
     val onSyncBackend: (String) -> Unit = {},
     val onPicturePosition: (String) -> Unit = {},
     val onStretch16x9: (Boolean) -> Unit = {},
+    val onGameFill: (String) -> Unit = {},
     val onSteamRepair: () -> Unit = {},
     val onSteamClientArch: (String) -> Unit = {},
     val onMangoapp: (Boolean) -> Unit = {},
@@ -161,6 +164,13 @@ class ModeSettingsActions(
     val onDeckyUninstall: () -> Unit = {},
     val onPickDeckyPluginZip: () -> Unit = {},
     val onDismiss: () -> Unit,
+)
+
+@Composable
+internal fun gameFillChoices(): List<Pair<String, String>> = listOf(
+    com.droiddeck.launcher.session.GameFill.STRETCH to stringResource(R.string.display_stretch),
+    com.droiddeck.launcher.session.GameFill.ASPECT to stringResource(R.string.display_preserve),
+    com.droiddeck.launcher.session.GameFill.OFF to stringResource(R.string.frame_gen_off),
 )
 
 internal fun fexVersionOf(script: String): String? =
@@ -228,6 +238,10 @@ fun ModeSheetRows(s: ModeSettings, a: ModeSettingsActions, tab: String, extras: 
                         "right" to stringResource(R.string.display_position_right),
                         "center" to stringResource(R.string.display_position_center)),
                     position, onPick = a.onPicturePosition)
+            }
+            s.gameFill?.let { fill ->
+                ChoiceRow(host, "game-fill", stringResource(R.string.game_fill_title), stringResource(R.string.game_fill_hint),
+                    gameFillChoices(), fill, onPick = a.onGameFill)
             }
             if (s.stretch16x9 != null && (com.droiddeck.launcher.session.SessionDisplay.canStretch16x9(s.panelSize) ||
                     com.droiddeck.launcher.session.SessionDisplay.canStretch16x9(displaySize))) {

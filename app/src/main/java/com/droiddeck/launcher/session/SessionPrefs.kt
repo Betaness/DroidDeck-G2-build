@@ -572,6 +572,45 @@ object SessionPrefs {
             position.takeIf { it in listOf("top", "bottom", "left", "right", "center") } ?: "center").apply()
     }
 
+    /** [mali-g2] Game window fill for every game without a setting of its own (GameFill). */
+    fun gameFill(context: Context): String =
+        GameFill.normalize(prefs(context).getString("gameFill", null)) ?: GameFill.DEFAULT
+
+    fun setGameFill(context: Context, choice: String) {
+        prefs(context).edit().putString("gameFill", GameFill.normalize(choice) ?: GameFill.DEFAULT).apply()
+    }
+
+    /** Games' own game window fill: game profile scope -> choice. */
+    fun gameFillGames(context: Context): Map<String, String> {
+        val json = runCatching { JSONObject(prefs(context).getString("gameFillGames", null) ?: "{}") }
+            .getOrElse { JSONObject() }
+        return buildMap {
+            json.keys().forEach { scope ->
+                if (scope.isEmpty() || !GameEnvironment.validScope(scope)) return@forEach
+                GameFill.normalize(json.optString(scope))?.let { put(scope, it) }
+            }
+        }
+    }
+
+    /** The game's own game window fill, null when it follows [gameFill]. */
+    fun gameFillFor(context: Context, scope: String): String? {
+        require(GameEnvironment.validScope(scope))
+        return gameFillGames(context)[scope]
+    }
+
+    fun setGameFillFor(context: Context, scope: String, choice: String?) {
+        require(scope.isNotEmpty() && GameEnvironment.validScope(scope))
+        require(choice == null || choice in GameFill.CHOICES)
+        val games = gameFillGames(context).toMutableMap()
+        if (choice == null) games.remove(scope) else games[scope] = choice
+        prefs(context).edit().putString("gameFillGames", JSONObject(games.toMap()).toString()).apply()
+    }
+
+    fun clearGameFillFor(context: Context, scope: String) {
+        require(GameEnvironment.validScope(scope))
+        if (gameFillGames(context).containsKey(scope)) setGameFillFor(context, scope, null)
+    }
+
     fun returnAfterGame(context: Context): Boolean = prefs(context).getBoolean("returnAfterGame", true)
 
     fun setReturnAfterGame(context: Context, on: Boolean) {

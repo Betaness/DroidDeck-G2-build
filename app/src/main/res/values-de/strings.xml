@@ -2859,6 +2859,8 @@
     <string name="stores_storage_low">Zu wenig Speicher (%1$s frei, %2$s benötigt)</string>
     <string name="stores_target_free_unknown">Freier Speicher unbekannt</string>
     <string name="display_picture_position">Bildposition</string>
+    <string name="game_fill_title">Spielfenster</string>
+    <string name="game_fill_hint">Ein Spielfenster, das kleiner als der Bildschirm ist, füllt ihn aus. Was darum liegt, etwa Steam, wird ausgeblendet.</string>
     <string name="display_position_top">Oben</string>
     <string name="display_position_bottom">Unten</string>
     <string name="display_position_center">Mitte (Standard)</string>

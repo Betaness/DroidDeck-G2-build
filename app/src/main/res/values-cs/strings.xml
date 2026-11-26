@@ -2917,6 +2917,8 @@
     <string name="stores_hltb_hours">%1$s h</string>
     <string name="stores_hltb_minutes">%1$d min</string>
     <string name="display_picture_position">Poloha obrázku</string>
+    <string name="game_fill_title">Okno hry</string>
+    <string name="game_fill_hint">Okno hry menší než obrazovka ji vyplní. Co je kolem něj, například Steam, se skryje.</string>
     <string name="display_position_top">Nahoře</string>
     <string name="display_position_bottom">Dole</string>
     <string name="display_position_center">Uprostřed (výchozí)</string>

@@ -54,6 +54,11 @@ void sc_layer_tx_apply(struct ASurfaceTransaction *batch);
 void sc_layer_tx_discard(struct ASurfaceTransaction *tx);
 int sc_layer_present_vortek(int slot, int z, AHardwareBuffer *ahb, int buf_w, int buf_h, int acquire_fd, void *token,
                             int x, int y, int w, int h, int scene_w, int scene_h, struct ASurfaceTransaction *batch);
+/* [mali-g2] Places Vortek layer `slot`, showing a buf_w x buf_h buffer of the game's own (not a pool
+ * buffer), over the scene rectangle x,y,w,h again after the output mapping changed: 1 placed, 0 none of
+ * it is on the screen (the caller hides it), -1 not such a layer. */
+int sc_layer_vortek_remap(int slot, int buf_w, int buf_h, int x, int y, int w, int h, int scene_w, int scene_h,
+                          struct ASurfaceTransaction *batch);
 /* [mali-g2] Zero-copy upscaling: Vortek layer `slot` shows buffers of its own pool (SC_VORTEK_POOL,
  * allocated on first use) that the upscaler renders into. pool_take reserves a free buffer of w x h
  * and returns its index, with the display's release fence for it in *wait_fd (-1: none) to wait for

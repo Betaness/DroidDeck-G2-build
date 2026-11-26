@@ -2827,6 +2827,8 @@
     <string name="hand_camera_group">Seguimiento de manos</string>
     <string name="hand_camera_prompt_title">¿Rastrear las manos o los mandos Joy-Con con la cámara del teléfono?</string>
     <string name="display_picture_position">Posición de la imagen</string>
+    <string name="game_fill_title">Ventana del juego</string>
+    <string name="game_fill_hint">Una ventana de juego más pequeña que la pantalla la llena. Lo que la rodea, como Steam, se oculta.</string>
     <string name="display_position_top">Arriba</string>
     <string name="display_position_bottom">Abajo</string>
     <string name="display_position_center">Centro (predeterminado)</string>

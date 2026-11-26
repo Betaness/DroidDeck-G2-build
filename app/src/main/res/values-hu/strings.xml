@@ -2859,6 +2859,8 @@
     <string name="stores_hltb_hours">%1$s óra</string>
     <string name="stores_hltb_minutes">%1$d perc</string>
     <string name="display_picture_position">A kép pozíciója</string>
+    <string name="game_fill_title">Játékablak</string>
+    <string name="game_fill_hint">A képernyőnél kisebb játékablak kitölti a képernyőt. Ami körülötte van, például a Steam, rejtve marad.</string>
     <string name="display_position_top">Fent</string>
     <string name="display_position_bottom">Lent</string>
     <string name="display_position_center">Középen (alapértelmezett)</string>

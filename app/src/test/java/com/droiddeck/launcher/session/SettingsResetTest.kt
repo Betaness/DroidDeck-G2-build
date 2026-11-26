@@ -167,10 +167,23 @@ class SettingsResetTest {
         assertTrue(SessionPrefs.gameTextureFiltering(app).isEmpty())
     }
 
+    @Test fun gameWindowFillIsResetButGamesKeepTheirOwnUnlessGameProfilesAreReset() {
+        SessionPrefs.setGameFill(app, GameFill.OFF)
+        SessionPrefs.setGameFillFor(app, "440", GameFill.ASPECT)
+        SettingsReset.resetAll(app, gameProfiles = false)
+        assertEquals(GameFill.STRETCH, SessionPrefs.gameFill(app))
+        assertEquals(GameFill.ASPECT, SessionPrefs.gameFillFor(app, "440"))
+
+        SettingsReset.resetAll(app, gameProfiles = true)
+        assertTrue(SessionPrefs.gameFillGames(app).isEmpty())
+    }
+
     @Test fun perModeKeysAreSettings() {
         listOf("resolutionCap.steam", "displayResolution.desktop", "customRes.steam", "hdr.steam", "fpsLimit.desktop", "suspendPolicy.steam")
             .forEach { assertTrue(it, SettingsReset.isSessionSetting(it)) }
-        listOf("addedName:/x", "addedAppId:/x", "gpuAutoInstalled", "romsDir", "gameStorage", "micAsked", "gameTextureFiltering")
+        assertTrue(SettingsReset.isSessionSetting("gameFill"))
+        listOf("addedName:/x", "addedAppId:/x", "gpuAutoInstalled", "romsDir", "gameStorage", "micAsked", "gameTextureFiltering",
+            "gameFillGames")
             .forEach { assertFalse(it, SettingsReset.isSessionSetting(it)) }
     }
 }

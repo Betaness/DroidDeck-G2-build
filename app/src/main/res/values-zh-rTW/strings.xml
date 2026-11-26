@@ -2838,6 +2838,8 @@
     <string name="drawer_component_downloads_hint">下載內容與「元件」頁面共用。在上方選擇已下載的版本，即可在下次啟動遊戲時使用。</string>
     <string name="drawer_component_choose_download">選擇要下載的版本</string>
     <string name="display_picture_position">畫面位置</string>
+    <string name="game_fill_title">遊戲視窗</string>
+    <string name="game_fill_hint">比螢幕小的遊戲視窗會填滿螢幕，周圍的 Steam 等內容會被隱藏。</string>
     <string name="display_position_top">置頂</string>
     <string name="display_position_bottom">置底</string>
     <string name="display_position_center">置中（預設）</string>

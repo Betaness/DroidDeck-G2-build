@@ -2859,6 +2859,8 @@
     <string name="stores_hltb_hours">%1$s ώ.</string>
     <string name="stores_hltb_minutes">%1$d λεπ.</string>
     <string name="display_picture_position">Θέση εικόνας</string>
+    <string name="game_fill_title">Παράθυρο παιχνιδιού</string>
+    <string name="game_fill_hint">Ένα παράθυρο παιχνιδιού μικρότερο από την οθόνη τη γεμίζει. Ό,τι υπάρχει γύρω του, όπως το Steam, κρύβεται.</string>
     <string name="display_position_top">Πάνω</string>
     <string name="display_position_bottom">Κάτω</string>
     <string name="display_position_center">Κέντρο (προεπιλογή)</string>

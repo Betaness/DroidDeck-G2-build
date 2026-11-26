@@ -2917,6 +2917,8 @@
     <string name="stores_hltb_hours">%1$s год</string>
     <string name="stores_hltb_minutes">%1$d хв</string>
     <string name="display_picture_position">Позиція зображення</string>
+    <string name="game_fill_title">Вікно гри</string>
+    <string name="game_fill_hint">Вікно гри, менше за екран, заповнює весь екран. Те, що навколо нього, наприклад Steam, приховується.</string>
     <string name="display_position_top">Угорі</string>
     <string name="display_position_bottom">Унизу</string>
     <string name="display_position_center">По центру (типово)</string>

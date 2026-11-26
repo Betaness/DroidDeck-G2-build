@@ -19,7 +19,16 @@ enum vkp_align { VKP_ALIGN_CENTER = 0, VKP_ALIGN_TOP = 1, VKP_ALIGN_BOTTOM = 2,
                   VKP_ALIGN_PICTURE_TOP = 3, VKP_ALIGN_PICTURE_BOTTOM = 4,
                   VKP_ALIGN_PICTURE_LEFT = 5, VKP_ALIGN_PICTURE_RIGHT = 6 };
 void vk_present_set_scale_mode(int mode, int alignment);
-int vkp_game_picture_rect(float rect[4]);
+/* Where the game picture is on the output when it is placed (picture position) or cropped (game window
+ * fill): rect is left, top, right, bottom in output px, shown the scene px it shows (width, height),
+ * *cropped 1 for a crop. 0 when the scene is centred as a whole. Any thread. */
+int vkp_game_picture_rect(float rect[4], float shown[2], int *cropped);
+/* [mali-g2] Game window fill: on, only rect (x, y, w, h in px of a root_w x root_h X screen) is shown,
+ * stretched over the output (mode VKP_MODE_STRETCH) or fitted into it with black bars (any other mode).
+ * Compositor thread. */
+void vkp_set_scene_crop(int on, const int rect[4], int root_w, int root_h, int mode);
+/* The part of the scene shown (x0, y0, x1, y1 in scene px) while cropped; 0 otherwise. */
+int vkp_scene_shown_rect(int r[4]);
 int vkp_output_to_scene(double ox, double oy, double *sx, double *sy);
 int vkp_scene_to_output(double sx, double sy, double *ox, double *oy);
 void vkp_output_size(int *w, int *h);

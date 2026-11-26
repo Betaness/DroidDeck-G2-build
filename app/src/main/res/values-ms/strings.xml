@@ -2830,6 +2830,8 @@
     <string name="stores_hltb_hours">%1$s j</string>
     <string name="stores_hltb_minutes">%1$d min</string>
     <string name="display_picture_position">Kedudukan gambar</string>
+    <string name="game_fill_title">Tetingkap permainan</string>
+    <string name="game_fill_hint">Tetingkap permainan yang lebih kecil daripada skrin akan memenuhi skrin. Apa yang ada di sekelilingnya, seperti Steam, disembunyikan.</string>
     <string name="display_position_top">Atas</string>
     <string name="display_position_bottom">Bawah</string>
     <string name="display_position_center">Tengah (lalai)</string>

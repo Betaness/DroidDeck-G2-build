@@ -2830,6 +2830,8 @@
     <string name="drawer_component_downloads_hint">ダウンロードは「コンポーネント」ページと共有されます。上でダウンロード済みのバージョンを選ぶと、次回のゲーム起動時に使用されます。</string>
     <string name="drawer_component_choose_download">ダウンロードするバージョンを選択</string>
     <string name="display_picture_position">画面の位置</string>
+    <string name="game_fill_title">ゲームウィンドウ</string>
+    <string name="game_fill_hint">画面より小さいゲームウィンドウを画面いっぱいに表示します。Steam など周りのものは隠れます。</string>
     <string name="display_position_top">上</string>
     <string name="display_position_bottom">下</string>
     <string name="display_position_center">中央（既定）</string>

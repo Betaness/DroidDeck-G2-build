@@ -2859,6 +2859,8 @@
     <string name="stores_hltb_hours">%1$s ч</string>
     <string name="stores_hltb_minutes">%1$d мин</string>
     <string name="display_picture_position">Позиция на картината</string>
+    <string name="game_fill_title">Прозорец на играта</string>
+    <string name="game_fill_hint">Прозорец на игра, по-малък от екрана, го запълва. Това около него, например Steam, се скрива.</string>
     <string name="display_position_top">Горе</string>
     <string name="display_position_bottom">Долу</string>
     <string name="display_position_center">В средата (по подразбиране)</string>

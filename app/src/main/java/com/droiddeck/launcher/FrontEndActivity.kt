@@ -193,6 +193,9 @@ class FrontEndActivity : ComponentActivity() {
     private var directAudio by mutableStateOf(false)
     private var picturePosition by mutableStateOf("center")
     private var stretch16x9 by mutableStateOf(false)
+    private var gameFill by mutableStateOf(com.droiddeck.launcher.session.GameFill.DEFAULT)
+    /** [mali-g2] No gamescope on this path: the game window fill takes the place of the 16:9 fit. */
+    private var noGamescope by mutableStateOf(false)
     private var orientation by mutableStateOf(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE)
     private var launcherOrientation by mutableStateOf(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_USER)
     private var launcherFullscreen by mutableStateOf(true)
@@ -2422,7 +2425,8 @@ class FrontEndActivity : ComponentActivity() {
                 backActionsInverted = backActionsInverted,
                 directAudio = if (mode == SessionService.MODE_STEAM) directAudio else null,
                 picturePosition = if (mode == SessionService.MODE_STEAM) picturePosition else null,
-                stretch16x9 = if (mode == SessionService.MODE_STEAM) stretch16x9 else null,
+                stretch16x9 = if (mode == SessionService.MODE_STEAM && !noGamescope) stretch16x9 else null,
+                gameFill = if (mode == SessionService.MODE_STEAM && noGamescope) gameFill else null,
                 mic = if (mode == SessionService.MODE_STEAM) mic else null,
                 gameStorage = if (mode == SessionService.MODE_STEAM) gameStorage else null,
                 storageOptions = storageOptions,
@@ -2483,6 +2487,7 @@ class FrontEndActivity : ComponentActivity() {
                 onDirectAudio = { on -> SessionPrefs.setDirectAudio(this, on); directAudio = on },
                 onPicturePosition = { value -> SessionPrefs.setPicturePosition(this, value); picturePosition = value },
                 onStretch16x9 = { on -> SessionPrefs.setStretch16x9(this, on); stretch16x9 = on },
+                onGameFill = { value -> SessionPrefs.setGameFill(this, value); gameFill = SessionPrefs.gameFill(this) },
                 onMic = { on ->
                     SessionPrefs.setMicEnabled(this, on)
                     mic = on
@@ -2741,6 +2746,8 @@ class FrontEndActivity : ComponentActivity() {
         directAudio = SessionPrefs.directAudio(this)
         picturePosition = SessionPrefs.picturePosition(this)
         stretch16x9 = SessionPrefs.stretch16x9(this)
+        gameFill = SessionPrefs.gameFill(this)
+        noGamescope = runCatching { com.droiddeck.launcher.core.DeviceSupport.ownMaliPath(this) }.getOrDefault(false)
         mic = SessionPrefs.micEnabled(this)
         refreshWifiDiscovery()
         gameStorage = SessionPrefs.gameStorage(this)

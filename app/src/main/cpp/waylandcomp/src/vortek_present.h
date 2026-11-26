@@ -38,6 +38,10 @@ void vortek_present_scene_size(int w, int h);
 /* Scene effects, frame generation and cardboard need the composited scene: pause zero-copy. */
 void vortek_present_set_accept(int accept);
 unsigned vortek_present_stats_take(void);
+/* The output mapping changed (game window fill): the layers shown with the game's own buffers move to
+ * where their windows are now on the screen; those with nothing left on it are hidden. Layers showing
+ * an upscaled or generated frame follow with their next frame. */
+void vortek_present_remap(void);
 /* From sc_layer's transaction-complete callback (a binder thread). */
 void vortek_present_released(void *token, int release_fd);
 /* VP_MSG_RELEASE for a game image with its release fence (consumed; -1: none). Any thread. */

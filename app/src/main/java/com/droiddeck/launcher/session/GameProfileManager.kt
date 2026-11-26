@@ -21,6 +21,7 @@ object GameProfileManager {
         clear("Proton") { ProtonDefault.requestGame(context, scope, null) }
         clear("component packages") { ComponentsManager.clearGameComponents(context, scope) }
         clear("texture filtering") { SessionPrefs.clearGameTextureFiltering(context, scope) }
+        clear("game window fill") { SessionPrefs.clearGameFillFor(context, scope) }
         clear("Windows components") { WinComponents.setPicks(context, scope, emptyList()) }
 
         if (failures.isNotEmpty()) {

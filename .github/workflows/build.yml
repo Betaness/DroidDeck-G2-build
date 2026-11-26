@@ -370,6 +370,14 @@ jobs:
           W=app/src/main/cpp/waylandcomp
           cc -O2 -Wall -Wextra -Werror -I$W/src -o mali-g2/vortek/out/pointer_sync_test $W/tests/pointer_sync_test.c $W/src/pointer_sync.c -lm
           mali-g2/vortek/out/pointer_sync_test
+      - name: Compositor game window fill tests (mali-g2)
+        run: |
+          set -euo pipefail
+          W=app/src/main/cpp/waylandcomp
+          cc -O2 -Wall -Wextra -Werror -I$W/src -o mali-g2/vortek/out/scene_map_test $W/tests/scene_map_test.c $W/src/scene_map.c -lm
+          mali-g2/vortek/out/scene_map_test
+          cc -O2 -Wall -Wextra -Werror -I$W/src -o mali-g2/vortek/out/game_fill_test $W/tests/game_fill_test.c $W/src/game_fill.c
+          mali-g2/vortek/out/game_fill_test
       - uses: actions/upload-artifact@v4
         with:
           name: vortek-client

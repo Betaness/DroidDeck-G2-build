@@ -16,6 +16,7 @@
 #include "frame_sched_feed.h"
 #include "vortek_upscale.h"
 #include "zerofg_zc.h"
+#include "game_fill_server.h"
 
 #define VP_MAX_CHAINS 32
 #define VP_MAX_IMAGES 8
@@ -71,6 +72,7 @@ static unsigned g_stat_frames;
 struct vp_shown {
     uint32_t chain;           /* 0: free */
     int32_t rect[4];          /* X root coordinates */
+    int32_t srect[4];         /* the same in scene px, as last placed */
     uint64_t key;
     uint32_t seq;
     uint32_t toplevel;        /* the window's top-level X window, 0 if the client did not say */
@@ -347,8 +349,10 @@ static void on_create(int fd, const struct vp_msg *m) {
 }
 
 /* The game or Steam's main view rather than a menu or tooltip: covers at least half of the X root and no
- * other zero-copy window is bigger. Only that window is upscaled. */
+ * other zero-copy window is bigger, or is in the game window the output is cropped to (game_fill.h).
+ * Only that window is upscaled. */
 static int main_window(int slot, const struct vp_msg *m) {
+    if (m->toplevel && m->toplevel == game_fill_window()) return 1;
     const int64_t rw = m->root_w ? (int64_t)m->root_w : g_scene_w, rh = m->root_h ? (int64_t)m->root_h : g_scene_h;
     int64_t x0 = m->x < 0 ? 0 : m->x, y0 = m->y < 0 ? 0 : m->y;
     int64_t x1 = (int64_t)m->x + m->w, y1 = (int64_t)m->y + m->h;
@@ -402,6 +406,7 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
         x = (int)(m->x * sx + 0.5); y = (int)(m->y * sy + 0.5);
         w = (int)((m->x + m->w) * sx + 0.5) - x; h = (int)((m->y + m->h) * sy + 0.5) - y;
     }
+    g_show[slot].srect[0] = x; g_show[slot].srect[1] = y; g_show[slot].srect[2] = w; g_show[slot].srect[3] = h;
     const struct vku_frame vf = {.slot = slot, .z = z, .chain = m->chain, .index = m->index, .ahb = c->ahb[m->index],
                                  .buf_w = (int)c->w, .buf_h = (int)c->h, .x = x, .y = y, .w = w, .h = h,
                                  .scene_w = g_scene_w, .scene_h = g_scene_h, .main_window = main_window(slot, m)};
@@ -459,6 +464,18 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
         g_first_logged = 1;
         droiddeck_log("vortek", "game frames shown zero-copy: %ux%u buffer over the window at %d,%d %dx%d (X root %ux%u, scene %dx%d)",
                       c->w, c->h, m->x, m->y, m->w, m->h, m->root_w, m->root_h, g_scene_w, g_scene_h);
+    }
+}
+
+void vortek_present_remap(void) {
+    for (int i = 0; i < VP_LAYERS; i++) {
+        if (!g_show[i].chain) continue;
+        const struct vp_chain *c = chain_of(g_show[i].chain);
+        if (!c) continue;
+        const int r = sc_layer_vortek_remap(i, (int)c->w, (int)c->h, g_show[i].srect[0], g_show[i].srect[1],
+                                            g_show[i].srect[2], g_show[i].srect[3], g_scene_w, g_scene_h, batch());
+        /* Nothing of it is on the screen any more: off until it presents again. */
+        if (r == 0) hide_slot(i);
     }
 }
 

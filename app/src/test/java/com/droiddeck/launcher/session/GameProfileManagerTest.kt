@@ -51,6 +51,8 @@ class GameProfileManagerTest {
         SessionPrefs.setGameTextureAnisotropy(context, other, 8)
         WinComponents.setPicks(context, game, listOf("vcrun2022"))
         WinComponents.setPicks(context, other, listOf("dotnet48"))
+        SessionPrefs.setGameFillFor(context, game, GameFill.OFF)
+        SessionPrefs.setGameFillFor(context, other, GameFill.ASPECT)
 
         GameProfileManager.reset(context, game)
 
@@ -65,6 +67,8 @@ class GameProfileManagerTest {
         assertEquals(8, SessionPrefs.gameTextureFiltering(context, other).anisotropy)
         assertEquals(emptyList<String>(), WinComponents.picks(context, game))
         assertEquals(listOf("dotnet48"), WinComponents.picks(context, other))
+        assertNull(SessionPrefs.gameFillFor(context, game))
+        assertEquals(GameFill.ASPECT, SessionPrefs.gameFillFor(context, other))
     }
 
     @Test

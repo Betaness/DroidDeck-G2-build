@@ -2830,6 +2830,8 @@
     <string name="stores_hltb_hours">%1$s giờ</string>
     <string name="stores_hltb_minutes">%1$d phút</string>
     <string name="display_picture_position">Vị trí ảnh</string>
+    <string name="game_fill_title">Cửa sổ trò chơi</string>
+    <string name="game_fill_hint">Cửa sổ trò chơi nhỏ hơn màn hình sẽ lấp đầy màn hình. Những gì xung quanh, như Steam, sẽ bị ẩn.</string>
     <string name="display_position_top">Trên</string>
     <string name="display_position_bottom">Dưới</string>
     <string name="display_position_center">Giữa (mặc định)</string>

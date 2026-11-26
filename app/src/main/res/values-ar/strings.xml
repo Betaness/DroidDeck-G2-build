@@ -2975,6 +2975,8 @@
     <string name="stores_hltb_hours">%1$s س</string>
     <string name="stores_hltb_minutes">%1$d د</string>
     <string name="display_picture_position">موضع الصورة</string>
+    <string name="game_fill_title">نافذة اللعبة</string>
+    <string name="game_fill_hint">تملأ نافذة اللعبة الأصغر من الشاشة الشاشةَ كلها، ويُخفى ما حولها مثل Steam.</string>
     <string name="display_position_top">أعلى</string>
     <string name="display_position_bottom">أسفل</string>
     <string name="display_position_center">الوسط (افتراضي)</string>

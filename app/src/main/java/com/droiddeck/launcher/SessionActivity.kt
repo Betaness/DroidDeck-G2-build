@@ -179,6 +179,14 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
         WaylandCompositor.nativeSetScaleMode(SCALE_FIT, alignment)
     }
+
+    /** [mali-g2] The game window fill settings to the compositor; off outside Steam sessions and with cardboard. */
+    private fun applyGameFill() {
+        if (!CompositorHost.isStarted) return
+        val active = SessionState.mode == SessionService.MODE_STEAM && !cardboard.enabled
+        val table = com.droiddeck.launcher.session.GameFill.table(active, SessionPrefs.gameFill(this), SessionPrefs.gameFillGames(this))
+        WaylandCompositor.nativeSetGameFill(table.defaultMode, table.apps, table.modes)
+    }
     private var unfoldedPanel by mutableStateOf<OnScreenControls?>(null)
     private var unfoldedColumn: android.widget.LinearLayout? = null
     private var unfoldedDeckSurface: com.droiddeck.launcher.ui.InputSurfaceView? = null
@@ -585,6 +593,9 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var textureLodBias by mutableStateOf(TextureFiltering.LOD_BIAS_OFF)
     private var drawerTextureAnisotropy by mutableStateOf<Int?>(null)
     private var drawerTextureLodBias by mutableStateOf<String?>(null)
+    private var gameFill by mutableStateOf(com.droiddeck.launcher.session.GameFill.DEFAULT)
+    private var drawerGameFill by mutableStateOf<String?>(null)
+    private var gameFillGamesChanged by mutableStateOf(0)
     private var lossless by mutableStateOf(Lossless.State.NONE)
     private val pickLossless = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         if (r.resultCode == RESULT_OK) InAppFilePicker.pickedFile(r.data)?.let { importLossless(it) }
@@ -1018,6 +1029,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 }
             }
             androidx.compose.runtime.LaunchedEffect(picturePosition, SessionState.running, pipUi, cardboard.enabled) { applyGameAlignment() }
+            androidx.compose.runtime.LaunchedEffect(gameFill, gameFillGamesChanged, SessionState.running, cardboard.enabled) { applyGameFill() }
             DroidDeckTheme {
             if (pipUi) {
                 if (SessionState.suspended) androidx.compose.foundation.layout.Box(
@@ -1282,6 +1294,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             onSteamVr = { action -> steamVrAction(action) },
             textureAnisotropy = if (drawerGameProfileId == null) textureAnisotropy else drawerTextureAnisotropy,
             textureLodBias = if (drawerGameProfileId == null) textureLodBias else drawerTextureLodBias,
+            gameFill = if (drawerGameProfileId == null) gameFill else drawerGameFill,
+            gameFillAvailable = SessionState.zeroCopy == true,
             frameGen = frameGen,
             lossless = lossless,
             oscMode = oscMode, suspendPolicy = suspendPolicy,
@@ -1333,6 +1347,16 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 } ?: value?.let {
                     SessionPrefs.setTextureLodBias(this@SessionActivity, it)
                     textureLodBias = it
+                }
+            },
+            onGameFill = { value ->
+                drawerGameProfileId?.let { appId ->
+                    SessionPrefs.setGameFillFor(this@SessionActivity, appId.toString(), value)
+                    drawerGameFill = value
+                    gameFillGamesChanged++
+                } ?: value?.let {
+                    SessionPrefs.setGameFill(this@SessionActivity, it)
+                    gameFill = SessionPrefs.gameFill(this@SessionActivity)
                 }
             },
             fpsLimit = fpsLimit,
@@ -1693,6 +1717,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         val choice = appId?.let { SessionPrefs.gameTextureFiltering(this, it.toString()) }
         drawerTextureAnisotropy = choice?.anisotropy
         drawerTextureLodBias = choice?.lodBias
+        drawerGameFill = appId?.let { SessionPrefs.gameFillFor(this, it.toString()) }
     }
 
     private fun refreshDrawerGameProfile() {
@@ -2011,6 +2036,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
         textureAnisotropy = SessionPrefs.textureAnisotropy(this)
         textureLodBias = SessionPrefs.textureLodBias(this)
+        gameFill = SessionPrefs.gameFill(this)
         val nextTouchMode = SessionPrefs.touchMode(this)
         if (touchMode != nextTouchMode) {
             if (::touchpad.isInitialized) touchpad.cancel()
@@ -3212,8 +3238,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         override fun moveBy(dx: Float, dy: Float, relative: Boolean) {
             val rect = (if (pointerLocked) drawnRect() else pointerSurfaceRect()) ?: return
             if (relative || pointerLocked) {
-                val scale = sceneScale(rect)
-                sendSceneDelta(dx * scale, dy * scale)
+                sendSceneDelta(dx * sceneScale(rect), dy * sceneScaleY(rect))
             } else moveTo(gesturePointerX + dx, gesturePointerY + dy)
         }
         override fun button(code: Int, down: Boolean) {
@@ -3358,8 +3383,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private fun moveLockedPointer(x: Float, y: Float) {
         val rect = drawnRect() ?: return
-        val scale = sceneScale(rect)
-        sendSceneDelta((x - rect.centerX()) * scale, (y - rect.centerY()) * scale)
+        sendSceneDelta((x - rect.centerX()) * sceneScale(rect), (y - rect.centerY()) * sceneScaleY(rect))
         touchpad.place(rect.centerX(), rect.centerY())
         cursorVisible = false
     }
@@ -3383,10 +3407,9 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         val position = cursorPos
         val x = if (position.x >= 0f) position.x.coerceIn(pointerRect.left, pointerRect.right) else pointerRect.centerX()
         val y = if (position.y >= 0f) position.y.coerceIn(pointerRect.top, pointerRect.bottom) else pointerRect.centerY()
-        val out = SessionState.outputSize
-        val nextX = (x + dx * pointerRect.width() / out.first)
+        val nextX = (x + dx / sceneScale(pointerRect))
             .coerceIn(pointerRect.left, pointerRect.right)
-        val nextY = (y + dy * pointerRect.height() / out.second)
+        val nextY = (y + dy / sceneScaleY(pointerRect, SessionState.outputSize.second / pointerRect.height()))
             .coerceIn(pointerRect.top, pointerRect.bottom)
         movePointer(nextX, nextY)
         // Make frame-callback updates visible to drawing before this frame's traversal.
@@ -3408,10 +3431,9 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             showCursor(mousePointerBuf[0], mousePointerBuf[1], fromMouse = true)
             return
         }
-        val scale = sceneScale(rect)
         showCursor(
-            (cursorPos.x + dx / scale).coerceIn(rect.left, rect.right),
-            (cursorPos.y + dy / scale).coerceIn(rect.top, rect.bottom),
+            (cursorPos.x + dx / sceneScale(rect)).coerceIn(rect.left, rect.right),
+            (cursorPos.y + dy / sceneScaleY(rect)).coerceIn(rect.top, rect.bottom),
             fromMouse = true,
         )
     }
@@ -4027,11 +4049,20 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         else -> if (usingTouchpad()) SessionPrefs.TOUCH_PAD else SessionPrefs.TOUCH_DIRECT
     }
 
-    private val gamePictureBounds = FloatArray(4)
+    private val gamePictureBounds = FloatArray(7)
     private var topPictureMapped = false
 
+    /** Scene px per view px across the picture. */
     private fun sceneScale(rect: android.graphics.RectF): Float =
-        SessionState.outputSize.first / rect.width()
+        (if (gameWindowCropped()) gamePictureBounds[4] else SessionState.outputSize.first.toFloat()) / rect.width()
+
+    /** The same down the picture: a game window stretched over the screen (game window fill) has its own. */
+    private fun sceneScaleY(rect: android.graphics.RectF, uncropped: Float = sceneScale(rect)): Float =
+        if (gameWindowCropped()) gamePictureBounds[5] / rect.height() else uncropped
+
+    /** The last drawnRect() came from a picture cropped to a game window (bounds 4, 5: the scene px it shows). */
+    private fun gameWindowCropped(): Boolean =
+        topPictureMapped && gamePictureBounds[6] > 0f && gamePictureBounds[4] > 0f && gamePictureBounds[5] > 0f
 
     // Clearing button owners emits releases, so backend transitions share their lock with all mouse writes.
     private fun openEvdevMouse(): Unit = synchronized(heldButtons) {
@@ -4093,8 +4124,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         lastMouseY = y
         val rect = drawnRect() ?: return
         if (previousX.isNaN() || previousY.isNaN()) return
-        val scale = sceneScale(rect)
-        sendSceneDelta((x - previousX) * scale, (y - previousY) * scale)
+        sendSceneDelta((x - previousX) * sceneScale(rect), (y - previousY) * sceneScaleY(rect))
     }
 
     private fun drawnRect(): android.graphics.RectF? {
@@ -4280,8 +4310,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (programLocksPointer() && event.actionMasked == MotionEvent.ACTION_MOVE) {
             if (lockedSwipeUsed) directTouchHold.cancelPendingHold() else directTouchHold.cancelTouch()
             lockedSwipeUsed = true
-            val scale = sceneScale(rect)
-            sendSceneDelta((event.x - swipeX) * scale, (event.y - swipeY) * scale)
+            sendSceneDelta((event.x - swipeX) * sceneScale(rect), (event.y - swipeY) * sceneScaleY(rect))
             return true
         }
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {

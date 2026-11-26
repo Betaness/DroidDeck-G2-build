@@ -45,6 +45,9 @@ add_library(droiddeckwayland SHARED
         src/zerofg_zc.c
         src/zerofg_pace.c
         src/pointer_sync.c
+        src/scene_map.c
+        src/game_fill.c
+        src/game_fill_server.c
 )
 target_compile_options(droiddeckwayland PRIVATE
         $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers>)

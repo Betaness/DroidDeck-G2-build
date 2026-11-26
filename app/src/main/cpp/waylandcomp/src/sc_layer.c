@@ -899,6 +899,25 @@ unavailable:
     return -1;
 }
 
+int sc_layer_vortek_remap(int slot, int buf_w, int buf_h, int x, int y, int w, int h, int scene_w, int scene_h,
+                          struct ASurfaceTransaction *batch) {
+    struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
+    int r[8];
+    if (!l || !l->sc || !l->shown || l->cur_slot >= 0 || !l->cur_token || buf_w <= 0 || buf_h <= 0 || w <= 0 ||
+        h <= 0 || load_api() != 0)
+        return -1;
+    if (vkp_update_map(scene_w, scene_h) != 0) return -1;
+    if (!vkp_map_window(buf_w, buf_h, x, y, w, h, scene_w, scene_h, r)) return 0;
+    ASurfaceTransaction *tx = batch ? batch : api.txCreate();
+    if (!tx) return -1;
+    apply_geometry(tx, l, r);
+    if (!batch) {
+        api.txApply(tx);
+        api.txDelete(tx);
+    }
+    return 1;
+}
+
 const void *sc_layer_vortek_surface(int slot, const char **name) {
     struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
     if (name) *name = l ? l->name : NULL;

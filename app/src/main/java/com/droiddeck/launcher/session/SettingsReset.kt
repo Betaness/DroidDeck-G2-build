@@ -18,7 +18,7 @@ object SettingsReset {
         "storesInstallLanguage",
         "hud", "hudDeck", "hudFps", "hudBattery", "hudGraph", "hudColor", "hudOpacity", "__KEEP_droidDeckHud__", "__KEEP_droidDeckHudPos__", "backHold", "backActionsInverted", "backDoubleTapMs", "touch", "osc", "shape", "steamController",
         "gamepadLeft", "gamepadRight", "pipAutoEnter", "unfoldedControls", "unfoldedControlsWithController",
-        "stretch16x9", "picturePosition", "railLabels", "pcKeyboardSize", "pcKeyboardOpacity", "pcKeyboardHiddenKeys",
+        "stretch16x9", "picturePosition", "gameFill", "railLabels", "pcKeyboardSize", "pcKeyboardOpacity", "pcKeyboardHiddenKeys",
         "gpuDriverMode", "androidDriver", "linuxDriver", "linuxDriver.steam", "linuxDriver.desktop",
         "tuSysmem", "glThread", "noGlError", "zinkLazy", "mangoapp", "gpuClockPin", "gamescopeRealtime", "ramCapMb", "vramCapMb", "zramClient",
         "directAudio", "mic", "wifiDiscovery", "clientCpusOverride", "clientCpus", "gameCpus",
@@ -54,13 +54,13 @@ object SettingsReset {
 
         if (gameProfiles) {
             val scopes = (gameScopes + runCatching { GameEnvironmentStore.read(context).games.keys }.getOrDefault(emptySet()) +
-                SessionPrefs.gameTextureFiltering(context).keys)
+                SessionPrefs.gameTextureFiltering(context).keys + SessionPrefs.gameFillGames(context).keys)
                 .filter { it.isNotEmpty() && GameEnvironment.validScope(it) }.toSet()
             scopes.forEach { scope ->
                 runCatching { GameProfileManager.reset(context, scope) }
                     .onFailure { ok = false; Log.w(TAG, "Could not reset the profile of $scope", it) }
             }
-            session.edit().remove("gameTextureFiltering").commit()
+            session.edit().remove("gameTextureFiltering").remove("gameFillGames").commit()
             runCatching { GameEnvironmentStore.save(context, GameEnvironmentStore.read(context).copy(shared = emptyMap())) }
                 .onFailure { ok = false; Log.w(TAG, "Could not clear the Default profile's environment", it) }
         }

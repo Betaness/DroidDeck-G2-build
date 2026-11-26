@@ -19,6 +19,7 @@
 #include "cardboard.h"
 #include "droiddeck_color.h"
 #include "gpu_clock_pin.h"
+#include "game_fill_server.h"
 
 extern int droiddeck_wayland_run(void);
 extern uint64_t droiddeck_screen_frames(void);
@@ -471,13 +472,36 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetScaleMode(JNIEnv 
 }
 
 
+/* out: left, top, right, bottom; with 7 or more slots also the scene px shown (width, height) and 1 when
+ * cropped to a game window. */
 JNIEXPORT jboolean JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeGamePictureRect(JNIEnv *env, jclass clazz, jfloatArray out) {
     if (!out || (*env)->GetArrayLength(env, out) < 4) return JNI_FALSE;
-    float rect[4];
-    if (!vkp_game_picture_rect(rect)) return JNI_FALSE;
-    (*env)->SetFloatArrayRegion(env, out, 0, 4, rect);
+    float v[7] = {0};
+    int cropped = 0;
+    if (!vkp_game_picture_rect(v, v + 4, &cropped)) return JNI_FALSE;
+    v[6] = cropped ? 1.0f : 0.0f;
+    (*env)->SetFloatArrayRegion(env, out, 0, (*env)->GetArrayLength(env, out) >= 7 ? 7 : 4, v);
     return JNI_TRUE;
+}
+
+/* [mali-g2] Game window fill (game_fill.h): the default mode and the games with their own. */
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetGameFill(JNIEnv *env, jclass clazz, jint mode,
+                                                                        jintArray apps, jintArray modes) {
+    (void)clazz;
+    const jsize n = apps && modes ? (*env)->GetArrayLength(env, apps) : 0;
+    if (n > 0 && (*env)->GetArrayLength(env, modes) != n) return;
+    jint *a = n > 0 ? (*env)->GetIntArrayElements(env, apps, NULL) : NULL;
+    jint *m = n > 0 ? (*env)->GetIntArrayElements(env, modes, NULL) : NULL;
+    if (n > 0 && (!a || !m)) {
+        if (a) (*env)->ReleaseIntArrayElements(env, apps, a, JNI_ABORT);
+        if (m) (*env)->ReleaseIntArrayElements(env, modes, m, JNI_ABORT);
+        return;
+    }
+    game_fill_set_modes(mode, (const uint32_t *)a, (const int *)m, (int)n);
+    if (a) (*env)->ReleaseIntArrayElements(env, apps, a, JNI_ABORT);
+    if (m) (*env)->ReleaseIntArrayElements(env, modes, m, JNI_ABORT);
 }
 
 JNIEXPORT void JNICALL

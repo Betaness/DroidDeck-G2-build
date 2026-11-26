@@ -2859,6 +2859,8 @@
     <string name="stores_hltb_hours">%1$s t</string>
     <string name="stores_hltb_minutes">%1$d min</string>
     <string name="display_picture_position">Bildets posisjon</string>
+    <string name="game_fill_title">Spillvindu</string>
+    <string name="game_fill_hint">Et spillvindu som er mindre enn skjermen, fyller den. Det rundt, for eksempel Steam, skjules.</string>
     <string name="display_position_top">Øverst</string>
     <string name="display_position_bottom">Nederst</string>
     <string name="display_position_center">Midten (standard)</string>

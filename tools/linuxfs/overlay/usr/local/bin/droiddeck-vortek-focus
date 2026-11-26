@@ -37,10 +37,17 @@ gamescope finds it, from Proton's WM_CLASS or the SteamLaunch process they desce
 Steam suspends a session it takes for idle, judging by GAMESCOPE_INPUT_COUNTER, which gamescope bumps
 on input. Touch and keys go to the game's window here, so the counter is bumped when the X server's
 idle time shows input since the last look.
+
+gamescope also scales the focused game's window to the screen. Here the app's compositor does that
+(game window fill): after each look at the windows they go to it, with their place, app, WM_CLASS
+and stacking, the focused one and whether a Steam menu is open, and it picks the game window.
 """
 import ctypes as c
+import os
 import re
 import select
+import socket
+import struct
 import sys
 import time
 
@@ -53,6 +60,12 @@ CLIENT_MESSAGE, MAP_NOTIFY, UNMAP_NOTIFY, PROPERTY_NOTIFY, CONFIGURE_NOTIFY = 33
 WITHDRAWN, NORMAL, ICONIC = 0, 1, 3
 PROPERTY_CHANGE, SUBSTRUCTURE_NOTIFY, STRUCTURE_NOTIFY = 1 << 22, 1 << 19, 1 << 17
 WS_DISABLED, WS_EX_TOOLWINDOW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE = 0x08000000, 0x80, 0x40000, 0x08000000
+# The compositor's window reports (game_fill.h in the app), little endian: a header of 7 u32 and per
+# window u32 id, u32 app, i32 x, y, width, height, u32 flags and FILL_CLASS bytes of WM_CLASS.
+FILL_SOCKET = 'droiddeck-game-fill'
+FILL_MAGIC, FILL_VERSION, FILL_MAX, FILL_CLASS = 0x46474444, 1, 24, 32
+FILL_OVERRIDE, FILL_INERT, FILL_MENU = 1, 2, 1
+FILL_RETRY_S = 5.0
 
 
 class X:
@@ -210,6 +223,62 @@ def idle_clock(x):
     except (OSError, AttributeError):
         pass
     return None, None
+
+
+class FillReport:
+    """The windows on the X screen, for the compositor's game window fill: one SOCK_SEQPACKET message
+    per change over $XDG_RUNTIME_DIR/droiddeck-game-fill. Without the socket nothing is sent."""
+
+    def __init__(self):
+        self.path = os.path.join(os.environ.get('XDG_RUNTIME_DIR') or '/run/droiddeck', FILL_SOCKET)
+        self.sock = None
+        self.tried = None
+        self.sent = None
+        self.said = None
+
+    @staticmethod
+    def encode(root_w, root_h, focus, menu, windows):
+        """windows: (id, app, x, y, width, height, flags, WM_CLASS), bottom to top; the top FILL_MAX go."""
+        windows = windows[-FILL_MAX:]
+        parts = [struct.pack('<7I', FILL_MAGIC, FILL_VERSION, root_w, root_h, focus & 0xffffffff,
+                             FILL_MENU if menu else 0, len(windows))]
+        for w, app, x, y, width, height, flags, cls in windows:
+            parts.append(struct.pack('<2I4iI%ds' % FILL_CLASS, w & 0xffffffff, app & 0xffffffff, x, y, width, height,
+                                     flags, cls[:FILL_CLASS - 1]))
+        return b''.join(parts)
+
+    def connect(self):
+        now = time.monotonic()
+        if self.tried is not None and now - self.tried < FILL_RETRY_S:
+            return False
+        self.tried = now
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
+        try:
+            s.settimeout(1.0)
+            s.connect(self.path)
+            s.setblocking(False)
+        except OSError as e:
+            s.close()
+            if self.said != e.errno:
+                self.said = e.errno
+                print('droiddeck-vortek-focus: no game window fill (%s: %s)' % (self.path, e.strerror), flush=True)
+            return False
+        self.sock, self.said = s, None
+        print('droiddeck-vortek-focus: reporting windows to %s for the game window fill' % self.path, flush=True)
+        return True
+
+    def send(self, data):
+        if data == self.sent or not self.sock and not self.connect():
+            return
+        try:
+            self.sock.send(data)
+            self.sent = data
+        except BlockingIOError:
+            self.sent = None
+        except OSError as e:
+            print('droiddeck-vortek-focus: window reports stopped: %s' % e, flush=True)
+            self.sock.close()
+            self.sock, self.sent = None, None
 
 
 def parent_pid(pid):
@@ -377,6 +446,14 @@ def main():
         print('droiddeck-vortek-focus: window 0x%x %dx%d moved from %d,%d to the corner'
               % (w, a.width, a.height, a.x, a.y), flush=True)
 
+    fill = FillReport()
+    classes = {}  # window -> its WM_CLASS as instance/class, for the window reports
+
+    def wm_class(w):
+        if w not in classes:
+            classes[w] = b'/'.join([p for p in x.text(w, 'WM_CLASS').split(b'\0') if p][:2])
+        return classes[w]
+
     tags = {}  # window -> (app, pid), read once the client has tagged it
     launches = {}  # pid -> app of its SteamLaunch ancestor, 0 without one
 
@@ -408,6 +485,7 @@ def main():
     stack = []
     # Properties a scan reads; titles and the like change often and need none.
     scan_atoms = style_atoms + tuple(x.atom(n) for n in ('STEAM_GAME', '_NET_WM_PID', 'WM_CLASS'))
+    class_atom = x.atom('WM_CLASS')
     scanned, busy = 0.0, True
     idle_source, idle_ms = idle_clock(x)
     checked, last_idle = time.monotonic(), idle_ms() if idle_ms else None
@@ -436,6 +514,8 @@ def main():
             if kind == PROPERTY_NOTIFY:
                 if event[5] in style_atoms:
                     styles.pop(event[4], None)
+                if event[5] == class_atom:
+                    classes.pop(event[4], None)
                 busy = busy or event[5] in scan_atoms
                 continue
             busy = True
@@ -491,11 +571,15 @@ def main():
 
         # Bottom to top: mapped, managed top-level windows with their app and pid.
         stack = []
+        placed = []  # (window, x, y, width, height, override-redirect) of every mapped one, bottom to top
         inert.clear()
         skipped.clear()
         for w in x.children(x.root):
             a = attrs(w)
-            if not a or a.map_state != 2 or a.override_redirect or (a.width <= 1 and a.height <= 1):
+            if not a or a.map_state != 2 or (a.width <= 1 and a.height <= 1):
+                continue
+            placed.append((w, a.x, a.y, a.width, a.height, bool(a.override_redirect)))
+            if a.override_redirect:
                 continue
             if w not in tags and w not in watched and w not in saved:
                 # First sight of this window: a client may set the state itself before mapping.
@@ -531,10 +615,13 @@ def main():
             del saved[w]
         for w in set(moved) - {e[0] for e in stack}:
             del moved[w]
+        for w in set(classes) - {e[0] for e in placed}:
+            del classes[w]
         steam = next((w for w, app, _ in stack if app == STEAM_APP), 0)
         steam_index = next((i for i, (w, _, _) in enumerate(stack) if w == steam), -1)
+        menu = bool(steam) and menu_open(steam)
 
-        if steam and menu_open(steam):
+        if menu:
             above = [w for w, _, _ in stack[steam_index + 1:]]
             if above:
                 # Remember what was over Steam, also windows that map while the menu is open.
@@ -576,6 +663,11 @@ def main():
             if restore is None:
                 activate(top[0], raise_=top is stack[-1])
             last_focus = (top[0], top[1])
+        app_of = {w: app for w, app, _ in stack}
+        fill.send(FillReport.encode(root_attrs.width, root_attrs.height, top[0] if top else 0, menu, [
+            (w, 0 if override else app_of.get(w, 0), wx, wy, ww, wh,
+             (FILL_OVERRIDE if override else 0) | (FILL_INERT if w in inert else 0), wm_class(w))
+            for w, wx, wy, ww, wh, override in placed]))
 
 
 if __name__ == '__main__':

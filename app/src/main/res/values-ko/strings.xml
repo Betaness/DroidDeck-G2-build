@@ -2830,6 +2830,8 @@
     <string name="drawer_component_downloads_hint">다운로드는 구성 요소 페이지와 공유됩니다. 위에서 다운로드한 버전을 선택하면 다음 게임 실행 시 사용됩니다.</string>
     <string name="drawer_component_choose_download">다운로드할 버전 선택</string>
     <string name="display_picture_position">화면 위치</string>
+    <string name="game_fill_title">게임 창</string>
+    <string name="game_fill_hint">화면보다 작은 게임 창을 화면 전체에 표시합니다. Steam 등 주변의 창은 가려집니다.</string>
     <string name="display_position_top">위</string>
     <string name="display_position_bottom">아래</string>
     <string name="display_position_center">가운데(기본)</string>

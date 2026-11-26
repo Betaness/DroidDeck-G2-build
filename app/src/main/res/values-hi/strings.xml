@@ -2859,6 +2859,8 @@
     <string name="stores_hltb_hours">%1$s घं</string>
     <string name="stores_hltb_minutes">%1$d मि</string>
     <string name="display_picture_position">चित्र की स्थिति</string>
+    <string name="game_fill_title">गेम विंडो</string>
+    <string name="game_fill_hint">स्क्रीन से छोटी गेम विंडो पूरी स्क्रीन भर देती है। उसके आसपास की चीज़ें, जैसे Steam, छिपा दी जाती हैं।</string>
     <string name="display_position_top">ऊपर</string>
     <string name="display_position_bottom">नीचे</string>
     <string name="display_position_center">बीच में (डिफ़ॉल्ट)</string>

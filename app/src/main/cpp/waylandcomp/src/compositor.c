@@ -24,6 +24,7 @@
 #include "sc_layer.h"
 #include "ahb_swapchain.h"
 #include "vortek_present.h"
+#include "game_fill_server.h"
 #include "zerofg_zc.h"
 #include "vortek_upscale.h"
 #include "viewporter-server-protocol.h"
@@ -780,6 +781,7 @@ static int shm_damage_rects(struct surface *s, int w, int h) {
 }
 
 static void scene_size(int *w, int *h);
+static void clamp_shown(int w, int h, double *x, double *y);
 static int64_t damage_area(const struct damage_list *d, int bound_w, int bound_h);
 static struct surface *g_hud_surface, *g_hud_shm;
 static int64_t g_hud_shm_ns;
@@ -3265,10 +3267,7 @@ static void pointer_input(double x, double y, int relative, uint32_t button, int
             int w, h;
             scene_size(&w, &h);
             x = g_ptr_x + dx; y = g_ptr_y + dy;
-            if (x < 0) x = 0;
-            if (y < 0) y = 0;
-            if (x > w - 1) x = w - 1;
-            if (y > h - 1) y = h - 1;
+            clamp_shown(w, h, &x, &y);
         }
         if (k) confine_clamp(k, &x, &y);
         g_ptr_x = x; g_ptr_y = y;
@@ -3371,21 +3370,34 @@ static void pointer_button(uint32_t button, int pressed) {
     wl_display_flush_clients(g_display);
 }
 
-static void deliver_pointer(const struct input_msg *m) {
-    int w, h, ow, oh;
-    double x, y;
-    scene_size(&w, &h);
-    vkp_output_size(&ow, &oh);
-    if (ow <= 0 || oh <= 0 ||
-        !vkp_output_to_scene((double)m->p2 * ow / INPUT_SPACE_W, (double)m->p3 * oh / INPUT_SPACE_H, &x, &y)) {
-        x = (double)m->p2 * w / INPUT_SPACE_W;
-        y = (double)m->p3 * h / INPUT_SPACE_H;
+/* The part of the scene on the output, inclusive scene px: all of it, or the game window the game window
+ * fill crops to (the pointer stays where it can be seen). */
+static void shown_box(int w, int h, double b[4]) {
+    int r[4];
+    b[0] = 0;
+    b[1] = 0;
+    b[2] = w - 1;
+    b[3] = h - 1;
+    if (!vkp_scene_shown_rect(r) || r[2] <= r[0] || r[3] <= r[1]) return;
+    if (r[0] > b[0]) b[0] = r[0];
+    if (r[1] > b[1]) b[1] = r[1];
+    if (r[2] - 1 < b[2]) b[2] = r[2] - 1;
+    if (r[3] - 1 < b[3]) b[3] = r[3] - 1;
+    if (b[2] < b[0] || b[3] < b[1]) {
+        b[0] = 0;
+        b[1] = 0;
+        b[2] = w - 1;
+        b[3] = h - 1;
     }
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (x > w - 1) x = w - 1;
-    if (y > h - 1) y = h - 1;
-    pointer_event(x, y, m->p1 == 1 ? 0 : BTN_LEFT, m->p1 == 0);
+}
+
+static void clamp_shown(int w, int h, double *x, double *y) {
+    double b[4];
+    shown_box(w, h, b);
+    if (*x < b[0]) *x = b[0];
+    if (*y < b[1]) *y = b[1];
+    if (*x > b[2]) *x = b[2];
+    if (*y > b[3]) *y = b[3];
 }
 
 static void input_output_to_scene(int px, int py, double *x, double *y) {
@@ -3397,10 +3409,13 @@ static void input_output_to_scene(int px, int py, double *x, double *y) {
         *x = (double)px * w / INPUT_SPACE_W;
         *y = (double)py * h / INPUT_SPACE_H;
     }
-    if (*x < 0) *x = 0;
-    if (*y < 0) *y = 0;
-    if (*x > w - 1) *x = w - 1;
-    if (*y > h - 1) *y = h - 1;
+    clamp_shown(w, h, x, y);
+}
+
+static void deliver_pointer(const struct input_msg *m) {
+    double x, y;
+    input_output_to_scene(m->p2, m->p3, &x, &y);
+    pointer_event(x, y, m->p1 == 1 ? 0 : BTN_LEFT, m->p1 == 0);
 }
 
 static int touch_points_for_client(struct wl_client *client) {
@@ -3504,8 +3519,7 @@ static void publish_query_state(void) {
         }
         int shown = ow > 0 && oh > 0 && vkp_scene_to_output(0, 0, &o0x, &o0y) && vkp_scene_to_output(1, 1, &o1x, &o1y);
         ptrsync_scene_map(shown, o0x, o0y, o1x, o1y, ow, oh, w, h, map);
-        box[2] = w - 1;
-        box[3] = h - 1;
+        shown_box(w, h, box);
         if (g_active_constraint && !g_active_constraint->is_lock) confine_box(g_active_constraint, box);
         has_position = 1;
     }
@@ -3835,6 +3849,13 @@ static int on_input_readable(int fd, uint32_t mask, void *data) {
     }
     if (vsync) on_vsync(vsync_ns);
     return 0;
+}
+
+/* The output mapping changed outside a frame (game window fill): the published pointer mapping follows
+ * and the scene is drawn again. Compositor thread. */
+void droiddeck_scene_map_changed(void) {
+    publish_query_state();
+    schedule_render();
 }
 
 void droiddeck_wayland_set_scale_mode(int mode, int alignment) {
@@ -4189,6 +4210,7 @@ int droiddeck_wayland_run(void) {
     droiddeck_ext_init(display);
     ahb_swapchain_init(display);
     vortek_present_init(wl_display_get_event_loop(display));
+    game_fill_init(wl_display_get_event_loop(display));
 
 
     droiddeck_color_init(display);
