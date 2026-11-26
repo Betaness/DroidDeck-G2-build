@@ -509,7 +509,9 @@ int vkp_scene_to_output(double sx, double sy, double *ox, double *oy) {
 }
 
 /* The size the effects chain renders the scene at: as mapped, but no larger than the output when only
- * a part of the scene is shown (the rest is cut off). */
+ * a part of the scene is shown (the rest is cut off). The chain still takes the whole scene, so on the
+ * copy path a cropped game window gets no detail from a scaling filter: the screen blit enlarges it.
+ * Zero-copy windows are filtered at their crop (vortek_upscale.c). */
 static void mapped_scene_size(int scene_w, int scene_h, int *mw, int *mh) {
     *mw = (int)(scene_w * g_map.kx + 0.5f);
     *mh = (int)(scene_h * g_map.ky + 0.5f);

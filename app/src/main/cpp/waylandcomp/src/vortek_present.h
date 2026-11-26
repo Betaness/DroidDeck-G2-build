@@ -42,6 +42,8 @@ unsigned vortek_present_stats_take(void);
  * where their windows are now on the screen; those with nothing left on it are hidden. Layers showing
  * an upscaled or generated frame follow with their next frame. */
 void vortek_present_remap(void);
+/* The top-level X windows shown zero-copy now (from the presenters' reports), at most max. */
+int vortek_present_toplevels(uint32_t *out, int max);
 /* From sc_layer's transaction-complete callback (a binder thread). */
 void vortek_present_released(void *token, int release_fd);
 /* VP_MSG_RELEASE for a game image with its release fence (consumed; -1: none). Any thread. */

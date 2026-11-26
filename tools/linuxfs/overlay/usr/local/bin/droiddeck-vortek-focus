@@ -39,8 +39,8 @@ on input. Touch and keys go to the game's window here, so the counter is bumped 
 idle time shows input since the last look.
 
 gamescope also scales the focused game's window to the screen. Here the app's compositor does that
-(game window fill): after each look at the windows they go to it, with their place, app, WM_CLASS
-and stacking, the focused one and whether a Steam menu is open, and it picks the game window.
+(game window fill): after each look at the windows they go to it, with their place, app, WM_CLASS,
+owner, type and stacking, the focused one and whether a Steam menu is open, and it picks the game window.
 """
 import ctypes as c
 import os
@@ -64,7 +64,10 @@ WS_DISABLED, WS_EX_TOOLWINDOW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE = 0x08000000, 0
 # window u32 id, u32 app, i32 x, y, width, height, u32 flags and FILL_CLASS bytes of WM_CLASS.
 FILL_SOCKET = 'droiddeck-game-fill'
 FILL_MAGIC, FILL_VERSION, FILL_MAX, FILL_CLASS = 0x46474444, 1, 24, 32
-FILL_OVERRIDE, FILL_INERT, FILL_MENU = 1, 2, 1
+FILL_OVERRIDE, FILL_INERT, FILL_TRANSIENT, FILL_DIALOG, FILL_MENU = 1, 2, 4, 8, 1
+# Window types that are never the game's main window.
+FILL_DIALOG_TYPES = ('DIALOG', 'UTILITY', 'SPLASH', 'TOOLBAR', 'MENU', 'DROPDOWN_MENU', 'POPUP_MENU', 'TOOLTIP',
+                     'NOTIFICATION')
 FILL_RETRY_S = 5.0
 
 
@@ -448,11 +451,19 @@ def main():
 
     fill = FillReport()
     classes = {}  # window -> its WM_CLASS as instance/class, for the window reports
+    kinds = {}  # window -> FILL_TRANSIENT and FILL_DIALOG, for the window reports
+    dialog_types = {x.atom('_NET_WM_WINDOW_TYPE_' + n) for n in FILL_DIALOG_TYPES}
 
     def wm_class(w):
         if w not in classes:
             classes[w] = b'/'.join([p for p in x.text(w, 'WM_CLASS').split(b'\0') if p][:2])
         return classes[w]
+
+    def window_kind(w):
+        if w not in kinds:
+            kinds[w] = (FILL_TRANSIENT if x.cardinals(w, 'WM_TRANSIENT_FOR') else 0) | \
+                (FILL_DIALOG if dialog_types & set(x.cardinals(w, '_NET_WM_WINDOW_TYPE')) else 0)
+        return kinds[w]
 
     tags = {}  # window -> (app, pid), read once the client has tagged it
     launches = {}  # pid -> app of its SteamLaunch ancestor, 0 without one
@@ -484,7 +495,8 @@ def main():
     last_lists = None
     stack = []
     # Properties a scan reads; titles and the like change often and need none.
-    scan_atoms = style_atoms + tuple(x.atom(n) for n in ('STEAM_GAME', '_NET_WM_PID', 'WM_CLASS'))
+    kind_atoms = (x.atom('WM_TRANSIENT_FOR'), x.atom('_NET_WM_WINDOW_TYPE'))
+    scan_atoms = style_atoms + kind_atoms + tuple(x.atom(n) for n in ('STEAM_GAME', '_NET_WM_PID', 'WM_CLASS'))
     class_atom = x.atom('WM_CLASS')
     scanned, busy = 0.0, True
     idle_source, idle_ms = idle_clock(x)
@@ -516,6 +528,8 @@ def main():
                     styles.pop(event[4], None)
                 if event[5] == class_atom:
                     classes.pop(event[4], None)
+                if event[5] in kind_atoms:
+                    kinds.pop(event[4], None)
                 busy = busy or event[5] in scan_atoms
                 continue
             busy = True
@@ -617,6 +631,8 @@ def main():
             del moved[w]
         for w in set(classes) - {e[0] for e in placed}:
             del classes[w]
+        for w in set(kinds) - {e[0] for e in placed}:
+            del kinds[w]
         steam = next((w for w, app, _ in stack if app == STEAM_APP), 0)
         steam_index = next((i for i, (w, _, _) in enumerate(stack) if w == steam), -1)
         menu = bool(steam) and menu_open(steam)
@@ -666,7 +682,7 @@ def main():
         app_of = {w: app for w, app, _ in stack}
         fill.send(FillReport.encode(root_attrs.width, root_attrs.height, top[0] if top else 0, menu, [
             (w, 0 if override else app_of.get(w, 0), wx, wy, ww, wh,
-             (FILL_OVERRIDE if override else 0) | (FILL_INERT if w in inert else 0), wm_class(w))
+             FILL_OVERRIDE if override else (FILL_INERT if w in inert else 0) | window_kind(w), wm_class(w))
             for w, wx, wy, ww, wh, override in placed]))
 
 

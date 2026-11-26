@@ -573,8 +573,11 @@ object SessionPrefs {
     }
 
     /** [mali-g2] Game window fill for every game without a setting of its own (GameFill). */
-    fun gameFill(context: Context): String =
-        GameFill.normalize(prefs(context).getString("gameFill", null)) ?: GameFill.DEFAULT
+    fun gameFill(context: Context): String {
+        val prefs = prefs(context)
+        GameFill.normalize(prefs.getString("gameFill", null))?.let { return it }
+        return GameFill.fromStretch16x9(if (prefs.contains("stretch16x9")) prefs.getBoolean("stretch16x9", false) else null)
+    }
 
     fun setGameFill(context: Context, choice: String) {
         prefs(context).edit().putString("gameFill", GameFill.normalize(choice) ?: GameFill.DEFAULT).apply()

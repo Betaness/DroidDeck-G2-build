@@ -43,3 +43,17 @@ int ptrsync_confine_box(int ox, int oy, int w, int h, int region_set, int rx, in
     box[3] = oy + y1 - 1;
     return 1;
 }
+
+void ptrsync_box_within(const double box[4], const double within[4], double out[4]) {
+    double r[4];
+    for (int a = 0; a < 2; a++) {
+        const double b0 = box[a], b1 = box[a + 2], w0 = within[a], w1 = within[a + 2];
+        if (b1 < w0) r[a] = r[a + 2] = w0;
+        else if (b0 > w1) r[a] = r[a + 2] = w1;
+        else {
+            r[a] = b0 > w0 ? b0 : w0;
+            r[a + 2] = b1 < w1 ? b1 : w1;
+        }
+    }
+    for (int i = 0; i < 4; i++) out[i] = r[i];
+}

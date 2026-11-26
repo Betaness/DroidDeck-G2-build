@@ -38,6 +38,19 @@ class GameFillTest {
         assertEquals(GameFill.STRETCH, SessionPrefs.gameFill(context))
     }
 
+    @Test fun anExplicitKeepProportionsFromThe16x9FitBecomesKeepAspect() {
+        session.edit().putBoolean("stretch16x9", false).commit()
+        assertEquals(GameFill.ASPECT, SessionPrefs.gameFill(context))
+        session.edit().putBoolean("stretch16x9", true).commit()
+        assertEquals(GameFill.STRETCH, SessionPrefs.gameFill(context))
+        session.edit().putBoolean("stretch16x9", false).commit()
+        SessionPrefs.setGameFill(context, GameFill.OFF)
+        assertEquals(GameFill.OFF, SessionPrefs.gameFill(context))
+        assertEquals(GameFill.ASPECT, GameFill.fromStretch16x9(false))
+        assertEquals(GameFill.STRETCH, GameFill.fromStretch16x9(true))
+        assertEquals(GameFill.STRETCH, GameFill.fromStretch16x9(null))
+    }
+
     @Test fun gamesHaveTheirOwnUntilItIsCleared() {
         SessionPrefs.setGameFillFor(context, "2074800", GameFill.OFF)
         SessionPrefs.setGameFillFor(context, "440", GameFill.ASPECT)

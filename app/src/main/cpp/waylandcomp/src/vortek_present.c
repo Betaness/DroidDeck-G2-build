@@ -467,6 +467,13 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
     }
 }
 
+int vortek_present_toplevels(uint32_t *out, int max) {
+    int n = 0;
+    for (int i = 0; i < VP_LAYERS && n < max; i++)
+        if (g_show[i].chain && g_show[i].toplevel) out[n++] = g_show[i].toplevel;
+    return n;
+}
+
 void vortek_present_remap(void) {
     for (int i = 0; i < VP_LAYERS; i++) {
         if (!g_show[i].chain) continue;

@@ -16,14 +16,16 @@
 
 /* Report wire format, little endian, one SOCK_SEQPACKET message per report: a header of 7 u32 (magic,
  * version, root width, root height, focused window, flags, window count) and per window, bottom to top,
- * u32 id, u32 Steam app (0: none), i32 x, y, width, height, u32 flags and GF_CLASS_LEN bytes of
- * WM_CLASS ("instance/class", NUL padded). */
+ * u32 id, u32 Steam app (0: none), i32 x, y, width, height, u32 flags (GF_WIN_*) and GF_CLASS_LEN bytes
+ * of WM_CLASS ("instance/class", NUL padded). */
 #define GF_MAGIC 0x46474444u /* "DDGF" */
 #define GF_VERSION 1u
 #define GF_HEADER_BYTES 28
 #define GF_WINDOW_BYTES (28 + GF_CLASS_LEN)
 
-enum { GF_WIN_OVERRIDE = 1u, GF_WIN_INERT = 2u };
+/* OVERRIDE: override-redirect; INERT: Wine will not activate it; TRANSIENT: has WM_TRANSIENT_FOR;
+ * DIALOG: a _NET_WM_WINDOW_TYPE other than normal (dialog, utility, splash, menus, ...). */
+enum { GF_WIN_OVERRIDE = 1u, GF_WIN_INERT = 2u, GF_WIN_TRANSIENT = 4u, GF_WIN_DIALOG = 8u };
 enum { GF_REPORT_STEAM_MENU = 1u };
 enum { GF_MODE_OFF = 0, GF_MODE_STRETCH = 1, GF_MODE_ASPECT = 2 };
 
@@ -34,11 +36,11 @@ enum { GF_MODE_OFF = 0, GF_MODE_STRETCH = 1, GF_MODE_ASPECT = 2 };
 #define GF_KEEP_PERMILLE 250
 #define GF_MIN_W 640
 #define GF_MIN_H 360
-/* A new or changed window rectangle is applied once it has stayed GF_SETTLE_MS; the crop goes away
- * GF_LEAVE_MS after the game window does (at once when Steam comes in front, the game window covers
- * the screen, the option is off or the reports stop). Edges that move by up to GF_SLOP px are kept. */
+/* A new window, or a new rectangle of the window cropped to, is applied once it has stayed GF_SETTLE_MS
+ * (the old rectangle of the same window stays meanwhile); the window and place cropped to last come back
+ * at once. A crop whose window is no longer the one picked goes at once. Edges that move by up to
+ * GF_SLOP px are kept. */
 #define GF_SETTLE_MS 500
-#define GF_LEAVE_MS 300
 #define GF_SLOP 2
 
 struct gf_window {
@@ -82,8 +84,6 @@ struct gf_state {
     int pending;
     struct gf_choice pend;
     int64_t pend_ns;
-    int leaving;
-    int64_t leave_ns;
 };
 
 /* 0, or -1 for a malformed report. */
@@ -91,10 +91,12 @@ int gf_decode(const void *buf, size_t len, struct gf_report *out);
 
 int gf_big_enough(int w, int h, int root_w, int root_h, int kept);
 
-/* The game window to crop to: the focused window when it is a game's and big enough, else the topmost
- * big enough window of the focused window's game. `keep`: the window cropped to now (0: none).
- * out->mode is GF_MODE_STRETCH; the caller sets the game's mode. */
-void gf_pick(const struct gf_report *r, uint32_t keep, struct gf_choice *out);
+/* The game window to crop to: the main window of the focused window's game, that is of its managed
+ * top-level windows without WM_TRANSIENT_FOR or a dialog-like type and big enough, one with a zero-copy
+ * swapchain (`presenting`: top-level windows, n_presenting of them), else the largest. `keep`: the window
+ * cropped to now (0: none). out->mode is GF_MODE_STRETCH; the caller sets the game's mode. */
+void gf_pick(const struct gf_report *r, uint32_t keep, const uint32_t *presenting, int n_presenting,
+             struct gf_choice *out);
 
 /* The option for `app`: its entry in apps/modes, else default_mode. */
 int gf_mode_for(int default_mode, const uint32_t *apps, const int *modes, int n, uint32_t app);

@@ -31,4 +31,9 @@ int ptrsync_scene_map(int shown, double o0x, double o0y, double o1x, double o1y,
  * that is empty. */
 int ptrsync_confine_box(int ox, int oy, int w, int h, int region_set, int rx, int ry, int rw, int rh, double box[4]);
 
+/* The box the pointer stays in when it is clamped into box and then into within, as pointer_input does
+ * (the shown part of the scene, then a confined pointer's box), x0, y0, x1, y1 inclusive: per direction
+ * their overlap, or within's edge nearest box when they do not overlap. out may be box or within. */
+void ptrsync_box_within(const double box[4], const double within[4], double out[4]);
+
 #endif

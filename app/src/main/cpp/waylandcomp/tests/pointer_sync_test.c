@@ -81,7 +81,44 @@ static void confine(void) {
     CHECK(!ptrsync_confine_box(0, 0, 0, 600, 0, 0, 0, 0, 0, b), "no window size: no box");
 }
 
+static double clamp(double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+/* Clamping into the shown box and then into the confine box ends inside the published box, at the
+ * same point as clamping into the published box. */
+static void box_within(void) {
+    const double shown[4] = {0, 0, 3407, 1916};
+    const double confines[][4] = {
+        {100, 100, 899, 599},       /* inside */
+        {3000, 1500, 3600, 2271},   /* across the crop's edges */
+        {0, 2000, 3407, 2271},      /* below it: no overlap */
+        {-200, -100, -10, 400},     /* left of it */
+        {0, 0, 3407, 2271},         /* the whole scene */
+    };
+    for (unsigned k = 0; k < sizeof(confines) / sizeof(confines[0]); k++) {
+        double out[4];
+        ptrsync_box_within(shown, confines[k], out);
+        CHECK(out[0] <= out[2] && out[1] <= out[3], "box %u is not empty", k);
+        for (double x = -400; x <= 3800; x += 97)
+            for (double y = -300; y <= 2600; y += 89) {
+                const double cx = clamp(clamp(x, shown[0], shown[2]), confines[k][0], confines[k][2]);
+                const double cy = clamp(clamp(y, shown[1], shown[3]), confines[k][1], confines[k][3]);
+                CHECK(near(cx, clamp(x, out[0], out[2])) && near(cy, clamp(y, out[1], out[3])),
+                      "box %u: %.0f,%.0f clamps to %.0f,%.0f, the box gives %.0f,%.0f", k, x, y, cx, cy,
+                      clamp(x, out[0], out[2]), clamp(y, out[1], out[3]));
+            }
+    }
+    double out[4];
+    ptrsync_box_within(shown, confines[1], out);
+    CHECK(near(out[0], 3000) && near(out[1], 1500) && near(out[2], 3407) && near(out[3], 1916), "overlap");
+    ptrsync_box_within(shown, confines[2], out);
+    CHECK(near(out[1], 2000) && near(out[3], 2000), "below: the confine box's top edge");
+    double same[4] = {0, 0, 3407, 1916};
+    ptrsync_box_within(same, confines[0], same);
+    CHECK(near(same[0], 100) && near(same[2], 899), "in place");
+}
+
 int main(void) {
+    box_within();
     motion();
     catch_up();
     scene_map();

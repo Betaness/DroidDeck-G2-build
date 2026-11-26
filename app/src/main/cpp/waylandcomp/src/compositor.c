@@ -782,6 +782,8 @@ static int shm_damage_rects(struct surface *s, int w, int h) {
 
 static void scene_size(int *w, int *h);
 static void clamp_shown(int w, int h, double *x, double *y);
+struct constraint;
+static void pointer_box(int w, int h, const struct constraint *k, double b[4]);
 static int64_t damage_area(const struct damage_list *d, int bound_w, int bound_h);
 static struct surface *g_hud_surface, *g_hud_shm;
 static int64_t g_hud_shm_ns;
@@ -3263,13 +3265,17 @@ static void pointer_input(double x, double y, int relative, uint32_t button, int
     if (k && k->is_lock) {
         target = k->surface;
     } else {
-        if (relative) {
+        if (relative || k) {
             int w, h;
+            double b[4];
             scene_size(&w, &h);
-            x = g_ptr_x + dx; y = g_ptr_y + dy;
-            clamp_shown(w, h, &x, &y);
+            if (relative) { x = g_ptr_x + dx; y = g_ptr_y + dy; }
+            pointer_box(w, h, k, b);
+            if (x < b[0]) x = b[0];
+            if (y < b[1]) y = b[1];
+            if (x > b[2]) x = b[2];
+            if (y > b[3]) y = b[3];
         }
-        if (k) confine_clamp(k, &x, &y);
         g_ptr_x = x; g_ptr_y = y;
         g_ptr_known = 1;
         if (atomic_load(&g_cursor_composite)) schedule_render();
@@ -3400,6 +3406,13 @@ static void clamp_shown(int w, int h, double *x, double *y) {
     if (*y > b[3]) *y = b[3];
 }
 
+/* Where the pointer may go: the shown part of the scene, and within a confined pointer's box. */
+static void pointer_box(int w, int h, const struct constraint *k, double b[4]) {
+    double c[4];
+    shown_box(w, h, b);
+    if (k && !k->is_lock && confine_box(k, c)) ptrsync_box_within(b, c, b);
+}
+
 static void input_output_to_scene(int px, int py, double *x, double *y) {
     int w, h, ow, oh;
     scene_size(&w, &h);
@@ -3519,8 +3532,7 @@ static void publish_query_state(void) {
         }
         int shown = ow > 0 && oh > 0 && vkp_scene_to_output(0, 0, &o0x, &o0y) && vkp_scene_to_output(1, 1, &o1x, &o1y);
         ptrsync_scene_map(shown, o0x, o0y, o1x, o1y, ow, oh, w, h, map);
-        shown_box(w, h, box);
-        if (g_active_constraint && !g_active_constraint->is_lock) confine_box(g_active_constraint, box);
+        pointer_box(w, h, g_active_constraint, box);
         has_position = 1;
     }
     pthread_mutex_lock(&g_query_lock);

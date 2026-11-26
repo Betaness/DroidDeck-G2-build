@@ -92,7 +92,7 @@ static void decode(void) {
 static void measured_case(void) {
     struct gf_report r = richman();
     struct gf_choice c;
-    gf_pick(&r, 0, &c);
+    gf_pick(&r, 0, NULL, 0, &c);
     CHECK(c.reason == GF_CROP, "3408x1917 on 3408x2272: cropped (%s)", gf_reason_text(c.reason));
     CHECK(c.window == GAME && c.app == APP && c.index == 1 && rect_is(&c, 0, 0, 3408, 1917), "the game's window");
     CHECK(!strcmp(c.cls, "richman11/steam_app_2074800"), "its class: %s", c.cls);
@@ -105,35 +105,35 @@ static void small_windows(void) {
     add(&r, STEAM, GF_STEAM_APP, 0, 0, 3408, 2272, 0, "steam");
     add(&r, GAME, APP, 1064, 776, 1280, 720, 0, "game");
     struct gf_choice c;
-    gf_pick(&r, 0, &c);
+    gf_pick(&r, 0, NULL, 0, &c);
     CHECK(c.reason == GF_CROP && rect_is(&c, 1064, 776, 1280, 720), "1280x720 centred: cropped (%s)", gf_reason_text(c.reason));
     r.win[1].x = r.win[1].y = 0;
-    gf_pick(&r, 0, &c);
+    gf_pick(&r, 0, NULL, 0, &c);
     CHECK(c.reason == GF_CROP && rect_is(&c, 0, 0, 1280, 720), "1280x720 at 0,0: cropped");
     r.win[1].x = -10;
     r.win[1].y = 2000;
-    gf_pick(&r, 0, &c);
+    gf_pick(&r, 0, NULL, 0, &c);
     CHECK(c.reason == GF_OFF_SMALL, "only 272 rows of it on the screen: too small (%s)", gf_reason_text(c.reason));
 
     struct gf_report splash = screen(3408, 2272, 0x300u);
     add(&splash, STEAM, GF_STEAM_APP, 0, 0, 3408, 2272, 0, "steam");
     add(&splash, 0x300u, APP, 1384, 956, 640, 360, 0, "splash");
-    gf_pick(&splash, 0, &c);
+    gf_pick(&splash, 0, NULL, 0, &c);
     CHECK(c.reason == GF_OFF_SMALL && c.window == 0x300u, "640x360 splash on 3408x2272: ignored (%s)", gf_reason_text(c.reason));
     struct gf_report small_screen = screen(1280, 720, 0x300u);
     add(&small_screen, 0x300u, APP, 340, 210, 600, 300, 0, "splash");
-    gf_pick(&small_screen, 0, &c);
+    gf_pick(&small_screen, 0, NULL, 0, &c);
     CHECK(c.reason == GF_OFF_SMALL, "600x300 splash on 1280x720: ignored");
     small_screen.win[0].w = 800;
     small_screen.win[0].h = 600;
-    gf_pick(&small_screen, 0, &c);
+    gf_pick(&small_screen, 0, NULL, 0, &c);
     CHECK(c.reason == GF_CROP, "800x600 on 1280x720: cropped");
 
     /* The splash in front of the game window: the game window is cropped to, the splash inside it stays. */
     struct gf_report both = screen(3408, 2272, 0x300u);
     add(&both, GAME, APP, 0, 0, 3408, 1917, 0, "game");
     add(&both, 0x300u, APP, 1384, 778, 640, 360, 0, "splash");
-    gf_pick(&both, 0, &c);
+    gf_pick(&both, 0, NULL, 0, &c);
     CHECK(c.reason == GF_CROP && c.window == GAME, "small focused window: its game's big one");
     int idx[4];
     CHECK(gf_strays(&both, &c, idx, 4) == 0, "the splash inside the game window is no stray");
@@ -150,12 +150,12 @@ static void scene_sized(void) {
     struct gf_report r = richman();
     r.win[1].h = 2272;
     struct gf_choice c;
-    gf_pick(&r, 0, &c);
+    gf_pick(&r, 0, NULL, 0, &c);
     CHECK(c.reason == GF_OFF_FULLSCREEN, "window at the screen's size: no crop (%s)", gf_reason_text(c.reason));
     r.win[1].x = -8;
     r.win[1].w = 3500;
     r.win[1].h = 2400;
-    gf_pick(&r, 0, &c);
+    gf_pick(&r, 0, NULL, 0, &c);
     CHECK(c.reason == GF_OFF_FULLSCREEN, "window larger than the screen: no crop");
 }
 
@@ -165,41 +165,85 @@ static void two_windows(void) {
     add(&r, 0x400u, APP, 0, 0, 1280, 800, 0, "launcher");
     add(&r, GAME, APP, 160, 90, 1600, 900, 0, "game");
     struct gf_choice c;
-    gf_pick(&r, 0, &c);
-    CHECK(c.reason == GF_CROP && c.window == GAME && rect_is(&c, 160, 90, 1600, 900), "the focused one");
+    gf_pick(&r, 0, NULL, 0, &c);
+    CHECK(c.reason == GF_CROP && c.window == GAME && rect_is(&c, 160, 90, 1600, 900), "the larger one");
     r.focus = 0x400u;
-    gf_pick(&r, 0, &c);
-    CHECK(c.reason == GF_CROP && c.window == 0x400u, "the launcher when it has the focus");
+    gf_pick(&r, 0, NULL, 0, &c);
+    CHECK(c.reason == GF_CROP && c.window == GAME, "the larger one also when the other has the focus");
     r.focus = 0;
-    gf_pick(&r, 0, &c);
-    CHECK(c.reason == GF_CROP && c.window == GAME, "no focus given: the topmost");
-    r.win[2].flags = GF_WIN_INERT;
-    gf_pick(&r, 0, &c);
-    CHECK(c.reason == GF_CROP && c.window == 0x400u, "no focus given: the topmost that can take it");
-    r.win[2].flags = GF_WIN_OVERRIDE;
+    gf_pick(&r, 0, NULL, 0, &c);
+    CHECK(c.reason == GF_CROP && c.window == GAME, "no focus given: the game of the topmost window");
+    r.win[1].w = 1700;
+    r.win[1].h = 1000;
     r.focus = GAME;
-    gf_pick(&r, 0, &c);
+    gf_pick(&r, 0, NULL, 0, &c);
+    CHECK(c.reason == GF_CROP && c.window == 0x400u, "a launcher left open and larger: it wins without a swapchain");
+    const uint32_t presenting[] = {0x777u, GAME};
+    gf_pick(&r, 0, presenting, 2, &c);
+    CHECK(c.reason == GF_CROP && c.window == GAME, "the window with the zero-copy swapchain wins");
+    r.win[1].w = 1280;
+    r.win[1].h = 800;
+    r.win[2].flags = GF_WIN_OVERRIDE;
+    gf_pick(&r, 0, NULL, 0, &c);
     CHECK(c.reason == GF_CROP && c.window == 0x400u, "an override-redirect window is never the game window");
     int idx[4];
     CHECK(gf_strays(&r, &c, idx, 4) == 1 && idx[0] == 2, "but it is a stray above the launcher");
+}
+
+/* A modal dialog of the game: Wine makes the game window inert and gives the dialog the focus. */
+static void dialogs(void) {
+    struct gf_report r = screen(1280, 720, 0x500u);
+    add(&r, STEAM, GF_STEAM_APP, 0, 0, 1280, 720, 0, "steam");
+    add(&r, GAME, APP, 0, 0, 1280, 720, GF_WIN_INERT, "game");
+    add(&r, 0x500u, APP, 240, 60, 800, 600, GF_WIN_TRANSIENT | GF_WIN_DIALOG, "dialog");
+    struct gf_choice c;
+    gf_pick(&r, 0, NULL, 0, &c);
+    CHECK(c.reason == GF_OFF_FULLSCREEN && c.window == GAME, "800x600 dialog over a 1280x720 game: no crop (%s)",
+          gf_reason_text(c.reason));
+    r.win[2].flags = 0;
+    gf_pick(&r, 0, NULL, 0, &c);
+    CHECK(c.reason == GF_OFF_FULLSCREEN && c.window == GAME, "unmarked dialog: the larger game window still");
+    r.win[1].w = 600;
+    r.win[1].h = 300;
+    r.win[2].flags = GF_WIN_TRANSIENT;
+    gf_pick(&r, 0, NULL, 0, &c);
+    CHECK(c.reason == GF_OFF_SMALL, "a transient window is never cropped to, even the largest (%s)", gf_reason_text(c.reason));
+
+    struct gf_report big = screen(3408, 2272, 0x500u);
+    add(&big, GAME, APP, 0, 0, 1280, 720, GF_WIN_INERT, "game");
+    add(&big, 0x500u, APP, 240, 60, 800, 600, GF_WIN_TRANSIENT | GF_WIN_DIALOG, "dialog");
+    gf_pick(&big, 0, NULL, 0, &c);
+    CHECK(c.reason == GF_CROP && c.window == GAME && rect_is(&c, 0, 0, 1280, 720), "the game window with its dialog in it");
+    int idx[4];
+    CHECK(gf_strays(&big, &c, idx, 4) == 0, "the dialog inside is no stray");
+    big.win[1].flags = GF_WIN_DIALOG;
+    big.win[1].w = 1400;
+    big.win[1].h = 900;
+    gf_pick(&big, 0, NULL, 0, &c);
+    CHECK(c.reason == GF_CROP && c.window == GAME, "a dialog-type window larger than the game is not cropped to");
+
+    struct gf_report splash = screen(1280, 720, 0x600u);
+    add(&splash, 0x600u, APP, 0, 0, 1024, 600, GF_WIN_DIALOG, "splash");
+    gf_pick(&splash, 0, NULL, 0, &c);
+    CHECK(c.reason == GF_OFF_SMALL, "a splash-type window alone: no crop");
 }
 
 static void steam_and_others(void) {
     struct gf_report r = richman();
     struct gf_choice c;
     r.flags = GF_REPORT_STEAM_MENU;
-    gf_pick(&r, 0, &c);
+    gf_pick(&r, 0, NULL, 0, &c);
     CHECK(c.reason == GF_OFF_STEAM, "Steam menu open");
     r = richman();
     r.focus = STEAM;
-    gf_pick(&r, 0, &c);
+    gf_pick(&r, 0, NULL, 0, &c);
     CHECK(c.reason == GF_OFF_STEAM, "Steam focused");
     r = richman();
     r.win[1].app = 0;
-    gf_pick(&r, 0, &c);
+    gf_pick(&r, 0, NULL, 0, &c);
     CHECK(c.reason == GF_OFF_NOT_GAME, "no app: not a game");
     struct gf_report none = screen(3408, 2272, 0);
-    gf_pick(&none, 0, &c);
+    gf_pick(&none, 0, NULL, 0, &c);
     CHECK(c.reason == GF_OFF_NO_FOCUS, "no windows");
 }
 
@@ -208,7 +252,7 @@ static void half_resolution(void) {
     add(&r, STEAM, GF_STEAM_APP, 0, 0, 1704, 1136, 0, "steam");
     add(&r, GAME, APP, 0, 0, 1704, 958, 0, "game");
     struct gf_choice c;
-    gf_pick(&r, 0, &c);
+    gf_pick(&r, 0, NULL, 0, &c);
     CHECK(c.reason == GF_CROP && rect_is(&c, 0, 0, 1704, 958), "half resolution: cropped");
 }
 
@@ -259,7 +303,8 @@ static void debounce(void) {
     CHECK(gf_step(&s, &aspect, 900 * MS, &wake) && s.cur.mode == GF_MODE_ASPECT, "a new mode applies at once");
 
     struct gf_choice moved = crop(GAME, 100, 100, 1280, 720, GF_MODE_ASPECT);
-    CHECK(!gf_step(&s, &moved, 1000 * MS, &wake) && s.cur.rect[0] == 0 && wake == 1500 * MS, "moved: the old crop until it settles");
+    CHECK(!gf_step(&s, &moved, 1000 * MS, &wake) && s.on && s.cur.rect[0] == 0 && wake == 1500 * MS,
+          "the same window moved: its old crop until the new place settles");
     CHECK(!gf_step(&s, &aspect, 1100 * MS, &wake) && !wake && !s.pending, "moved back: nothing changes");
 
     struct gf_choice steam = off(GF_OFF_STEAM);
@@ -268,19 +313,23 @@ static void debounce(void) {
     struct gf_choice full = off(GF_OFF_FULLSCREEN);
     CHECK(gf_step(&s, &full, 1300 * MS, &wake) && !s.on, "fullscreen: off at once");
     CHECK(gf_step(&s, &aspect, 1400 * MS, &wake) && s.on, "out of fullscreen: on at once");
-
     struct gf_choice gone = off(GF_OFF_NO_FOCUS);
-    CHECK(!gf_step(&s, &gone, 2000 * MS, &wake) && s.on && wake == 2300 * MS, "window gone: kept a little");
-    CHECK(!gf_step(&s, &aspect, 2200 * MS, &wake) && s.on, "it came back in time");
-    CHECK(!gf_step(&s, &gone, 3000 * MS, &wake) && s.on, "gone again");
-    CHECK(gf_step(&s, &gone, 3300 * MS, &wake) && !s.on && !wake, "then off");
-    struct gf_choice opt = off(GF_OFF_OPTION);
-    CHECK(!gf_step(&s, &opt, 3400 * MS, &wake) && !s.on, "off stays off");
+    CHECK(gf_step(&s, &gone, 2000 * MS, &wake) && !s.on && !wake, "the window gone: off at once");
+    CHECK(gf_step(&s, &aspect, 2100 * MS, &wake) && s.on, "and back at once when it returns to its place");
 
+    /* Another window becomes the game window: the old crop goes at once, the new one settles. */
     struct gf_choice other = crop(0x500u, 0, 0, 1024, 768, GF_MODE_STRETCH);
-    CHECK(!gf_step(&s, &other, 4000 * MS, &wake) && wake == 4500 * MS, "another window waits");
+    CHECK(gf_step(&s, &other, 3000 * MS, &wake) && !s.on && wake == 3500 * MS, "another window: off at once, then waits");
+    CHECK(!gf_step(&s, &other, 3200 * MS, &wake) && !s.on && wake == 3500 * MS, "still waiting");
+    CHECK(gf_step(&s, &other, 3500 * MS, &wake) && s.on && s.cur.window == 0x500u, "then on it");
+    struct gf_choice opt = off(GF_OFF_OPTION);
+    CHECK(gf_step(&s, &opt, 3600 * MS, &wake) && !s.on, "option off: off at once");
+    CHECK(!gf_step(&s, &opt, 3700 * MS, &wake) && !s.on, "off stays off");
+
+    struct gf_choice third = crop(0x600u, 0, 0, 1024, 768, GF_MODE_STRETCH);
+    CHECK(!gf_step(&s, &third, 4000 * MS, &wake) && wake == 4500 * MS, "a third window waits");
     CHECK(!gf_step(&s, &steam, 4100 * MS, &wake) && !s.pending, "Steam in front drops what waits");
-    CHECK(!gf_step(&s, &other, 4200 * MS, &wake) && wake == 4700 * MS, "and it starts over");
+    CHECK(!gf_step(&s, &third, 4200 * MS, &wake) && wake == 4700 * MS, "and it starts over");
 }
 
 int main(void) {
@@ -289,6 +338,7 @@ int main(void) {
     small_windows();
     scene_sized();
     two_windows();
+    dialogs();
     steam_and_others();
     half_resolution();
     modes();

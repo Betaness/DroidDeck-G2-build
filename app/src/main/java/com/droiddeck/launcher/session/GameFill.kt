@@ -19,6 +19,12 @@ object GameFill {
 
     fun normalize(choice: String?): String? = choice?.takeIf { it in CHOICES }
 
+    /**
+     * Before this setting, the 16:9 game fit (stretch16x9) asked gamescope to keep proportions or stretch;
+     * there is no gamescope on this path. An explicit keep becomes [ASPECT]; otherwise [DEFAULT].
+     */
+    fun fromStretch16x9(explicit: Boolean?): String = if (explicit == false) ASPECT else DEFAULT
+
     fun nativeMode(choice: String?): Int = when (normalize(choice) ?: DEFAULT) {
         OFF -> NATIVE_OFF
         ASPECT -> NATIVE_ASPECT

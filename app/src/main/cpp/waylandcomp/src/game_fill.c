@@ -64,10 +64,26 @@ static int on_root(const struct gf_window *w, int root_w, int root_h, long long 
 
 static int managed(const struct gf_window *w) { return !(w->flags & GF_WIN_OVERRIDE); }
 
+/* A window that can be the game's main window: not a dialog, menu or splash, not owned by another. */
+static int main_kind(const struct gf_window *w) {
+    return !(w->flags & (GF_WIN_OVERRIDE | GF_WIN_TRANSIENT | GF_WIN_DIALOG));
+}
+
+static long long area_on_root(const struct gf_window *w, int root_w, int root_h) {
+    long long r[4];
+    return on_root(w, root_w, root_h, r) ? (r[2] - r[0]) * (r[3] - r[1]) : 0;
+}
+
 static int counts(const struct gf_window *w, int root_w, int root_h, uint32_t keep) {
     long long r[4];
     return on_root(w, root_w, root_h, r) &&
            gf_big_enough((int)(r[2] - r[0]), (int)(r[3] - r[1]), root_w, root_h, keep && w->id == keep);
+}
+
+static int listed(uint32_t id, const uint32_t *ids, int n) {
+    for (int i = 0; ids && i < n; i++)
+        if (ids[i] == id) return 1;
+    return 0;
 }
 
 static void name_window(struct gf_choice *out, const struct gf_report *r, int i) {
@@ -76,7 +92,8 @@ static void name_window(struct gf_choice *out, const struct gf_report *r, int i)
     memcpy(out->cls, r->win[i].cls, GF_CLASS_LEN);
 }
 
-void gf_pick(const struct gf_report *r, uint32_t keep, struct gf_choice *out) {
+void gf_pick(const struct gf_report *r, uint32_t keep, const uint32_t *presenting, int n_presenting,
+             struct gf_choice *out) {
     memset(out, 0, sizeof(*out));
     out->index = -1;
     out->mode = GF_MODE_STRETCH;
@@ -106,9 +123,20 @@ void gf_pick(const struct gf_report *r, uint32_t keep, struct gf_choice *out) {
         out->reason = GF_OFF_NOT_GAME;
         return;
     }
-    int pick = counts(&r->win[f], RW, RH, keep) ? f : -1;
-    for (int i = n - 1; i >= 0 && pick < 0; i--)
-        if (managed(&r->win[i]) && r->win[i].app == app && counts(&r->win[i], RW, RH, keep)) pick = i;
+    /* From the top: of equal ones the upper wins. */
+    int pick = -1, pick_presents = 0;
+    long long pick_area = 0;
+    for (int i = n - 1; i >= 0; i--) {
+        const struct gf_window *w = &r->win[i];
+        if (w->app != app || !main_kind(w) || !counts(w, RW, RH, keep)) continue;
+        const int presents = listed(w->id, presenting, n_presenting);
+        const long long area = area_on_root(w, RW, RH);
+        if (pick < 0 || presents > pick_presents || (presents == pick_presents && area > pick_area)) {
+            pick = i;
+            pick_presents = presents;
+            pick_area = area;
+        }
+    }
     if (pick < 0) {
         out->reason = GF_OFF_SMALL;
         return;
@@ -137,35 +165,15 @@ static int same_place(const struct gf_choice *a, const struct gf_choice *b) {
            near((long long)a->rect[1] + a->rect[3], (long long)b->rect[1] + b->rect[3]);
 }
 
-static int off_at_once(int reason) {
-    return reason == GF_OFF_OPTION || reason == GF_OFF_NO_HELPER || reason == GF_OFF_STEAM ||
-           reason == GF_OFF_FULLSCREEN;
-}
-
 int gf_step(struct gf_state *s, const struct gf_choice *c, int64_t now_ns, int64_t *wake_ns) {
-    const int64_t settle = GF_SETTLE_MS * 1000000LL, leave = GF_LEAVE_MS * 1000000LL;
+    const int64_t settle = GF_SETTLE_MS * 1000000LL;
     *wake_ns = 0;
     if (c->reason != GF_CROP) {
         s->pending = 0;
-        if (!s->on) {
-            s->leaving = 0;
-            return 0;
-        }
-        if (!off_at_once(c->reason)) {
-            if (!s->leaving) {
-                s->leaving = 1;
-                s->leave_ns = now_ns;
-            }
-            if (now_ns - s->leave_ns < leave) {
-                *wake_ns = s->leave_ns + leave;
-                return 0;
-            }
-        }
+        if (!s->on) return 0;
         s->on = 0;
-        s->leaving = 0;
         return 1;
     }
-    s->leaving = 0;
     if (s->on && same_place(&s->cur, c)) {
         s->pending = 0;
         s->cur.index = c->index;
@@ -173,6 +181,12 @@ int gf_step(struct gf_state *s, const struct gf_choice *c, int64_t now_ns, int64
         s->cur.mode = c->mode;
         s->last = s->cur;
         return 1;
+    }
+    /* Another window: what was cropped to is gone or no longer the game window. */
+    int changed = 0;
+    if (s->on && s->cur.window != c->window) {
+        s->on = 0;
+        changed = 1;
     }
     /* Back to the window and place shown last (after a Steam menu, out of fullscreen): no settling. */
     if (!(s->has_last && same_place(&s->last, c))) {
@@ -183,7 +197,7 @@ int gf_step(struct gf_state *s, const struct gf_choice *c, int64_t now_ns, int64
         }
         if (now_ns - s->pend_ns < settle) {
             *wake_ns = s->pend_ns + settle;
-            return 0;
+            return changed;
         }
     }
     s->on = 1;

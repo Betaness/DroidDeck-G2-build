@@ -75,7 +75,7 @@ static void log_strays(void) {
     }
 }
 
-static void apply(int reason) {
+static void apply(const struct gf_choice *why) {
     static const int none[4];
     if (g_state.on) {
         const struct gf_choice *c = &g_state.cur;
@@ -91,7 +91,11 @@ static void apply(int reason) {
         log_strays();
     } else {
         vkp_set_scene_crop(0, none, 0, 0, 0);
-        droiddeck_log("game-fill", "off: %s", gf_reason_text(reason));
+        if (why->reason == GF_CROP)
+            droiddeck_log("game-fill", "off: window 0x%x (%s) is the game window now, shown once it has settled",
+                          why->window, why->cls[0] ? why->cls : "no WM_CLASS");
+        else
+            droiddeck_log("game-fill", "off: %s", gf_reason_text(why->reason));
         g_nstrays = 0;
     }
     vortek_present_remap();
@@ -105,7 +109,9 @@ static void evaluate(void) {
         c.index = -1;
         c.reason = GF_OFF_NO_HELPER;
     } else {
-        gf_pick(&g_report, g_state.on ? g_state.cur.window : 0, &c);
+        uint32_t presenting[8];
+        const int n = vortek_present_toplevels(presenting, 8);
+        gf_pick(&g_report, g_state.on ? g_state.cur.window : 0, presenting, n, &c);
         if (c.reason == GF_CROP) {
             const int mode = mode_for(c.app);
             if (mode == GF_MODE_OFF) c.reason = GF_OFF_OPTION;
@@ -114,8 +120,8 @@ static void evaluate(void) {
     }
     const int64_t now = now_ns();
     int64_t wake = 0;
-    if (gf_step(&g_state, &c, now, &wake)) apply(c.reason);
-    else if (g_state.on && (g_applied_root[0] != g_report.root_w || g_applied_root[1] != g_report.root_h)) apply(c.reason);
+    if (gf_step(&g_state, &c, now, &wake)) apply(&c);
+    else if (g_state.on && (g_applied_root[0] != g_report.root_w || g_applied_root[1] != g_report.root_h)) apply(&c);
     else if (g_state.on) log_strays();
     if (g_timer) {
         int ms = 0;
