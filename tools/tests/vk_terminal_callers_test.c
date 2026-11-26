@@ -1,6 +1,7 @@
 /* Compiled with the complete, unmodified production translation unit. The
  * compositor's take_shm/take_pixel functions are inserted verbatim by Python. */
 #include "vk_present.c"
+#include "scene_map.c"
 #include <assert.h>
 
 struct vk_api g_vk;

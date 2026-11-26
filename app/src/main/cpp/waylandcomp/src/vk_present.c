@@ -235,9 +235,10 @@ static pthread_cond_t g_req_condition = PTHREAD_COND_INITIALIZER;
 static volatile int g_mode = VKP_MODE_STRETCH, g_align = VKP_ALIGN_CENTER;
 
 static struct scene_map g_map;
-_Static_assert(SCENE_MODE_STRETCH == VKP_MODE_STRETCH && SCENE_MODE_FIT == VKP_MODE_FIT &&
-               SCENE_MODE_INTEGER == VKP_MODE_INTEGER && SCENE_ALIGN_PICTURE_RIGHT == VKP_ALIGN_PICTURE_RIGHT &&
-               SCENE_ALIGN_BOTTOM == VKP_ALIGN_BOTTOM, "scene_map.h and vk_present.h disagree");
+_Static_assert((int)SCENE_MODE_STRETCH == (int)VKP_MODE_STRETCH && (int)SCENE_MODE_FIT == (int)VKP_MODE_FIT &&
+               (int)SCENE_MODE_INTEGER == (int)VKP_MODE_INTEGER &&
+               (int)SCENE_ALIGN_PICTURE_RIGHT == (int)VKP_ALIGN_PICTURE_RIGHT &&
+               (int)SCENE_ALIGN_BOTTOM == (int)VKP_ALIGN_BOTTOM, "scene_map.h and vk_present.h disagree");
 /* [mali-g2] Game window fill (game_fill_server.c): the part of the X screen g_map shows. Compositor thread. */
 static struct { int on, rect[4], root_w, root_h, mode; unsigned gen; } g_crop;
 static unsigned g_map_crop_gen;

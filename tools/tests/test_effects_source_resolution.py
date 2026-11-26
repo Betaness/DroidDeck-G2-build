@@ -27,7 +27,7 @@ class EffectsSourceResolutionTest(unittest.TestCase):
         effects = (REPO / 'app/src/main/cpp/waylandcomp/src/effects_chain.c').read_text()
         functions = '\n'.join(function(source, signature) for signature in (
             'static void release_external_client_image(', 'static void release_external_client_draws(',
-            'static int map_draw(', 'static int draw_to_blit(',
+            'static int map_draw(', 'static int draw_to_blit(', 'static void mapped_scene_size(',
             'static int draw_to_scene_blit(', 'static int effects_source_draw(',
             'static void effects_source_note(',
             'static void effects_overlay_draws(',
@@ -202,7 +202,7 @@ static int slot_wait(struct frame_slot *f) { f->serial = 0; return 0; }
 static void frames_idle(void) {}
 static uint32_t g_swap_md_identity;
 static VkExtent2D g_extent = {1920, 1080};
-static struct { float kx, ky, off_x, off_y; int rx, ry, rw, rh; } g_map;
+static struct { float kx, ky, off_x, off_y; int rx, ry, rw, rh; float clip[4]; int crop; } g_map;
 static struct { VkImage img; int w, h; } g_scene;
 struct vkp_img_slot { VkImage img; int w, h; };
 static struct vkp_img_slot g_hdrscene, g_fgscene;
@@ -230,6 +230,7 @@ static int acquire_image(const struct frame_slot *f, int k, int wait, uint32_t *
 static void update_map(int w, int h) {
     g_map.kx = (float)g_extent.width / w; g_map.ky = (float)g_extent.height / h;
     g_map.rw = g_extent.width; g_map.rh = g_extent.height;
+    g_map.clip[0] = 0; g_map.clip[1] = 0; g_map.clip[2] = (float)g_extent.width; g_map.clip[3] = (float)g_extent.height;
 }
 static int vkp_update_map(int w, int h) { update_map(w, h); return 0; }
 static void send_hdr_metadata(const struct droiddeck_color *color) {}
