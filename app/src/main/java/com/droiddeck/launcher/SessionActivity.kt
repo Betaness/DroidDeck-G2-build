@@ -2564,6 +2564,52 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             pushCardboard(activeCardboard)
             if (changed && ::surfaceView.isInitialized) applyFrameGen()
         }
+        updateLiftWant()
+    }
+
+    /** [mali-g2] What RefreshRateLift last heard from this activity: the rate, and why. */
+    private var liftWant = -1f
+    private var liftWhy = ""
+
+    /** [mali-g2] Tells RefreshRateLift the built-in panel's rate the session wants: HyperOS sets the panel from
+     *  user_refresh_rate and leaves app votes and modes aside. The rules are RefreshRateLiftDriver.sessionWant's:
+     *  ZeroFG's vote while it votes for the game on this screen; else the requested mode while a frame rate limit (the
+     *  games' held BL_FPS, the compositor's limit) or the mirror picks it; else none in particular (the panel's top rate). */
+    private fun updateLiftWant() {
+        if (!com.droiddeck.launcher.session.RefreshRateLift.available) return
+        val gameCap = if (gameCapHold.held) gameFpsCap else 0
+        val want = com.droiddeck.launcher.session.RefreshRateLiftDriver.sessionWant(
+            zeroFg = CompositorHost.isStarted && FrameGen.engine(this) == FrameGen.ENGINE_ZEROFG,
+            vote = { WaylandCompositor.nativeZeroFgVoteHz() },
+            bottomHz = bottomGame?.takeIf { bottomOutputActive }?.hz ?: 0f,
+            glassesHz = glassesScreen?.hz ?: 0f,
+            limitFps = com.droiddeck.launcher.session.GameFpsCap.forMode(outputFpsLimit(false), gameCap),
+            mirrorHz = mirrorRefreshLimit(),
+            mode = { wantedRefreshHz() },
+        )
+        val hz = want.hz
+        val why = want.why
+        if (kotlin.math.abs(hz - liftWant) < 0.01f && why == liftWhy) return
+        liftWant = hz
+        liftWhy = why
+        Log.i(TAG, "perf: refresh lift wants " + (if (hz > 1f) String.format(java.util.Locale.US, "%.0f Hz", hz) else "no rate in particular") + " ($why)")
+        com.droiddeck.launcher.session.RefreshRateLift.want(this, hz)
+    }
+
+    /** [mali-g2] Once a second while started: ZeroFG's vote, which the compositor changes on its own. */
+    private val liftWantSampler = object : Runnable {
+        override fun run() {
+            updateLiftWant()
+            uiHandler.postDelayed(this, 1000)
+        }
+
+        fun start() {
+            if (!com.droiddeck.launcher.session.RefreshRateLift.available) return
+            uiHandler.removeCallbacks(this)
+            uiHandler.post(this)
+        }
+
+        fun stop() = uiHandler.removeCallbacks(this)
     }
 
     /** [mali-g2] The layers' frame-rate vote: the running rate, except with ZeroFG, whose own vote may have
@@ -5028,6 +5074,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (::hud.isInitialized) hud.setBackgrounded(false)
         refreshActivityDisplayId()
         gameCapSampler.start()
+        liftWantSampler.start()
         displayManager.registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
         com.droiddeck.launcher.input.DualScreen.watchTaken(bottomScreenListener)
         for (name in arrayOf("peak_refresh_rate", "min_refresh_rate")) {
@@ -5055,6 +5102,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (::hud.isInitialized) hud.setBackgrounded(true)
         updateHandCamera()
         gameCapSampler.stop()
+        liftWantSampler.stop()
         displayManager.unregisterDisplayListener(displayListener)
         com.droiddeck.launcher.input.DualScreen.unwatchTaken(bottomScreenListener)
         contentResolver.unregisterContentObserver(refreshSettingObserver)

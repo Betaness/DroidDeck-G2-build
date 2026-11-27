@@ -2550,8 +2550,8 @@
     <string name="setup_group_device">這部裝置</string>
     <string name="setup_cooler_mode">水冷模式</string>
     <string name="setup_cooler_mode_hint">接上散熱器時開啟：遊戲執行時把 GPU 頻率拉得更高，同時讓 CPU、GPU 和記憶體提頻。需要無線偵錯配對，裝置過熱時自動暫停。下次啟動工作階段生效。</string>
-    <string name="setup_refresh_lift">遊戲時螢幕 144 Hz</string>
-    <string name="setup_refresh_lift_hint">HyperOS 把應用程式限制在系統設定裡選的更新率。工作階段在螢幕上時把它調到螢幕的最高更新率，離開後改回。需要無線偵錯配對。</string>
+    <string name="setup_refresh_lift">遊戲時調整螢幕更新率</string>
+    <string name="setup_refresh_lift_hint">HyperOS 把應用程式限制在系統設定裡選的更新率。工作階段在螢幕上時把它改成工作階段要的更新率（螢幕最高更新率，或影格生成、影格率限制能均勻對上的更新率），離開後改回。需要無線偵錯配對。</string>
     <string name="setup_group_art">收藏庫圖片</string>
     <string name="setup_group_download">下載</string>
     <string name="setup_download_source">來源</string>

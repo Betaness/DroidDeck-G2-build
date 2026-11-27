@@ -1,10 +1,14 @@
 package com.droiddeck.launcher.session
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.database.ContentObserver
 import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Process
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.Display
@@ -12,23 +16,27 @@ import com.droiddeck.launcher.core.GlobalSettings
 import com.droiddeck.launcher.core.WirelessAdbFix
 import java.util.UUID
 import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
 /**
- * [mali-g2] The panel's top refresh rate (144 Hz) while a game session is on screen on the Xring O3 (on by default there).
+ * [mali-g2] The refresh rate the session wants while a game session is on screen on the Xring O3 (on by default there).
  *
- * The session asks for the panel's top mode (PerfMode), but HyperOS gives a third-party app no more than the rate chosen
- * in Settings > Display, Secure user_refresh_rate (120 Hz): PowerKeeper writes it for the foreground app to Secure
- * miui_refresh_rate, and DisplayModeDirector caps rendering there. The app may not write Secure settings, the shell user
- * may: so it is raised through the wireless debugging pairing while a session activity is started and not in
- * picture-in-picture, and put back afterwards ([RefreshRateLiftLogic] has the rules). A restorer started as the shell
- * user puts it back once this process is gone (crash, force-stop, an update, the app's data cleared); it ends with a
- * restart of the device or of adbd, and then the next app or session start puts the value back. On the O3 the panel
- * went to 144 Hz within about a second; Duckov's frame rate, pacing and temperatures stayed as they were.
+ * HyperOS runs the panel at the rate chosen in Settings > Display, Secure user_refresh_rate (120 Hz), whatever mode or
+ * frame rate a third-party app asks for: PowerKeeper writes it for the foreground app to Secure miui_refresh_rate, and
+ * the compositor follows it. The app may not write Secure settings, the shell user may: so it is set through the
+ * wireless debugging pairing while a session activity is started and not in picture-in-picture, and put back afterwards
+ * ([RefreshRateLiftLogic] has the rules). The rate is the one the session asks for ([want]: ZeroFG's frame-rate vote,
+ * the mode a frame rate limit divides), else the panel's top rate (144 Hz), as a mode of the panel's; a change is
+ * written once it has held for a while, at most every few seconds. A restorer started as the shell user puts the value
+ * back once this process is gone (crash, force-stop, an update, the app's data cleared); it ends with a restart of the
+ * device or of adbd. The value is put back when the system announces a shutdown or restart; after one it did not
+ * announce (a crash of the system, the battery cut off) or with adbd stopped, the next app or session start puts it
+ * back. On the O3 the panel went to 144 Hz within about a second; Duckov's frame rate, pacing and temperatures stayed
+ * as they were.
  *
- * Shell calls run on one background thread, in order; with wireless debugging off none is tried. A value that could not
- * be put back is tried again after [RETRY_MS] and when wireless debugging comes on, for as long as this process lives.
+ * Shell calls run on one background thread, in order ([RefreshRateLiftDriver]); with wireless debugging off none is
+ * tried. A value that could not be put back, or a rate that could not be written while shown, is tried again after
+ * [RefreshRateLiftDriver.RETRY_MS] and when wireless debugging comes on, for as long as this process lives.
  */
 object RefreshRateLift {
     private const val TAG = "RefreshRateLift"
@@ -40,86 +48,86 @@ object RefreshRateLift {
     internal const val RESTORER = "refreshLiftRestorer"
     /** Session prefs: false until the write went through. */
     internal const val CONFIRMED = "refreshLiftConfirmed"
-    /** Session activities stopping and starting again (recreated, a dialog over them) keep the setting raised. */
-    private const val HIDE_GRACE_MS = 1_500L
-    /** Waits before trying again to put the value back, one per failure in a row; the last repeats. */
-    private val RETRY_MS = longArrayOf(15_000L, 30_000L, 60_000L, 120_000L, 300_000L, 600_000L, 1_200_000L, 2_400_000L, 3_600_000L)
-    /** After wireless debugging comes on, for adbd to listen. */
-    private const val WIRELESS_DEBUGGING_ON_MS = 3_000L
+    /** Session prefs: the value written before, while the write of the one after has not gone through. */
+    internal const val PREVIOUS = "refreshLiftPrevious"
     private const val WIRELESS_DEBUGGING = "adb_wifi_enabled"
     /** Watched for re-pacing when the app may read them; the display's mode changes are followed in any case. */
     val WATCHED = listOf(RefreshRateLiftLogic.KEY, "miui_refresh_rate")
 
     private val executor = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "refresh-lift").apply { isDaemon = true } }
-    private var pendingHide: ScheduledFuture<*>? = null
+
+    private val scheduler = object : RefreshRateLiftDriver.Scheduler {
+        override fun execute(task: () -> Unit) {
+            executor.execute(Runnable { task() })
+        }
+
+        override fun schedule(delayMs: Long, task: () -> Unit): RefreshRateLiftDriver.Cancel {
+            val future = executor.schedule(Runnable { task() }, delayMs, TimeUnit.MILLISECONDS)
+            return RefreshRateLiftDriver.Cancel { future.cancel(false) }
+        }
+    }
+
+    @Volatile
+    private var driver: RefreshRateLiftDriver? = null
     // Used on the executor's thread only.
     private var shell: Shell? = null
-    private var logic: RefreshRateLiftLogic? = null
-    private var failureLogged = false
-    private var retries = 0
-    private var retry: ScheduledFuture<*>? = null
     private var debuggingObserver: ContentObserver? = null
 
     val available: Boolean get() = Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL == "O3"
 
-    /** For the settings page: whether the setting is on, or null where it is not offered (the panel is no faster than the rate chosen in Settings). */
+    /** For the settings page: whether the setting is on, or null where it is not offered (the panel has one rate only). */
     fun setting(context: Context): Boolean? {
-        if (!available) return null
-        val record = Prefs(context).load()
-        // Raised here, the value before counts; unreadable to the app, it is offered (the pairing reads it).
-        val chosen = if (record != null) record.original
-            else runCatching { Settings.Secure.getString(context.contentResolver, RefreshRateLiftLogic.KEY) }.getOrNull()
-        return if (RefreshRateLiftLogic.below(chosen, topHz(context))) SessionPrefs.refreshLift(context) else null
+        if (!available || modesHz(context).map { Math.round(it) }.distinct().size < 2) return null
+        return SessionPrefs.refreshLift(context)
     }
 
     fun setEnabled(context: Context, on: Boolean) {
         SessionPrefs.setRefreshLift(context, on)
-        if (!on && available) submit(context) { _, logic -> logic.turnedOff() }
+        if (!on && available) driver(context).turnedOff()
     }
 
     /** A session activity is on screen: started and not in picture-in-picture. */
-    @Synchronized
     fun shown(context: Context) {
         if (!available) return
-        pendingHide?.cancel(false)
-        pendingHide = null
-        submit(context) { app, logic -> logic.shown(SessionPrefs.refreshLift(app), topHz(app)) }
+        driver(context).shown()
+    }
+
+    /**
+     * The rate the session asks the panel for, [hz] (0: nothing in particular, the top rate): written as the panel's
+     * mode for it once it has been asked for [RefreshRateLiftLogic.STEADY_MS] and the last write is
+     * [RefreshRateLiftLogic.DWELL_MS] old, while a session activity is on screen.
+     */
+    fun want(context: Context, hz: Float) {
+        if (!available) return
+        driver(context).want(hz)
     }
 
     /** No session activity is on screen any more; [grace] lets one that is recreated keep the setting raised. */
-    @Synchronized
     fun hidden(context: Context, grace: Boolean = true) {
         if (!available) return
-        val app = context.applicationContext
-        pendingHide?.cancel(false)
-        pendingHide = null
-        if (!grace) {
-            submit(app) { _, logic -> logic.hidden() }
-            return
-        }
-        pendingHide = executor.schedule({ run(app) { _, logic -> logic.hidden() } }, HIDE_GRACE_MS, TimeUnit.MILLISECONDS)
+        driver(context).hidden(grace)
     }
 
     /** At a session's start. The line is for the log. */
     fun sessionStarted(context: Context): String {
         if (!available) return "refresh lift: not on this SoC"
         val on = SessionPrefs.refreshLift(context)
-        submit(context) { app, logic -> logic.sessionStarted(on, topHz(app)) }
-        return if (on) "refresh lift: ${RefreshRateLiftLogic.KEY} raised to the panel's top rate while on screen (see the $TAG lines)"
+        driver(context).sessionStarted(on)
+        return if (on) "refresh lift: ${RefreshRateLiftLogic.KEY} set to the rate the session wants (the panel's top rate unless " +
+            "ZeroFG or a frame rate limit asks for another) while on screen (see the $TAG lines)"
         else "refresh lift: off"
     }
 
     /** At a session's end. */
     fun sessionEnded(context: Context) {
         if (!available) return
-        submit(context) { _, logic -> logic.sessionEnded() }
-        executor.execute { failureLogged = false }
+        driver(context).sessionEnded()
     }
 
     /** At app start: a value left raised by a process that died is put back. */
     fun appStarted(context: Context) {
         if (!available || Prefs(context).load() == null) return
-        submit(context) { _, logic -> logic.appStarted() }
+        driver(context).appStarted()
     }
 
     /** Has [observer] told of changes to the [WATCHED] settings this app may read. */
@@ -130,66 +138,64 @@ object RefreshRateLift {
         }
     }
 
-    /** The default display's top refresh rate at its current size, 0 when unknown. */
-    internal fun topHz(context: Context): Int {
-        val display = context.getSystemService(DisplayManager::class.java)?.getDisplay(Display.DEFAULT_DISPLAY) ?: return 0
+    /** The default display's refresh rates at its current size; empty when unknown. */
+    private fun modesHz(context: Context): List<Float> {
+        val display = context.getSystemService(DisplayManager::class.java)?.getDisplay(Display.DEFAULT_DISPLAY) ?: return emptyList()
         val mode = display.mode
-        val top = display.supportedModes
+        return display.supportedModes
             .filter { it.physicalWidth == mode.physicalWidth && it.physicalHeight == mode.physicalHeight }
-            .maxOfOrNull { it.refreshRate } ?: return 0
-        return Math.round(top)
+            .map { it.refreshRate }
     }
 
-    private fun submit(context: Context, block: (Context, RefreshRateLiftLogic) -> String?) {
-        val app = context.applicationContext
-        executor.execute { run(app, block) }
-    }
+    private fun driver(context: Context): RefreshRateLiftDriver {
+        driver?.let { return it }
+        synchronized(this) {
+            driver?.let { return it }
+            val app = context.applicationContext
+            val events = object : RefreshRateLiftDriver.Events {
+                override fun line(text: String) {
+                    Log.i(TAG, text)
+                }
 
-    private fun run(app: Context, block: (Context, RefreshRateLiftLogic) -> String?) {
-        val shell = shell ?: Shell(app).also { shell = it }
-        val logic = logic ?: RefreshRateLiftLogic(shell, Prefs(app)) { newId() }.also { logic = it }
-        var failure: Throwable? = null
-        try {
-            block(app, logic)?.let { Log.i(TAG, it) }
-        } catch (t: Throwable) {
-            failure = t
-            if (!failureLogged) {
-                failureLogged = true
-                if (t is NoPairing) Log.i(TAG, "${t.message}: ${RefreshRateLiftLogic.KEY} left as it is")
-                else Log.w(TAG, "${RefreshRateLiftLogic.KEY} left as it is", t)
+                override fun failed(t: Throwable) {
+                    if (t is NoPairing) Log.i(TAG, "${t.message}: ${RefreshRateLiftLogic.KEY} left as it is")
+                    else Log.w(TAG, "${RefreshRateLiftLogic.KEY} left as it is", t)
+                }
+
+                override fun callDone() {
+                    shell?.close()
+                }
+
+                override fun watchDebugging(on: Boolean) = watchDebuggingSetting(app, on)
             }
-        } finally {
-            shell.close()
+            return RefreshRateLiftDriver(scheduler, { SessionPrefs.refreshLift(app) }, { modesHz(app) }, events) {
+                watchShutdown(app)
+                RefreshRateLiftLogic(Shell(app).also { shell = it }, Prefs(app), SystemClock::elapsedRealtime) { newId() }
+            }.also { driver = it }
         }
-        settleRetry(app, logic, failure)
     }
 
-    /** After a call: tries again later when it failed and a raised value waits to be put back, else stops trying. */
-    private fun settleRetry(app: Context, logic: RefreshRateLiftLogic, failure: Throwable?) {
-        retry?.cancel(false)
-        retry = null
-        val waiting = failure != null && runCatching { logic.pending(SessionPrefs.refreshLift(app)) }.getOrDefault(false)
-        if (!waiting) {
-            retries = 0
-            watchDebugging(app, false)
-            return
+    /**
+     * The restorer, a child of adbd, ends when the device shuts down or restarts, while the setting stays: the value is
+     * put back when the shutdown is announced, within the time the system gives the broadcast.
+     */
+    private fun watchShutdown(app: Context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action != Intent.ACTION_SHUTDOWN) return
+                val result = goAsync()
+                driver(app).shutdown { result.finish() }
+            }
         }
-        val delay = RETRY_MS[retries.coerceAtMost(RETRY_MS.size - 1)]
-        if (retries == 0) {
-            Log.i(TAG, "${RefreshRateLiftLogic.KEY} not put back (${failure?.message}): trying again in ${delay / 1000} s, " +
-                "then less often, and when wireless debugging comes on")
-        }
-        retries++
-        retry = executor.schedule(Runnable { retryNow(app) }, delay, TimeUnit.MILLISECONDS)
-        watchDebugging(app, true)
-    }
-
-    private fun retryNow(app: Context) {
-        run(app) { a, logic -> logic.retry(SessionPrefs.refreshLift(a)) }
+        val filter = IntentFilter(Intent.ACTION_SHUTDOWN)
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 33) app.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            else app.registerReceiver(receiver, filter)
+        }.onFailure { Log.w(TAG, "shutdown not watched", it) }
     }
 
     /** While a retry waits: wireless debugging coming on brings it forward. */
-    private fun watchDebugging(app: Context, on: Boolean) {
+    private fun watchDebuggingSetting(app: Context, on: Boolean) {
         if (on == (debuggingObserver != null)) return
         if (!on) {
             debuggingObserver?.let { observer -> runCatching { app.contentResolver.unregisterContentObserver(observer) } }
@@ -198,13 +204,7 @@ object RefreshRateLift {
         }
         val observer = object : ContentObserver(null) {
             override fun onChange(selfChange: Boolean) {
-                if (!wirelessDebuggingOn(app)) return
-                executor.schedule(Runnable {
-                    val waiting = retry ?: return@Runnable
-                    waiting.cancel(false)
-                    retry = null
-                    retryNow(app)
-                }, WIRELESS_DEBUGGING_ON_MS, TimeUnit.MILLISECONDS)
+                if (wirelessDebuggingOn(app)) driver(app).debuggingCameOn()
             }
         }
         if (runCatching { app.contentResolver.registerContentObserver(Settings.Global.getUriFor(WIRELESS_DEBUGGING), false, observer) }.isSuccess) {
@@ -220,7 +220,7 @@ object RefreshRateLift {
 
     private class NoPairing : Exception("no wireless debugging pairing, or wireless debugging is off")
 
-    /** The setting through the pairing; connected on first use, closed after each call of [run]. */
+    /** The setting through the pairing; connected on first use, closed after each call of the logic. */
     private class Shell(private val context: Context) : RefreshRateLiftLogic.Secure {
         private val markerFile = RefreshRateLiftLogic.markerPath(context.packageName)
         private var adb: com.flyfishxu.kadb.Kadb? = null
@@ -255,6 +255,10 @@ object RefreshRateLift {
             command(RefreshRateLiftLogic.armCommand(markerFile, Process.myPid(), record))
         }
 
+        override fun change(record: RefreshRateLiftLogic.Record) {
+            command(RefreshRateLiftLogic.changeCommand(markerFile, record))
+        }
+
         override fun disarm() {
             command("rm -f $markerFile")
         }
@@ -270,17 +274,19 @@ object RefreshRateLift {
 
         // A record without a restorer comes from a build before the restorer; its write had gone through.
         override fun load() = prefs.getString(WRITTEN, null)?.let {
-            RefreshRateLiftLogic.Record(prefs.getString(ORIGINAL, null), it, prefs.getString(RESTORER, null) ?: "0", prefs.getBoolean(CONFIRMED, true))
+            RefreshRateLiftLogic.Record(prefs.getString(ORIGINAL, null), it, prefs.getString(RESTORER, null) ?: "0", prefs.getBoolean(CONFIRMED, true),
+                prefs.getString(PREVIOUS, null))
         }
 
         override fun save(record: RefreshRateLiftLogic.Record) {
             val edit = prefs.edit().putString(WRITTEN, record.written).putString(RESTORER, record.id).putBoolean(CONFIRMED, record.confirmed)
             if (record.original == null) edit.remove(ORIGINAL) else edit.putString(ORIGINAL, record.original)
+            if (record.previous == null) edit.remove(PREVIOUS) else edit.putString(PREVIOUS, record.previous)
             check(edit.commit()) { "could not record ${RefreshRateLiftLogic.KEY}" }
         }
 
         override fun clear() {
-            prefs.edit().remove(WRITTEN).remove(ORIGINAL).remove(RESTORER).remove(CONFIRMED).commit()
+            prefs.edit().remove(WRITTEN).remove(ORIGINAL).remove(RESTORER).remove(CONFIRMED).remove(PREVIOUS).commit()
         }
     }
 }

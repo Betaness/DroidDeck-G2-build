@@ -223,7 +223,7 @@ static _Atomic int g_mode = ZFG_MODE_REALLYZERO;
 static _Atomic(const char *) g_unsupported;
 static _Atomic int g_checked;
 static char g_unsupported_buf[200];
-static _Atomic float g_rate_real, g_rate_shown, g_peak_hz;
+static _Atomic float g_rate_real, g_rate_shown, g_peak_hz, g_vote_hz;
 static _Atomic int g_new_session;
 static pthread_mutex_t g_fail_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_fail[200];
@@ -280,6 +280,8 @@ void zfg_rates(float *real, float *shown) {
 }
 
 void zfg_set_peak_hz(float hz) { atomic_store(&g_peak_hz, hz > 1.0f ? hz : 0.0f); }
+
+float zfg_vote_hz(void) { return atomic_load(&g_vote_hz); }
 
 static pthread_mutex_t g_modes_lock = PTHREAD_MUTEX_INITIALIZER;
 static float g_modes[16];
@@ -1538,6 +1540,7 @@ static void vote_clear(void) {
     if (Z.vote_slot >= 0) sc_layer_vortek_frame_rate(Z.vote_slot, 0.0f);
     Z.vote_slot = -1;
     Z.vote = 0.0f;
+    atomic_store(&g_vote_hz, 0.0f);
     zfg_vote_reset(&Z.vs);
 }
 
@@ -1657,6 +1660,7 @@ static void vote_update(int slot, int64_t period, float peak, int64_t now) {
     sc_layer_vortek_frame_rate(slot, v);
     Z.vote_slot = slot;
     Z.vote = v;
+    atomic_store(&g_vote_hz, v);
 }
 
 static void say_on(int dpt) {

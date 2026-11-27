@@ -51,6 +51,8 @@ void zfg_set_mode(int mode);
 void zfg_rates(float *real, float *shown);
 /* Any thread. The highest refresh rate the session lets the panel run at (0: not given; the refresh rate). */
 void zfg_set_peak_hz(float hz);
+/* Any thread. The rate the layer's frame-rate vote asks the panel for (0: no vote in force). */
+float zfg_vote_hz(void);
 /* Any thread. The panel's rates the layer's vote may pick from (up to 16; none: whole fractions of the peak). */
 void zfg_set_modes(const float *hz, int n);
 /* Any thread. A new game session: ZeroFG, off after a failure, may run again; the failure is forgotten. */

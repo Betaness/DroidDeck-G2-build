@@ -81,6 +81,12 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetZeroFgPeakHz(JNIE
     zfg_set_peak_hz((float)hz);
 }
 
+JNIEXPORT jfloat JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeZeroFgVoteHz(JNIEnv *env, jclass clazz) {
+    (void)env; (void)clazz;
+    return (jfloat)zfg_vote_hz();
+}
+
 JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetZeroFgModes(JNIEnv *env, jclass clazz, jfloatArray hz) {
     (void)clazz;
