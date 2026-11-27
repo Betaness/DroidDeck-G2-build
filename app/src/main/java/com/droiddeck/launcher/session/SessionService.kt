@@ -1615,6 +1615,8 @@ class SessionService : Service() {
             val startBy = android.os.SystemClock.elapsedRealtime() + GAME_START_TIMEOUT_MS
             var seen = false
             var goneSince = 0L
+            val content = SteamContentActivity()
+            var held = emptyList<String>()
             while (token == gameExitWatchToken && gen == sessionGen && SessionState.running && !SessionState.stopRequested) {
                 val now = android.os.SystemClock.elapsedRealtime()
                 if (steamGameRunning()) {
@@ -1626,11 +1628,25 @@ class SessionService : Service() {
                         Log.i(TAG, "game $gameId did not start; not watching for its exit")
                         return@Thread
                     }
-                } else if (goneSince == 0L) {
-                    goneSince = now
-                } else if (now - goneSince >= GAME_EXIT_GRACE_MS) {
-                    mainHandler.post { returnAfterGame(gameId, gen, token) }
-                    return@Thread
+                } else {
+                    val busy = steamBusy(content)
+                    if (busy != held) {
+                        if (busy.isNotEmpty()) {
+                            Log.i(TAG, "game $gameId closed while Steam is busy (${busy.joinToString()}); returning to the launcher once it is done")
+                            SessionEvents.record("steam.return_held", mapOf("gameId" to gameId, "busy" to busy.joinToString()))
+                        } else {
+                            Log.i(TAG, "Steam is done (${held.joinToString()})")
+                        }
+                        held = busy
+                    }
+                    when {
+                        busy.isNotEmpty() -> goneSince = 0L
+                        goneSince == 0L -> goneSince = now
+                        now - goneSince >= GAME_EXIT_GRACE_MS -> {
+                            mainHandler.post { returnAfterGame(gameId, gen, token) }
+                            return@Thread
+                        }
+                    }
                 }
                 try { Thread.sleep(GAME_EXIT_POLL_MS) } catch (e: InterruptedException) { return@Thread }
             }
@@ -1648,6 +1664,11 @@ class SessionService : Service() {
     }
 
     private fun steamGameRunning(): Boolean = SteamGameProcess.running()
+
+    /** Downloads, install scripts and uninstalls the client is running; it is not asked to exit during them. */
+    private fun steamBusy(content: SteamContentActivity): List<String> = runCatching {
+        content.poll(SteamContentActivity.contentLog(LinuxRuntime.rootDir(this), SessionState.steamClientArch))
+    }.getOrDefault(emptyList())
 
     private fun resumeSession(panelVisible: Boolean = true) {
         if (SessionState.suspended) SessionState.resumeRequested = true

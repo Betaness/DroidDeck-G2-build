@@ -42,6 +42,49 @@ class LaunchCmdlineTest {
         assertNull(LaunchCmdline.parse(listOf("reaper", "SteamLaunch", "AppId=0", "--", "x")))
     }
 
+    // console_log.txt 2026-11-27 13:03:19: "Running install script evaluator for AppID 1473480, 7 step(s)".
+    private val evaluator = listOf(
+        "/root/.local/share/Steam/linuxarm64/pw-audio-namespace", "--",
+        "/root/.local/share/Steam/steamrtarm64/reaper", "SteamLaunch", "AppId=1473480", "Install=1", "--",
+        "/root/.local/share/Steam/compatibilitytools.d/droiddeck-proton-arm64/droiddeck-proton", "run",
+        "/root/.local/share/Steam/legacycompat/iscriptevaluator.exe", "legacycompat\\evaluatorscript_1473480.vdf",
+    )
+
+    @Test fun steamsInstallScriptIsNotAPlay() {
+        assertTrue(LaunchCmdline.steamHelper(evaluator))
+        assertNull(LaunchCmdline.parse(evaluator))
+        assertNull(LaunchCmdline.parse(evaluator.drop(2)))
+        assertTrue(LaunchCmdline.steamHelper(listOf("python3", "/x/proton", "run",
+            "/root/.local/share/Steam/legacycompat/iscriptevaluator.exe", "legacycompat\\evaluatorscript_1473480.vdf")))
+        assertTrue(LaunchCmdline.steamHelper(listOf("c:\\windows\\system32\\steam.exe",
+            "/root/.local/share/Steam/legacycompat/iscriptevaluator.exe", "legacycompat\\evaluatorscript_1473480.vdf")))
+        assertTrue(LaunchCmdline.steamHelper(listOf("C:\\Program Files (x86)\\Steam\\legacycompat\\IScriptEvaluator.exe")))
+        // Marked as an install even with the game's verb.
+        val marked = evaluator.toMutableList().apply { this[8] = "waitforexitandrun"; this[9] = "/x/Game.exe" }
+        assertTrue(LaunchCmdline.steamHelper(marked))
+        assertNull(LaunchCmdline.parse(marked))
+    }
+
+    @Test fun pressureVesselVerbsAreRead() {
+        val slr = listOf("reaper", "SteamLaunch", "AppId=220", "--", "/x/SteamLinuxRuntime_sniper/_v2-entry-point", "--verb=%s", "--",
+            "/x/Proton/proton", "%s", "/x/steamapps/common/Half-Life 2/hl2.exe")
+        val game = slr.map { it.replace("%s", "waitforexitandrun") }
+        val script = slr.map { it.replace("%s", "run") }
+        assertFalse(LaunchCmdline.steamHelper(game))
+        assertEquals("Half-Life 2/hl2.exe", LaunchCmdline.parse(game)!!.exe)
+        assertTrue(LaunchCmdline.steamHelper(script))
+        assertNull(LaunchCmdline.parse(script))
+    }
+
+    @Test fun gamesAreNotSteamHelpers() {
+        assertFalse(LaunchCmdline.steamHelper(wrapper))
+        assertFalse(LaunchCmdline.steamHelper(wrapper.drop(4)))
+        assertFalse(LaunchCmdline.steamHelper(listOf("reaper", "SteamLaunch", "AppId=70", "--",
+            "/root/.local/share/Steam/steamapps/common/Half-Life/hl_linux", "-steam")))
+        assertFalse(LaunchCmdline.steamHelper(listOf("reaper", "SteamLaunch", "AppId=70", "Install=0", "--", "/x/hl_linux")))
+        assertFalse(LaunchCmdline.steamHelper(listOf("python3", "/x/proton", "waitforexitandrun", "/x/Duckov.exe")))
+    }
+
     @Test fun nativeGamesAndShortcuts() {
         val native = LaunchCmdline.parse(listOf("reaper", "SteamLaunch", "AppId=70", "--",
             "/root/.local/share/Steam/steamapps/common/Half-Life/hl_linux", "-steam"))!!
