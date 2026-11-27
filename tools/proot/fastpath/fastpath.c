@@ -55,17 +55,20 @@ static unsigned long hits, misses;
 // A seccomp filter the guest installs itself (Firefox's content sandbox) can trap a trampoline
 // syscall that the host allows; proot answers those with ENOSYS. The call is then repeated
 // through libc, where the guest's own SIGSYS handler sees the guest path, and the process stops
-// using the fast path.
+// using the fast path. Filesystems return ENOSYS too (Android's FUSE daemon has no symlink or
+// link), so the call is asked again with invalid arguments: only a trap answers that with ENOSYS
+// as well. Otherwise just this call is repeated through libc and the fast path stays on. A close
+// still runs after a refusal, so descriptors opened for the refused call are not left open.
 static __thread int fp_refused;
 static int optional_syscall(long nr) {
   return nr == SYS_statx || nr == SYS_memfd_create || nr == SYS_faccessat2 || nr == SYS_close_range ||
          nr == SYS_openat2 || nr == SYS_renameat2;
 }
 static long sc(long nr, long a, long b, long c, long d, long e) {
-  if (fp_refused) return -ENOSYS;
+  if (fp_refused && nr != SYS_close) return -ENOSYS;
   long r = fp_sys(nr, a, b, c, d, e, 0);
   if (r == -ENOSYS && !optional_syscall(nr)) {
-    __atomic_store_n(&fp_on, 0, __ATOMIC_RELAXED);
+    if (fp_sys(nr, -1, -1, -1, -1, -1, 0) == -ENOSYS) __atomic_store_n(&fp_on, 0, __ATOMIC_RELAXED);
     fp_refused = 1;
   }
   return r;
