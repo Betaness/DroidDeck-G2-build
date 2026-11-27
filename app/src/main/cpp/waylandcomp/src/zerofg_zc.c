@@ -1654,7 +1654,8 @@ static void vote_update(int slot, int64_t period, float peak, int64_t now) {
     float modes[16];
     const int n = modes_get(modes);
     if (Z.vote_slot != slot) zfg_vote_reset(&Z.vs);
-    const float v = zfg_vote_step_n(&Z.vs, now, period, Z.mult.vote_n ? Z.mult.vote_n : 2, modes, n, peak);
+    const int held = Z.fast.on || (Z.mult.n && Z.mult.n < Z.mult.vote_n);
+    const float v = zfg_vote_step_n(&Z.vs, now, period, Z.mult.vote_n ? Z.mult.vote_n : 2, held, modes, n, peak);
     if (v <= 0.0f || (Z.vote_slot == slot && v == Z.vote)) return;
     if (Z.vote_slot >= 0 && Z.vote_slot != slot) sc_layer_vortek_frame_rate(Z.vote_slot, 0.0f);
     sc_layer_vortek_frame_rate(slot, v);
@@ -2170,9 +2171,10 @@ static int present(const struct vku_frame *f, int acquire_fd, void *token) {
     /* The game's acquire fence for the next pair, when no generation waited for this frame. */
     const int keep_acq = why >= 0 && acquire_fd >= 0 ? fcntl(acquire_fd, F_DUPFD_CLOEXEC, 0) : -1;
 
-    /* The vote goes with the frames below. */
-    if (why < 0 || why == SK_EARLY || why == SK_LATE || why == SK_BUSY) vote_update(f->slot, period, peak, now);
-    else if (why == SK_FAST || why == SK_UNSUPPORTED || why == SK_ERROR) vote_clear();
+    /* The vote goes with the frames below; while fast it asks for the rate that ends it. */
+    if (why < 0 || why == SK_EARLY || why == SK_LATE || why == SK_BUSY || why == SK_FAST)
+        vote_update(f->slot, period, peak, now);
+    else if (why == SK_UNSUPPORTED || why == SK_ERROR) vote_clear();
 
     if (why >= 0) S.skip[why]++;
     /* No generated frames for this pair (early, late, busy): B keeps the rhythm. */

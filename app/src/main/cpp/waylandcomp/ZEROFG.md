@@ -71,7 +71,7 @@ frames: the menu items are greyed out with that reason, and picking ZeroFG says 
   When S1 would have to pass the upper bound to keep that spacing (the real frame came early against the
   rhythm; at x4 on 120 Hz and x3 on 90 Hz, one output a refresh, any early frame at the top of the window),
   x3 and x4 leave out as few of the first generated frames as they can (`early_ph`; only where N times the real
-  rate is at most 5 % above the refresh rate): the next one goes at least the spacing after the previous B and
+  rate is at most 12 % above the refresh rate): the next one goes at least the spacing after the previous B and
   at least m Q after arrival + L (m left out), up to m Q after the upper bound, the others and B Q apart, so B
   comes m Q earlier than the rhythm would have it. Where none fits (and always at x2), the pair has no
   generated frames (`early`) and B goes (N - 1) P / N after arrival + L, at least the spacing after the previous
@@ -91,8 +91,9 @@ frames: the menu items are greyed out with that reason, and picking ZeroFG says 
   pairs in flight would not fit: with the median time from a real frame's arrival to its generation's completion
   D (last 16 pairs), floor(D / P) + 1 pairs are in flight, and their (N - 1) calls each must fit the 8 frame
   contexts and the 3 jobs (x4 up to D < 2 P, x3 up to 3 P; 15 % more than D to go back up), else every pair after
-  two still running would be skipped as `late`; and after N times the real rate stayed more than 5 % above the
-  running refresh rate for 2 s (3 % to go back up). A higher multiplier comes back once it has fitted for 2 s.
+  two still running would be skipped as `late`; and after N times the real rate stayed more than 12 % above the
+  running refresh rate for 2 s (3 % to go back up; up to 12 % the generated frames that find no refresh of their own
+  are left out and every output keeps one refresh). A higher multiplier comes back once it has fitted for 2 s.
   Every change is logged with its reason. x2's own limits are `fast` below.
 - SurfaceFlinger takes the transactions of a process in order and holds every later one behind one whose
   desired present time has not come, or whose buffer is not ready. So S and B are not handed over at once:
@@ -111,21 +112,28 @@ frames: the menu items are greyed out with that reason, and picking ZeroFG says 
   skips show B at once and restart the rhythm.
 - `fast` (B shown as it comes, no S): 2x the real rate more than 5 % above the peak rate (below), until it is
   3 % or less above; or the real rate itself more than 2 % above the running refresh rate, until it is no
-  longer above it; or 2x the real rate more than 5 % above the running refresh rate (until 3 % or less) for
+  longer above it; or 2x the real rate more than 12 % above the running refresh rate (until 3 % or less) for
   2 s, the panel having stayed below the peak after the vote (a power or thermal cap, the system's refresh
   policy, a peak the panel never reaches).
 - The layer votes the lowest of the panel's rates (modes of its current size up to the peak, from
   `SessionActivity`; none known: the peak over 1 .. 8) that is a whole multiple of N times the real rate within
   3 %, so every output keeps the same number of refreshes (30 fps: x2 60 Hz, x3 90 Hz, x4 120 Hz); where none is,
   the highest rate up to the peak (the smallest unevenness). N here is the multiplier in force, or a higher one
-  that only the running rate holds down, so the panel can come up for it. The rate is judged on P smoothed
-  further (each frame moves it an eighth of the way). The vote stays while N times the real rate is at most 5 %
-  above or 8 % below a whole fraction of it and no lower rate fits within 3 %; it changes once another rate has been chosen for 1 s without a break, so a few uneven frames do not move it
-  (`zfg_vote_step_n`). It asks for seamless mode switches only. The peak rate is the requested mode, else the
-  fastest mode of the panel's size, after the caps (`FrameGen.apply`). While ZeroFG is selected the session's own
-  vote is that rate too, so the panel comes back up after ZeroFG's vote lowered it, and for 10 s after ZeroFG was
-  turned off while the panel still runs below it; then the running rate, as without ZeroFG. Frames skipped as
-  `fast`, `unsupported` or `error`, and a window that stops being the main one, drop the layer's vote.
+  that only the running rate holds down, so the panel can come up for it. The rate is judged on P smoothed further
+  (each frame moves it an eighth of the way; the first vote on the mean of eight periods of eight intervals each).
+  The vote stays while N times the real rate is at most 12 % above or below a whole fraction of it, unless a lower
+  rate fits within 3 % and the vote does not (or the lower rate is at most half of it). Another rate replaces it
+  once it has been chosen for 10 s more than the vote was (time back in the band counts against it), so a rate at
+  a band edge does not move the panel; ten times faster while N times the real rate is more than 20 % above the
+  vote, the multiplier in force is below the one the vote is for or x2 is `fast` (the running rate costs outputs),
+  the vote is above the peak, or the first vote is less than 10 s old and unchanged (`zfg_vote_step_n`). So a rate
+  12 to 20 % above the panel's runs up to about 10 s with outputs left out before the panel comes up, and a lower
+  rate that fits again is taken 10 s late. It asks for seamless mode switches only. The peak rate is the requested
+  mode, else the fastest mode of the panel's size, after the caps (`FrameGen.apply`). While ZeroFG is selected the
+  session's own vote is that rate too, so the panel comes back up after ZeroFG's vote lowered it, and for 10 s
+  after ZeroFG was turned off while the panel still runs below it; then the running rate, as without ZeroFG. While
+  `fast` the vote goes on (it asks for the rate that ends it); frames skipped as `unsupported` or `error`, and a
+  window that stops being the main one, drop the layer's vote.
 
 The pure arithmetic is `src/zerofg_pace.c`, tested by `tests/zerofg_pace_test.c` (CI: "ZeroFG pacing test"),
 which also drives it as `zfg_present` does against a model of SurfaceFlinger's queue (one apply token, a

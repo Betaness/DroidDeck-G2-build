@@ -4,6 +4,7 @@
 #include "game_fill.h"
 #include "scene_map.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -165,7 +166,8 @@ static void votes(void) {
         CHECK(v == 60.0f, "%.1f fps after 60: 60, got %.1f", fps[i], v);
     }
     /* clearly away from 60 outputs: the vote moves */
-    CHECK(pick(32.0, m120, 7, 120.0f, 60.0f) == 120.0f, "64 outputs after 60: 120");
+    CHECK(pick(32.0, m120, 7, 120.0f, 60.0f) == 60.0f, "64 outputs after 60: 60 stays");
+    CHECK(pick(34.0, m120, 7, 120.0f, 60.0f) == 120.0f, "68 outputs after 60: 120");
     /* no modes given: whole fractions of the peak */
     CHECK(pick(30, NULL, 0, 120.0f, 0) == 60.0f, "30 fps, modes unknown: 120 / 2");
     CHECK(pick(20, NULL, 0, 120.0f, 0) == 40.0f, "20 fps, modes unknown: 120 / 3");
@@ -189,12 +191,22 @@ static void votes_near_30_on_the_tablet(void) {
         CHECK(!zfg_fast_update(&fs, 1000 * MS, (int64_t)(1e9 / f), 120.0f, 144.0f), "%.1f fps on 120 (peak 144): not fast",
               f);
     }
-    /* a vote of 60 stays while 2x the real rate is at most 5 % above or 8 % below 60 */
-    CHECK(pick(27.75, m, 7, 144.0f, 60.0f) == 60.0f, "55.5 outputs after 60: 60");
-    CHECK(pick(27.25, m, 7, 144.0f, 60.0f) == 144.0f, "54.5 outputs after 60: 144");
+    /* a vote of 60 stays while 2x the real rate is at most 12 % above or below 60 */
+    CHECK(pick(26.5, m, 7, 144.0f, 60.0f) == 60.0f, "53 outputs after 60: 60");
+    CHECK(pick(26.25, m, 7, 144.0f, 60.0f) == 144.0f, "52.5 outputs after 60: 144");
     CHECK(pick(27.75, m, 7, 144.0f, 0) == 144.0f, "55.5 outputs, no vote yet: 144");
-    CHECK(pick(31.45, m, 7, 144.0f, 60.0f) == 60.0f, "62.9 outputs after 60: 60");
-    CHECK(pick(31.8, m, 7, 144.0f, 60.0f) == 144.0f, "63.6 outputs after 60: 144");
+    CHECK(pick(33.5, m, 7, 144.0f, 60.0f) == 60.0f, "67 outputs after 60: 60");
+    CHECK(pick(33.75, m, 7, 144.0f, 60.0f) == 144.0f, "67.5 outputs after 60: 144");
+    /* x3 at 31.4 .. 33.5 fps (94 .. 100.5 outputs) after 90: 90 stays; from 144 only once 90 fits within 3 % */
+    const double near90[] = {31.4, 32.0, 32.5, 33.5};
+    for (unsigned i = 0; i < sizeof(near90) / sizeof(near90[0]); i++) {
+        CHECK(zfg_vote_pick_n((int64_t)(1e9 / near90[i]), 3, m, 7, 144.0f, 90.0f) == 90.0f,
+              "x3 at %.1f fps after 90: 90", near90[i]);
+        CHECK(zfg_vote_pick_n((int64_t)(1e9 / near90[i]), 3, m, 7, 144.0f, 144.0f) == 144.0f,
+              "x3 at %.1f fps after 144: 144", near90[i]);
+    }
+    CHECK(zfg_vote_pick_n((int64_t)(1e9 / 30.8), 3, m, 7, 144.0f, 144.0f) == 90.0f, "x3 at 30.8 fps after 144: 90");
+    CHECK(zfg_vote_pick_n((int64_t)(1e9 / 33.7), 3, m, 7, 144.0f, 90.0f) == 144.0f, "x3 at 33.7 fps after 90: 144");
 }
 
 /* Intervals of a game at about `fps`: each within 10 % of the mean, a 1.7x one every 23rd. */
@@ -257,8 +269,8 @@ static void vote_steady_through_uneven_frames(void) {
         if (zfg_vote_step(&v, t, iv, m, 7, 144.0f) != 60.0f) moved = t - step;
     }
     CHECK(v.hz == 90.0f, "30 then 45 fps: 90, got %.1f", v.hz);
-    CHECK(moved >= ZFG_VOTE_HOLD_NS && moved <= ZFG_VOTE_HOLD_NS + 500 * MS,
-          "the vote moved %lld ms after the rate changed", (long long)(moved / MS));
+    CHECK(moved >= ZFG_VOTE_HOLD_FAR_NS && moved <= ZFG_VOTE_HOLD_FAR_NS + 500 * MS,
+          "the vote moved %lld ms after the rate changed (far above 60)", (long long)(moved / MS));
 }
 
 static void vote_steps(void) {
@@ -266,9 +278,15 @@ static void vote_steps(void) {
     struct zfg_vote v;
     zfg_vote_reset(&v);
     CHECK(zfg_vote_step(&v, 1000 * MS, 0, m, 7, 144.0f) == 0.0f, "period unknown: no vote");
-    CHECK(zfg_vote_step(&v, 1010 * MS, 33333333, m, 7, 144.0f) == 60.0f, "the first vote at once");
+    int64_t t = 1000 * MS;
+    for (int n = 1; n < ZFG_PERIOD_HIST + ZFG_VOTE_FIRST; n++) {
+        t += 33333333;
+        CHECK(zfg_vote_step(&v, t, 33333333, m, 7, 144.0f) == 0.0f, "frame %d with a period: no vote yet", n);
+    }
+    t += 33333333;
+    CHECK(zfg_vote_step(&v, t, 33333333, m, 7, 144.0f) == 60.0f, "the first vote after %d frames",
+          ZFG_PERIOD_HIST + ZFG_VOTE_FIRST);
     /* 20 fps for 500 ms (the period of the vote moves towards 50 ms): 60 stays */
-    int64_t t = 1010 * MS;
     for (int n = 0; n < 10; n++) {
         t += 50 * MS;
         CHECK(zfg_vote_step(&v, t, 50 * MS, m, 7, 144.0f) == 60.0f, "a stretch at 20 fps, frame %d: 60 stays", n);
@@ -277,7 +295,7 @@ static void vote_steps(void) {
         t += 33333333;
         zfg_vote_step(&v, t, 33333333, m, 7, 144.0f);
     }
-    CHECK(v.hz == 60.0f && !v.away, "back at 30 fps: 60, nothing pending");
+    CHECK(v.hz == 60.0f && !v.away, "back at 30 fps: 60, nothing pending (%lld ms)", (long long)(v.away / MS));
     zfg_vote_reset(&v);
     CHECK(v.hz == 0.0f && v.period == 0, "reset: no vote");
 }
@@ -921,17 +939,29 @@ static void votes_n(void) {
     CHECK(pick_n(30, 4, NULL, 0, 120.0f, 0) == 120.0f, "x4 at 30 fps, modes unknown: the peak");
     CHECK(pick_n(30, 3, NULL, 0, 180.0f, 0) == 90.0f, "x3 at 30 fps, modes unknown: 180 / 2");
     CHECK(pick_n(30, 2, m, 7, 144.0f, 0) == pick(30, m, 7, 144.0f, 0), "zfg_vote_pick is x2");
-    /* the vote over the frames follows a multiplier change after the hold */
+    /* the vote over the frames follows a multiplier change after the hold: twice the outputs, far above 60 */
     struct zfg_vote v;
     zfg_vote_reset(&v);
     int64_t t = 1000 * MS;
-    CHECK(zfg_vote_step_n(&v, t, 33333333, 2, m, 7, 144.0f) == 60.0f, "x2 at 30 fps: 60");
+    for (int n = 0; n <= 20 * 30; n++, t += 33333333) zfg_vote_step_n(&v, t, 33333333, 2, 0, m, 7, 144.0f);
+    CHECK(v.hz == 60.0f, "x2 at 30 fps: 60");
+    t -= 33333333;
+    const int64_t t0 = t;
     int64_t moved = 0;
     for (int n = 0; n < 100 && !moved; n++) {
         t += 33333333;
-        if (zfg_vote_step_n(&v, t, 33333333, 4, m, 7, 144.0f) == 120.0f) moved = t - 1000 * MS;
+        if (zfg_vote_step_n(&v, t, 33333333, 4, 0, m, 7, 144.0f) == 120.0f) moved = t - t0;
     }
-    CHECK(moved >= ZFG_VOTE_HOLD_NS && moved <= ZFG_VOTE_HOLD_NS + 100 * MS, "x2 -> x4: 120 after %lld ms",
+    CHECK(moved >= ZFG_VOTE_HOLD_FAR_NS && moved <= ZFG_VOTE_HOLD_FAR_NS + 100 * MS, "x2 -> x4: 120 after %lld ms",
+          (long long)(moved / MS));
+    /* x4 -> x3 (90 outputs, below 120): after the long hold */
+    const int64_t t1 = t;
+    moved = 0;
+    for (int n = 0; n < 400 && !moved; n++) {
+        t += 33333333;
+        if (zfg_vote_step_n(&v, t, 33333333, 3, 0, m, 7, 144.0f) == 90.0f) moved = t - t1;
+    }
+    CHECK(moved >= ZFG_VOTE_HOLD_NS && moved <= ZFG_VOTE_HOLD_NS + 100 * MS, "x4 -> x3: 90 after %lld ms",
           (long long)(moved / MS));
 }
 
@@ -1126,6 +1156,260 @@ static void sim_xn_panel_below_the_peak(void) {
     hold_means(m, grace + 10, SIM_FRAMES - 2, &s, &b);
     CHECK(s > 0.9 && b > 0.9, "then x2 on 60: S held %.2f, B held %.2f refreshes", s, b);
     free(m);
+}
+
+/* x3 at 31.5 .. 33 fps on 90 Hz (94.5 .. 99 outputs a second, up to 10 % above the refresh rate): x3 stays, every
+ * output one refresh, the first generated frame of some pairs left out; no real frame lost. */
+static void sim_x3_a_little_above_90(void) {
+    const double fps[] = {31.5, 32.0, 32.5, 33.0};
+    for (unsigned i = 0; i < sizeof(fps) / sizeof(fps[0]); i++) {
+        struct sim *m = sim_xn(3, 11111111, fps[i], 144.0f);
+        int one = 0, outs = 0;
+        for (int f = 20; f < SIM_FRAMES - 2; f++) {
+            for (int k = 0; k < 2; k++)
+                if (m->s_hold[f][k]) {
+                    outs++;
+                    one += m->s_hold[f][k] == 1;
+                }
+            if (m->b_hold[f]) {
+                outs++;
+                one += m->b_hold[f] == 1;
+            }
+        }
+        const double secs = (SIM_FRAMES - 22) / fps[i];
+        CHECK(m->mult_lo == 3 && m->mult_hi == 3, "x3 at %.1f fps on 90: the multiplier %d .. %d", fps[i], m->mult_lo,
+              m->mult_hi);
+        CHECK(m->b_lost_after_warmup == 0 && m->order_bad == 0 && m->spacing_bad == 0 && m->bare_after_warmup == 0,
+              "x3 at %.1f fps on 90: %d lost, %d too close, %d off the spacing, %d without generated frames", fps[i],
+              m->b_lost_after_warmup, m->order_bad, m->spacing_bad, m->bare_after_warmup);
+        CHECK(one >= outs - 2, "x3 at %.1f fps on 90: %d of %d outputs held one refresh", fps[i], one, outs);
+        CHECK(outs >= secs * 90 * 0.97, "x3 at %.1f fps on 90: %.1f outputs a second", fps[i], outs / secs);
+        free(m);
+    }
+}
+
+/* ---- the vote, the multiplier and the panel together ----
+ *
+ * Frames come at a real rate that wanders or steps, each interval up to 10 % off its mean. The vote, the multiplier
+ * and fast go as zerofg_zc.c runs them; the session samples the vote once a second and the
+ * refresh lift (RefreshRateLiftLogic.due) puts its mode in place once it was wanted for 2 s without a break, at
+ * least 5 s after the lift's last write; no vote: the top rate. */
+struct loop_case {
+    int mult;
+    const float *modes;
+    int nm;
+    float peak;
+    double (*fps_at)(double secs, const struct loop_case *c);
+    double lo, hi, wander_s, phase; /* the real rate between lo and hi, a cycle (or a step) every wander_s */
+    double x2_gain;                 /* the real rate this much higher while x2 runs (its GPU time is shorter) */
+    int spikes;                     /* every 23rd interval 1.7 times as long */
+    double jitter;                  /* each interval up to this share off its mean (0: 10 %) */
+    double count_from;              /* seconds: changes before are not counted */
+    double secs;
+};
+struct loop_out {
+    int vote_changes, panel_changes, mult_lo, mult_hi;
+    float first_vote, last_vote, vote_from; /* vote_from: at count_from */
+    int panel, first_panel;
+    double vote_changed_at, panel_changed_at; /* seconds, the first change after the first vote; -1: none */
+};
+
+static double fps_sine(double secs, const struct loop_case *c) {
+    const double mid = (c->lo + c->hi) / 2, half = (c->hi - c->lo) / 2, w = 6.283185307179586 / c->wander_s;
+    return mid + half * (0.7 * sin(w * secs + c->phase) + 0.3 * sin(2.3 * w * secs + 1.0));
+}
+
+static uint32_t walk_state;
+static double walk_fps;
+static double fps_walk(double secs, const struct loop_case *c) {
+    (void)secs;
+    walk_state = walk_state * 1664525u + 1013904223u;
+    const double u = (double)(walk_state >> 8) / 16777216.0 - 0.5;
+    if (walk_fps <= 0.0) walk_fps = c->lo + (c->hi - c->lo) * c->phase;
+    walk_fps += u * (c->hi - c->lo) / c->wander_s * 0.4;
+    if (walk_fps < c->lo) walk_fps = 2 * c->lo - walk_fps;
+    if (walk_fps > c->hi) walk_fps = 2 * c->hi - walk_fps;
+    return walk_fps;
+}
+
+static double fps_step(double secs, const struct loop_case *c) { return secs < c->wander_s ? c->lo : c->hi; }
+
+static int mode_of(float hz, const float *modes, int nm, float peak) {
+    int top = 0;
+    for (int i = 0; i < nm; i++)
+        if (modes[i] <= peak + 0.5f && (int)(modes[i] + 0.5f) > top) top = (int)(modes[i] + 0.5f);
+    return hz > 1.0f ? (int)(hz + 0.5f) : top;
+}
+
+static void loop_run(const struct loop_case *c, struct loop_out *o) {
+    struct zfg_period per;
+    zfg_period_reset(&per);
+    struct zfg_vote v;
+    zfg_vote_reset(&v);
+    struct zfg_fast fast = {0, 0};
+    struct zfg_mult mult;
+    zfg_mult_reset(&mult);
+    memset(o, 0, sizeof(*o));
+    o->mult_lo = ZFG_MULT_MAX + 1;
+    o->vote_changed_at = o->panel_changed_at = -1.0;
+    walk_fps = 0.0;
+    float vote = 0.0f;
+    int want = mode_of(0.0f, c->modes, c->nm, c->peak), wanted = want, panel = want;
+    int64_t wanted_since = 0, written_at = 0, sampled = 0;
+    const int64_t t0 = 1000 * MS;
+    int64_t t = t0;
+    for (int n = 0; t - t0 < (int64_t)(c->secs * 1e9); n++) {
+        const double secs = (double)(t - t0) / 1e9;
+        double fps = c->fps_at(secs, c);
+        if (mult.n == 2) fps *= 1.0 + c->x2_gain;
+        jit_state = jit_state * 1664525u + 1013904223u;
+        const double j = c->jitter > 0.0 ? c->jitter : 0.1;
+        double iv = 1e9 / fps * (1.0 - j + 2.0 * j * ((double)(jit_state >> 8) / 16777216.0));
+        if (c->spikes && n % 23 == 22) iv *= 1.7;
+        t += (int64_t)iv;
+        if (!zfg_is_gap((int64_t)iv, zfg_period_get(&per))) zfg_period_add(&per, (int64_t)iv);
+        const int64_t period = zfg_period_get(&per);
+        zfg_fast_update(&fast, t, period, (float)panel, c->peak);
+        const struct zfg_mult_in in = {.want = c->mult, .period = period, .refresh_hz = (float)panel,
+                                       .peak_hz = c->peak};
+        const int nm = zfg_mult_update(&mult, t, &in);
+        if (t - t0 > 2000 * MS) {
+            if (nm < o->mult_lo) o->mult_lo = nm;
+            if (nm > o->mult_hi) o->mult_hi = nm;
+        }
+        const float before = vote;
+        const int counted = secs >= c->count_from;
+        if (!counted) o->vote_from = vote;
+        const float hz = zfg_vote_step_n(&v, t, period, mult.vote_n ? mult.vote_n : 2, fast.on || nm < mult.vote_n,
+                                         c->modes, c->nm, c->peak);
+        if (hz > 0.0f) vote = hz;
+        if (vote != before) {
+            if (o->first_vote > 0.0f) {
+                if (counted && o->vote_changed_at < 0) o->vote_changed_at = (double)(t - t0) / 1e9;
+                o->vote_changes += counted;
+            } else {
+                o->first_vote = vote;
+                /* the panel as the lift would have put it by then: the changes after it count */
+                panel = wanted = want = mode_of(vote, c->modes, c->nm, c->peak);
+                o->first_panel = panel;
+                written_at = wanted_since = t;
+            }
+        }
+        if (t - sampled >= 1000 * MS) {
+            sampled = t;
+            want = mode_of(vote, c->modes, c->nm, c->peak);
+        }
+        if (want != wanted) {
+            wanted = want;
+            wanted_since = t;
+        }
+        if (wanted != panel && t - wanted_since >= 2000 * MS && t - written_at >= 5000 * MS) {
+            panel = wanted;
+            written_at = t;
+            if (o->first_vote > 0.0f && counted) {
+                if (o->panel_changed_at < 0) o->panel_changed_at = (double)(t - t0) / 1e9;
+                o->panel_changes++;
+            }
+        }
+    }
+    o->last_vote = vote;
+    o->panel = panel;
+}
+
+/* x3 on 60/90/120/144 at a real rate that wanders over 30.5 .. 32.5 fps for 2 minutes (91.5 .. 97.5 outputs, at
+ * 90's band edges), slowly or quickly, starting low or high, with a 1.7 times longer frame now and then, with x2's
+ * shorter GPU time raising the real rate: at most one switch of the vote and of the panel, and none once at 90. */
+static void loop_x3_near_90(void) {
+    const float m[] = {60, 90, 120, 144};
+    const double waves[] = {4.0, 9.0, 20.0, 45.0, 120.0};
+    const double phases[] = {-1.5708, 0.0, 1.5708, 3.1416};
+    int cases = 0, at90 = 0;
+    for (int shape = 0; shape < 2; shape++)
+        for (unsigned w = 0; w < sizeof(waves) / sizeof(waves[0]); w++)
+            for (unsigned ph = 0; ph < sizeof(phases) / sizeof(phases[0]); ph++)
+                for (int variant = 0; variant < 4; variant++) {
+                    struct loop_case c = {.mult = 3, .modes = m, .nm = 4, .peak = 144.0f, .lo = 30.5, .hi = 32.5,
+                                          .wander_s = waves[w], .phase = phases[ph], .secs = 120.0};
+                    c.fps_at = shape ? fps_walk : fps_sine;
+                    if (shape) c.phase = (ph + 0.5) / 4.0;
+                    c.spikes = variant & 1;
+                    c.x2_gain = variant & 2 ? 0.07 : 0.0;
+                    jit_state = 101u + 7u * w + 31u * ph + 977u * (unsigned)variant;
+                    walk_state = 5u + w + 13u * ph;
+                    struct loop_out o;
+                    loop_run(&c, &o);
+                    cases++;
+                    at90 += o.last_vote == 90.0f;
+                    CHECK(o.vote_changes <= 1 && o.panel_changes <= 1,
+                          "x3 at 30.5 .. 32.5 fps (%s, %.0f s, phase %u, spikes %d, x2 gain %.2f): the vote %.0f -> "
+                          "%.0f, %d changes, the panel %d changes (first at %.1f s)", shape ? "walk" : "sine",
+                          waves[w], ph, c.spikes, c.x2_gain, (double)o.first_vote, (double)o.last_vote,
+                          o.vote_changes, o.panel_changes, o.panel_changed_at);
+                    CHECK(!(o.first_vote == 90.0f && o.vote_changes), "x3 (%s, %.0f s, phase %u): 90 first, then %.0f",
+                          shape ? "walk" : "sine", waves[w], ph, (double)o.last_vote);
+                    CHECK(o.mult_lo == 3 && o.mult_hi == 3, "x3 (%s, %.0f s, phase %u): the multiplier %d .. %d",
+                          shape ? "walk" : "sine", waves[w], ph, o.mult_lo, o.mult_hi);
+                }
+    CHECK(at90 >= cases / 2, "x3 at 30.5 .. 32.5 fps: 90 at the end in %d of %d runs", at90, cases);
+}
+
+/* Other multipliers and mode sets near a band edge: x2 about 60 and 90, x4 about 120, x3 on the tablet's modes, x2
+ * and x3 with the peak at 120: at most one switch of the vote and of the panel. */
+static void loop_near_band_edges(void) {
+    const float m4[] = {60, 90, 120, 144};
+    const float m7[] = {30, 48, 50, 60, 90, 120, 144};
+    const struct { int mult; const float *modes; int nm; float peak; double lo, hi; } cases[] = {
+        {2, m4, 4, 144.0f, 29.5, 31.5}, {2, m4, 4, 144.0f, 44.5, 47.5}, {4, m4, 4, 144.0f, 29.5, 31.5},
+        {3, m7, 7, 144.0f, 30.5, 32.5}, {2, m7, 7, 120.0f, 29.5, 31.5}, {3, m7, 7, 120.0f, 38.5, 40.5},
+        {2, m7, 7, 144.0f, 24.0, 26.0}, {4, m7, 7, 144.0f, 35.0, 37.0}};
+    const double waves[] = {5.0, 20.0, 60.0};
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        for (unsigned w = 0; w < sizeof(waves) / sizeof(waves[0]); w++)
+            for (int ph = 0; ph < 4; ph++) {
+                struct loop_case c = {.mult = cases[i].mult, .modes = cases[i].modes, .nm = cases[i].nm,
+                                      .peak = cases[i].peak, .fps_at = fps_sine, .lo = cases[i].lo, .hi = cases[i].hi,
+                                      .wander_s = waves[w], .phase = ph * 1.5708, .spikes = ph & 1, .secs = 120.0};
+                jit_state = 3u + 11u * i + 101u * w + 1009u * (unsigned)ph;
+                struct loop_out o;
+                loop_run(&c, &o);
+                CHECK(o.vote_changes <= 1 && o.panel_changes <= 1,
+                      "x%d at %.1f .. %.1f fps, peak %.0f, %u modes (%.0f s, phase %d): the vote %.0f -> %.0f, %d "
+                      "changes, the panel %d", c.mult, c.lo, c.hi, (double)c.peak, c.nm, waves[w], ph,
+                      (double)o.first_vote, (double)o.last_vote, o.vote_changes, o.panel_changes);
+            }
+}
+
+/* A real change of rate still moves the vote and the panel, once. Far above the vote (x3 from 30 to 45 fps: 90 to 135
+ * outputs) within about a second, the panel within the lift's 2 s after it; just out of the band (x3 at 34.5 fps, 103.5
+ * outputs, 15 % above 90) after the long hold; further (35.5 fps, 18 % above) once the multiplier went down to x2 for
+ * the running rate after its grace; below the band or where a lower rate fits again (x3 from 45 to 30: 144 shows every
+ * output, unevenly, none lost) after the long hold. x2 (fast until the panel is up) and x4 likewise. */
+static void loop_steps(void) {
+    const float m[] = {60, 90, 120, 144};
+    const struct { int mult; double lo, hi; float from, to; double vote_min, vote_max, panel_max; } cases[] = {
+        {3, 30.0, 45.0, 90.0f, 144.0f, 0.5, 1.5, 4.5},   {3, 30.0, 34.5, 90.0f, 144.0f, 9.5, 15.0, 18.0},
+        {3, 30.0, 35.5, 90.0f, 144.0f, 2.0, 7.0, 10.0},   {3, 45.0, 30.0, 144.0f, 90.0f, 9.5, 15.0, 18.0},
+        {2, 30.0, 45.0, 60.0f, 90.0f, 0.5, 1.5, 4.5},    {2, 45.0, 30.0, 90.0f, 60.0f, 9.5, 11.0, 14.0},
+        {4, 30.0, 36.0, 120.0f, 144.0f, 1.0, 4.5, 7.5}};
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        for (int spikes = 0; spikes < 2; spikes++) {
+            const double step = 30.0;
+            struct loop_case c = {.mult = cases[i].mult, .modes = m, .nm = 4, .peak = 144.0f, .fps_at = fps_step,
+                                  .lo = cases[i].lo, .hi = cases[i].hi, .wander_s = step, .spikes = spikes,
+                                  .count_from = step, .secs = 60.0};
+            jit_state = 17u + 3u * i + (unsigned)spikes;
+            struct loop_out o;
+            loop_run(&c, &o);
+            const double dv = o.vote_changed_at - step, dp = o.panel_changed_at - step;
+            CHECK(o.vote_from == cases[i].from && o.last_vote == cases[i].to && o.vote_changes == 1 &&
+                  o.panel_changes == 1 && o.panel == mode_of(cases[i].to, m, 4, 144.0f),
+                  "x%d %.1f -> %.1f fps (spikes %d): the vote %.0f -> %.0f (%d changes), the panel %d (%d changes)",
+                  c.mult, c.lo, c.hi, spikes, (double)o.vote_from, (double)o.last_vote, o.vote_changes, o.panel,
+                  o.panel_changes);
+            CHECK(dv >= cases[i].vote_min && dv <= cases[i].vote_max && dp > dv && dp <= cases[i].panel_max,
+                  "x%d %.1f -> %.1f fps (spikes %d): the vote moved %.1f s, the panel %.1f s after the step", c.mult,
+                  c.lo, c.hi, spikes, dv, dp);
+        }
 }
 
 /* g2-060's zfg_schedule, before x3 and x4. */
@@ -1531,6 +1815,10 @@ int main(void) {
     sim_xn_at_30();
     sim_xn_downgrades();
     sim_xn_panel_below_the_peak();
+    sim_x3_a_little_above_90();
+    loop_x3_near_90();
+    loop_near_band_edges();
+    loop_steps();
     schedule_x2_as_before();
     slots_drop_first();
     pair_times_and_actions();

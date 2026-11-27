@@ -97,9 +97,9 @@ struct zfg_slots zfg_schedule_n(int64_t arrival, int64_t prev_b, int64_t period,
         r.b = r.s + (n - 1) * step;
         return r;
     }
-    /* the first m generated frames left out, where n outputs fit the refresh rate (within 5 %, as the multiplier
-     * is kept); else (the multiplier is about to be lowered for the running rate) none */
-    const int fit = refresh <= 0 || q * 105 >= refresh * 100;
+    /* the first m generated frames left out, where n outputs fit the refresh rate (within ZFG_OVER_KEEP, as the
+     * multiplier is kept); else (the multiplier is about to be lowered for the running rate) none */
+    const int fit = refresh <= 0 || (double)q * (1.0 + ZFG_OVER_KEEP) >= (double)refresh;
     for (int m = 1; fit && m < n - 1; m++) {
         int64_t f = prev_b + gap;
         if (f < lo + m * step) f = lo + m * step;
@@ -199,15 +199,18 @@ float zfg_vote_pick_n(int64_t period, int mult, const float *modes, int n, float
     if (!nc)
         for (int k = 1; k <= 8; k++) cand[nc++] = (float)(peak / k);
     float best = 0.0f, top = 0.0f;
-    int kept = 0;
+    int kept = 0, even = 0;
     for (int i = 0; i < nc; i++) {
         if (cand[i] > top) top = cand[i];
+        const int fits = vote_fits(cand[i], out, ZFG_VOTE_FIT, ZFG_VOTE_FIT);
         if (prev > 0.0f && fabs(cand[i] - prev) < 0.5 &&
-            vote_fits(cand[i], out, ZFG_VOTE_KEEP_BELOW, ZFG_VOTE_KEEP_ABOVE))
+            vote_fits(cand[i], out, ZFG_VOTE_KEEP_BELOW, ZFG_VOTE_KEEP_ABOVE)) {
             kept = 1;
-        if (vote_fits(cand[i], out, ZFG_VOTE_FIT, ZFG_VOTE_FIT) && (best <= 0.0f || cand[i] < best)) best = cand[i];
+            even = fits;
+        }
+        if (fits && (best <= 0.0f || cand[i] < best)) best = cand[i];
     }
-    if (kept && !(best > 0.0f && best < prev)) return prev;
+    if (kept && !(best > 0.0f && best < prev && (!even || best <= prev / 2 + 0.5f))) return prev;
     return best > 0.0f ? best : top;
 }
 
@@ -215,39 +218,43 @@ float zfg_vote_pick(int64_t period, const float *modes, int n, float peak_hz, fl
     return zfg_vote_pick_n(period, 2, modes, n, peak_hz, prev);
 }
 
-void zfg_vote_reset(struct zfg_vote *v) {
-    v->hz = 0.0f;
-    v->away = 0;
-    v->away_since = 0;
-    v->period = 0;
-}
+void zfg_vote_reset(struct zfg_vote *v) { memset(v, 0, sizeof(*v)); }
 
-float zfg_vote_step_n(struct zfg_vote *v, int64_t now, int64_t period, int mult, const float *modes, int n,
-                      float peak_hz) {
-    if (period > 0) v->period = v->period > 0 ? v->period + (period - v->period) / 8 : period;
+float zfg_vote_step_n(struct zfg_vote *v, int64_t now, int64_t period, int mult, int held, const float *modes,
+                      int n, float peak_hz) {
+    if (period > 0 && v->frames < ZFG_PERIOD_HIST + 8) v->frames++;
+    const int k = v->frames - ZFG_PERIOD_HIST;
+    if (period > 0 && k > 0) v->period += (period - v->period) / k;
+    int64_t dt = v->last > 0 && now > v->last ? now - v->last : 0;
+    if (dt > ZFG_GAP_MIN_NS) dt = ZFG_GAP_MIN_NS;
+    v->last = now;
+    if (k < ZFG_VOTE_FIRST) return v->hz;
     const float pick = zfg_vote_pick_n(v->period, mult, modes, n, peak_hz, v->hz);
-    if (pick <= 0.0f || pick == v->hz) {
-        v->away = 0;
-        return v->hz;
-    }
+    if (pick <= 0.0f) return v->hz;
     if (v->hz <= 0.0f) {
         v->hz = pick;
         v->away = 0;
+        v->young_until = now + ZFG_VOTE_HOLD_NS;
         return pick;
     }
-    if (!v->away) {
-        v->away = 1;
-        v->away_since = now;
+    const double out = mult_of(mult) * 1e9 / (double)v->period;
+    if (held || now < v->young_until || out > (double)v->hz * (1.0 + ZFG_VOTE_FAR) || v->hz > peak_hz + 0.5f)
+        dt *= ZFG_VOTE_HOLD_NS / ZFG_VOTE_HOLD_FAR_NS;
+    if (pick == v->hz) {
+        v->away = v->away > dt ? v->away - dt : 0;
+        return v->hz;
     }
-    if (now - v->away_since >= ZFG_VOTE_HOLD_NS) {
+    v->away += dt;
+    if (v->away >= ZFG_VOTE_HOLD_NS) {
         v->hz = pick;
         v->away = 0;
+        v->young_until = 0;
     }
     return v->hz;
 }
 
 float zfg_vote_step(struct zfg_vote *v, int64_t now, int64_t period, const float *modes, int n, float peak_hz) {
-    return zfg_vote_step_n(v, now, period, 2, modes, n, peak_hz);
+    return zfg_vote_step_n(v, now, period, 2, 0, modes, n, peak_hz);
 }
 
 int zfg_too_fast(int64_t period, float peak_hz, int was_fast) {
@@ -263,7 +270,7 @@ int zfg_fast_update(struct zfg_fast *f, int64_t now, int64_t period, float refre
     }
     const double real = 1e9 / (double)period;
     const int was = f->on;
-    const int over_run = refresh_hz > 0.0f && 2.0 * real > (double)refresh_hz * (was ? 1.03 : 1.05);
+    const int over_run = refresh_hz > 0.0f && 2.0 * real > (double)refresh_hz * (was ? 1.03 : 1.0 + ZFG_OVER_KEEP);
     if (!over_run) f->over_since = 0;
     else if (!f->over_since) f->over_since = now;
     f->on = zfg_too_fast(period, peak_hz, was) ||
@@ -283,12 +290,16 @@ double zfg_pair_gpu_ms(int mult, double first_ms, double phase_ms) {
     return (first_ms > 0.0 ? first_ms : 0.0) + (mult - 2) * (phase_ms > 0.0 ? phase_ms : 0.0);
 }
 
-/* Whether `mult` times the real rate fits: below a rate (peak or running refresh rate, 0: unknown), the GPU time
- * of a pair within the share of the period, and its pairs in flight within the frame contexts and jobs. keep: the
- * limits that keep a multiplier in force (else those that let one come back). */
-static int fits_rate(int mult, double real, float hz, int keep) {
-    return hz <= 0.0f || mult * real <= (double)hz * (keep ? 1.05 : 1.03);
+/* Whether `mult` times the real rate fits: at most `over` above a rate (0: unknown), the GPU time of a pair within
+ * the share of the period, and its pairs in flight within the frame contexts and jobs. keep: the limits that keep a
+ * multiplier in force (else those that let one come back; over: 5 % above the peak rate, ZFG_OVER_KEEP above the
+ * running rate, else 3 %). */
+static int fits_rate(int mult, double real, float hz, double over) {
+    return hz <= 0.0f || mult * real <= (double)hz * (1.0 + over);
 }
+
+static double peak_over(int keep) { return keep ? 0.05 : 0.03; }
+static double running_over(int keep) { return keep ? ZFG_OVER_KEEP : 0.03; }
 
 static int fits_gpu(int mult, const struct zfg_mult_in *in, int keep) {
     return in->gpu_first_ms <= 0.0 || zfg_pair_gpu_ms(mult, in->gpu_first_ms, in->gpu_phase_ms) <=
@@ -321,25 +332,25 @@ int zfg_mult_update(struct zfg_mult *m, int64_t now, const struct zfg_mult_in *i
     const double real = 1e9 / (double)period;
     int n = m->n;
     while (n > limit) n--;
-    while (n > 2 && !fits_rate(n, real, in->peak_hz, 1)) n--;
+    while (n > 2 && !fits_rate(n, real, in->peak_hz, peak_over(1))) n--;
     while (n > 2 && !fits_gpu(n, in, 1)) {
         m->gpu_block = n;
         m->gpu_block_until = now + ZFG_GPU_BLOCK_NS;
         n--;
     }
     while (n > 2 && !fits_flight(n, in, 1)) n--;
-    if (n > 2 && !fits_rate(n, real, in->refresh_hz, 1)) {
+    if (n > 2 && !fits_rate(n, real, in->refresh_hz, running_over(1))) {
         if (!m->over_since) m->over_since = now;
         if (now - m->over_since >= ZFG_FAST_GRACE_NS)
-            while (n > 2 && !fits_rate(n, real, in->refresh_hz, 1)) n--;
+            while (n > 2 && !fits_rate(n, real, in->refresh_hz, running_over(1))) n--;
     }
     if (n != m->n) m->raise = 0;
-    if (n > 2 && fits_rate(n, real, in->refresh_hz, 1)) m->over_since = 0;
+    if (n > 2 && fits_rate(n, real, in->refresh_hz, running_over(1))) m->over_since = 0;
     if (n == 2) m->over_since = 0;
     int up = 0;
     for (int k = want < limit ? want : limit; k > n && !up; k--)
-        if (fits_rate(k, real, in->peak_hz, 0) && fits_rate(k, real, in->refresh_hz, 0) && fits_gpu(k, in, 0) &&
-            fits_flight(k, in, 0) && !(m->gpu_block && k >= m->gpu_block))
+        if (fits_rate(k, real, in->peak_hz, peak_over(0)) && fits_rate(k, real, in->refresh_hz, running_over(0)) &&
+            fits_gpu(k, in, 0) && fits_flight(k, in, 0) && !(m->gpu_block && k >= m->gpu_block))
             up = k;
     if (!up) m->raise = 0;
     else if (m->raise != up) {
@@ -354,7 +365,7 @@ int zfg_mult_update(struct zfg_mult *m, int64_t now, const struct zfg_mult_in *i
     const int voted = m->vote_n;
     m->vote_n = n;
     for (int k = want < limit ? want : limit; k > n; k--)
-        if (fits_rate(k, real, in->peak_hz, k <= voted) && fits_gpu(k, in, 1) && fits_flight(k, in, 1) &&
+        if (fits_rate(k, real, in->peak_hz, peak_over(k <= voted)) && fits_gpu(k, in, 1) && fits_flight(k, in, 1) &&
             !(m->gpu_block && k >= m->gpu_block)) {
             m->vote_n = k;
             break;
@@ -363,7 +374,7 @@ int zfg_mult_update(struct zfg_mult *m, int64_t now, const struct zfg_mult_in *i
     if (n < want) {
         const int k = n + 1;
         m->why = k > limit                                                         ? ZFG_CAP_ENGINE
-                 : !fits_rate(k, real, in->peak_hz, 0)                              ? ZFG_CAP_PEAK
+                 : !fits_rate(k, real, in->peak_hz, peak_over(0))                   ? ZFG_CAP_PEAK
                  : !fits_gpu(k, in, 0) || (m->gpu_block && k >= m->gpu_block)       ? ZFG_CAP_GPU
                  : !fits_flight(k, in, 0)                                           ? ZFG_CAP_LATE
                                                                                     : ZFG_CAP_REFRESH;

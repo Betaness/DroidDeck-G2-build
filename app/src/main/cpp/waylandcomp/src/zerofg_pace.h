@@ -53,6 +53,10 @@ int64_t zfg_slack(int64_t period, int64_t refresh);
 /* x3 and x4: outputs are at least this share of their mean interval (a real-frame period / N) apart, and at least
  * a refresh. x2: a refresh. */
 #define ZFG_SPACING 0.8
+/* n times the real rate may be up to this share above the running refresh rate while x3 and x4 keep their multiplier
+ * and x2 does not go fast (each after ZFG_FAST_GRACE_NS above it): the generated frames that find no refresh of their
+ * own are left out, every output keeps one refresh. The vote keeps a rate as far (ZFG_VOTE_KEEP_ABOVE). */
+#define ZFG_OVER_KEEP 0.12
 
 struct zfg_slots {
     int64_t s, b;
@@ -69,9 +73,9 @@ int64_t zfg_spacing(int64_t period, int n, int64_t refresh);
  * frame's target (prev_b; 0: none), kept between arrival + lead and arrival + lead + slack and at least
  * zfg_spacing after prev_b; the others and b follow a period / n apart (at least a refresh). When s would have to
  * pass arrival + lead + slack to stay that far after prev_b (the real frame came early against the rhythm), the
- * first generated frames are left out, as few as can be (x3 and x4 where n times the real rate is at most 5 %
- * above the refresh rate): the next one goes at least zfg_spacing after prev_b and at least m steps after
- * arrival + lead (m left out), within m steps after arrival + lead + slack, the others and b a step apart, so b
+ * first generated frames are left out, as few as can be (x3 and x4 where n times the real rate is at most
+ * ZFG_OVER_KEEP above the refresh rate): the next one goes at least zfg_spacing after prev_b and at least m steps
+ * after arrival + lead (m left out), within m steps after arrival + lead + slack, the others and b a step apart, so b
  * comes m steps earlier than the rhythm would have it. When none is left
  * (x2, or no room even for the last), b is (n - 1) periods / n after arrival + lead, at least zfg_spacing after
  * prev_b, but never later than b of a pair with generated frames could be (arrival + lead + slack + (n - 1)
@@ -123,30 +127,44 @@ int zfg_s_action(int ready, int64_t now, int64_t apply, int64_t last, int force)
 /* The layer's frame-rate vote: the lowest of the panel's rates (`modes`, n of them; none given: the peak rate
  * over 1 .. 8) that is a whole multiple of `mult` times the real rate within 3 %, so every output keeps the same
  * number of refreshes; where none is, the highest rate up to the peak (the smallest unevenness). The previous
- * vote (0: none) stays while mult times the real rate is at most 5 % above or 8 % below a whole fraction of it
- * (ZFG_VOTE_KEEP_*) and no lower rate fits within 3 %. Rates above the peak are not voted. 0 while the period
- * or the peak rate is unknown. zfg_vote_pick: mult 2. */
+ * vote (0: none) stays while mult times the real rate is at most 12 % above or below a whole fraction of it
+ * (ZFG_VOTE_KEEP_*), unless a lower rate fits within 3 % and the previous vote does not, or the lower rate is at
+ * most half of it. Rates above the peak are not voted. 0 while the period or the peak rate is unknown.
+ * zfg_vote_pick: mult 2. */
 #define ZFG_VOTE_FIT 0.03
-#define ZFG_VOTE_KEEP_ABOVE 0.05
-#define ZFG_VOTE_KEEP_BELOW 0.08
+#define ZFG_VOTE_KEEP_ABOVE ZFG_OVER_KEEP
+#define ZFG_VOTE_KEEP_BELOW 0.12
 float zfg_vote_pick_n(int64_t period, int mult, const float *modes, int n, float peak_hz, float prev);
 float zfg_vote_pick(int64_t period, const float *modes, int n, float peak_hz, float prev);
 
-/* The vote over the frames. The period is smoothed further (each frame's period moves it an eighth of the way:
- * the period of a few uneven frames hardly moves it). The first vote is zfg_vote_pick_n's choice for it; then
- * that choice (with `hz` as the previous vote) replaces the vote once zfg_vote_pick_n has chosen other rates for
- * ZFG_VOTE_HOLD_NS without a break (also after the multiplier changed). zfg_vote_step: mult 2. */
-#define ZFG_VOTE_HOLD_NS 1000000000LL
+/* The vote over the frames. The period is smoothed further: from the first frame whose period covers a whole
+ * history (ZFG_PERIOD_HIST intervals) the mean of eight, then each frame's period moves it an eighth of the way (the
+ * period of a few uneven frames hardly moves it). The first vote is zfg_vote_pick_n's choice once ZFG_VOTE_FIRST
+ * such frames came. Then, while zfg_vote_pick_n (with `hz` as the previous vote) chooses another rate, the time
+ * since the previous frame (at most ZFG_GAP_MIN_NS) adds to `away`; while it chooses the vote, that time comes off
+ * again. Both count ZFG_VOTE_HOLD_NS / ZFG_VOTE_HOLD_FAR_NS times over while mult times the real rate is more than
+ * ZFG_VOTE_FAR above the vote, the running rate holds the outputs down (`held`: the multiplier in force below the
+ * one the vote is for, or fast), the vote is above the peak, or the first vote is younger than ZFG_VOTE_HOLD_NS and
+ * has not changed (it was taken on few frames). Once `away` reaches ZFG_VOTE_HOLD_NS, the choice replaces the vote:
+ * about ZFG_VOTE_HOLD_NS outside the band that keeps it, ZFG_VOTE_HOLD_FAR_NS in those cases; a rate outside the
+ * band at most half the time does not move it (also after the multiplier changed). zfg_vote_step: mult 2. */
+#define ZFG_VOTE_HOLD_NS 10000000000LL
+#define ZFG_VOTE_HOLD_FAR_NS 1000000000LL
+#define ZFG_VOTE_FAR 0.2
+#define ZFG_VOTE_FIRST 8
 struct zfg_vote {
-    float hz;           /* the vote in force; 0: none */
-    int away;           /* zfg_vote_pick_n has chosen another rate since away_since */
-    int64_t away_since;
-    int64_t period;     /* smoothed; 0: none yet */
+    float hz;            /* the vote in force; 0: none */
+    int frames;          /* with a period, up to ZFG_PERIOD_HIST + 8 */
+    int64_t away;        /* towards a change, up to ZFG_VOTE_HOLD_NS */
+    int64_t last;        /* the previous frame; 0: none */
+    int64_t young_until; /* the first vote, until it changed or this time came */
+    int64_t period;      /* smoothed; 0: none yet */
 };
 void zfg_vote_reset(struct zfg_vote *v);
-/* The vote for a real frame at `now`; 0 while there is none. */
-float zfg_vote_step_n(struct zfg_vote *v, int64_t now, int64_t period, int mult, const float *modes, int n,
-                      float peak_hz);
+/* The vote for a real frame at `now`; 0 while there is none. held: the multiplier in force is below `mult`, or x2's
+ * generated frames are off for the running rate (fast). */
+float zfg_vote_step_n(struct zfg_vote *v, int64_t now, int64_t period, int mult, int held, const float *modes,
+                      int n, float peak_hz);
 float zfg_vote_step(struct zfg_vote *v, int64_t now, int64_t period, const float *modes, int n, float peak_hz);
 
 /* Twice the real rate is more than 5 % above the peak refresh rate; once it was (was_fast), until it is 3 %
@@ -156,8 +174,8 @@ int zfg_too_fast(int64_t period, float peak_hz, int was_fast);
 /* `fast`: real frames go to the display as they come, without S. Twice the real rate above the peak rate
  * (zfg_too_fast); or the real rate itself more than 2 % above the running refresh rate (until it is no
  * longer above it): not every real frame can have a refresh of its own; or twice the real rate more than
- * 5 % above the running refresh rate (until 3 % or less) for ZFG_FAST_GRACE_NS: the panel did not come up
- * to the peak rate after the vote (a power or thermal cap, the system's refresh policy). Below that, S frames
+ * ZFG_OVER_KEEP above the running refresh rate (until 3 % or less) for ZFG_FAST_GRACE_NS: the panel did not come
+ * up to the peak rate after the vote (a power or thermal cap, the system's refresh policy). Below that, S frames
  * that find no refresh of their own are left out (zfg_schedule). refresh_hz 0: unknown, the peak rate alone. */
 #define ZFG_FAST_GRACE_NS 2000000000LL
 struct zfg_fast {
@@ -191,8 +209,8 @@ int zfg_flight_pairs(int64_t ready_ns, int64_t period);
  *   real frame's arrival to its generation's completion) would need more Interpolate calls than ZFG_CONTEXTS, or
  *   more than ZFG_JOBS pairs, so that pairs would be skipped as late (ZFG_FLIGHT_RAISE times ready_ns to go back
  *   up);
- * - ZFG_CAP_REFRESH after mult times the real rate stayed more than 5 % above the running refresh rate (refresh_hz,
- *   0: unknown) for ZFG_FAST_GRACE_NS (3 % to go back up).
+ * - ZFG_CAP_REFRESH after mult times the real rate stayed more than ZFG_OVER_KEEP above the running refresh rate
+ *   (refresh_hz, 0: unknown) for ZFG_FAST_GRACE_NS (3 % to go back up).
  * A higher multiplier comes back once it has fitted for ZFG_MULT_RAISE_NS. vote_n is the multiplier the layer's
  * frame-rate vote is for: n, or the highest one only the running rate holds down, so the panel can come up. */
 #define ZFG_GPU_SHARE 0.5
