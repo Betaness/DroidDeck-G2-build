@@ -378,6 +378,20 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeVsync(JNIEnv *env, j
 }
 
 JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeFrameTimeline(JNIEnv *env, jclass clazz, jlong presentNanos,
+                                                                         jlong deadlineNanos, jlong periodNanos) {
+    (void)env; (void)clazz;
+    sc_layer_frame_timeline((int64_t)presentNanos, (int64_t)deadlineNanos, (int64_t)periodNanos);
+}
+
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetPresentCadence(JNIEnv *env, jclass clazz, jboolean on) {
+    (void)env; (void)clazz;
+    sc_layer_set_present_cadence(on ? 1 : 0);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "even frame pacing %s", on ? "on" : "off");
+}
+
+JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetHideShell(JNIEnv *env, jclass clazz, jboolean hide) {
     g_hide_shell = hide ? 1 : 0;
 }

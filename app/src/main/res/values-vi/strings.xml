@@ -575,16 +575,7 @@
     <string name="perf_gsrealtime">gamescope: hàng đợi GPU thời gian thực</string>
     <string name="perf_gsrealtime_hint">Ưu tiên công việc GPU của compositor. Có thể làm nhịp khung hình mượt hơn với một phần chi phí cho game.</string>
     <string name="perf_gpu">GPU</string>
-    <string name="perf_memory">Bộ nhớ</string>
     <string name="perf_cap_off">Tắt</string>
-    <string name="perf_cap_auto">Mặc định của driver</string>
-    <string name="perf_zram_client">Nén Steam khi game đang chạy</string>
-    <string name="perf_zram_client_hint">20 giây sau khi game bắt đầu, client Steam được nén vào zRAM để game có thêm bộ nhớ, và được đọc lại khi game đóng. Tắt nếu phiên bị đóng ngay sau khi game bắt đầu. Giới hạn RAM ở trên vẫn nén Steam khi phiên vượt quá mức đó.</string>
-    <string name="perf_ram_cap">Giới hạn RAM</string>
-    <string name="perf_ram_cap_hint">Áp dụng khi client Steam đang chạy, ở chế độ Steam hoặc từ desktop. Khi phiên dùng nhiều hơn mức này, Steam rồi đến các tiến trình được hỗ trợ khác của phiên sẽ bị nén vào zRAM. Giới hạn mềm: không có gì bị đóng, nhưng game có thể giật khi các trang được nạp lại.</string>
-    <string name="perf_ram_cap_unavailable">Cần swap zRAM, thiết bị này không có.</string>
-    <string name="perf_vram_cap">Giới hạn VRAM</string>
-    <string name="perf_vram_cap_hint">Báo ngân sách bộ nhớ video này cho các trò chơi Direct3D 9 đến 12 để giảm mức dùng bộ nhớ. Trò chơi có thể vượt ngân sách; tính năng này không bổ sung phân trang GPU hay bảo đảm tránh lỗi do hết bộ nhớ. Có hiệu lực ở phiên tiếp theo.</string>
     <string name="perf_gpuclock">Giữ GPU ở xung nhịp cao nhất</string>
     <string name="perf_gpuclock_hint">Chỉ dành cho Adreno. Ít giật hơn, dùng nhiều pin và nhiệt hơn.</string>
     <string name="perf_fixes">Các bản sửa phiên</string>

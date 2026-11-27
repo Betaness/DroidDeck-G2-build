@@ -4083,6 +4083,7 @@ static int on_stats_timer(void *data) {
         memset(&g_pace, 0, sizeof(g_pace));
         g_pace.game_frames_seen = seen;
     }
+    sc_layer_cadence_log();
     g_stat_frames = g_stat_dmabuf = g_stat_shm = 0;
     droiddeck_color_stats_tick();
 

@@ -578,16 +578,7 @@
     <string name="perf_gsrealtime">gamescope：实时 GPU 队列</string>
     <string name="perf_gsrealtime_hint">优先处理合成器的 GPU 工作。可平滑帧节奏，但会牺牲部分游戏性能。</string>
     <string name="perf_gpu">GPU</string>
-    <string name="perf_memory">内存</string>
     <string name="perf_cap_off">关闭</string>
-    <string name="perf_cap_auto">驱动默认</string>
-    <string name="perf_zram_client">游戏运行时压缩 Steam</string>
-    <string name="perf_zram_client_hint">游戏启动 20 秒后，Steam 客户端会被压缩到 zRAM 中，为游戏腾出更多内存，并在游戏关闭时读回。如果会话在游戏启动后不久就关闭，请关闭此选项。设置了上方的 RAM 上限时，会话超出上限后仍会压缩 Steam。</string>
-    <string name="perf_ram_cap">RAM 上限</string>
-    <string name="perf_ram_cap_hint">在 Steam 客户端运行时生效，无论是 Steam 模式还是从桌面启动。会话使用量超过此值时，会先将 Steam、再将会话中其他受支持的进程压缩到 zRAM。这是软上限：不会关闭任何进程，但在页面读回时游戏可能卡顿。</string>
-    <string name="perf_ram_cap_unavailable">需要 zRAM 交换空间，但此设备不支持。</string>
-    <string name="perf_vram_cap">VRAM 上限</string>
-    <string name="perf_vram_cap_hint">向 Direct3D 9 至 12 游戏报告此显存预算，以促使游戏减少内存使用。游戏可能超出预算；此功能不提供 GPU 分页，也不保证避免内存不足导致的崩溃。下次会话生效。</string>
     <string name="perf_gpuclock">把 GPU 锁定在最高频率</string>
     <string name="perf_gpuclock_hint">仅限 Adreno。卡顿更少，但更耗电、更发热。</string>
     <string name="perf_fixes">会话修复</string>
@@ -624,6 +615,8 @@
     <string name="drawer_page_display">显示</string>
     <string name="drawer_frame_limit">帧率限制</string>
     <string name="drawer_frame_limit_note">限制此游戏的帧率。如有能被上限整除的刷新率，显示屏会切换到该刷新率；其他上限可能导致画面不均匀。Steam 游戏请使用快捷访问菜单中的 Steam 帧率限制。</string>
+    <string name="drawer_present_cadence">均匀帧节奏</string>
+    <string name="drawer_present_cadence_note">让帧率上限低于刷新率的游戏按均匀的节奏出帧，每一帧在屏幕上停留相同的刷新次数。画面最多晚约两次刷新显示，受限帧率的游戏运行时显示系统每次刷新都要合成。需要 Android 13。</string>
     <string name="drawer_page_effects">画面效果</string>
     <string name="drawer_page_controls">控制</string>
     <string name="drawer_page_components">组件</string>

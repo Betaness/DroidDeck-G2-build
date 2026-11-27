@@ -575,16 +575,7 @@
     <string name="perf_gsrealtime">gamescope: antrean GPU realtime</string>
     <string name="perf_gsrealtime_hint">Memprioritaskan kerja GPU compositor. Dapat menghaluskan pacing frame dengan sedikit mengorbankan gim.</string>
     <string name="perf_gpu">GPU</string>
-    <string name="perf_memory">Memori</string>
     <string name="perf_cap_off">Nonaktif</string>
-    <string name="perf_cap_auto">Default driver</string>
-    <string name="perf_zram_client">Kompres Steam saat gim berjalan</string>
-    <string name="perf_zram_client_hint">20 detik setelah gim dimulai, klien Steam dikompres ke zRAM agar gim mendapat lebih banyak memori, lalu dibaca kembali saat gim ditutup. Nonaktifkan jika sesi tertutup sesaat setelah gim dimulai. Batas RAM di atas tetap mengompres Steam saat sesi melampauinya.</string>
-    <string name="perf_ram_cap">Batas RAM</string>
-    <string name="perf_ram_cap_hint">Berlaku saat klien Steam berjalan, di mode Steam atau dari desktop. Saat sesi menggunakan lebih dari ini, Steam lalu proses lain yang didukung dalam sesi dikompres ke zRAM. Batas lunak: tidak ada yang ditutup, tetapi gim dapat tersendat saat halaman dimuat kembali.</string>
-    <string name="perf_ram_cap_unavailable">Memerlukan swap zRAM, yang tidak dimiliki perangkat ini.</string>
-    <string name="perf_vram_cap">Batas VRAM</string>
-    <string name="perf_vram_cap_hint">Melaporkan anggaran memori video ini ke game Direct3D 9 hingga 12 untuk mengurangi penggunaan memori. Game dapat melampauinya; ini tidak menambahkan paging GPU atau menjamin perlindungan dari crash akibat kehabisan memori. Berlaku pada sesi berikutnya.</string>
     <string name="perf_gpuclock">Pertahankan GPU pada clock tertingginya</string>
     <string name="perf_gpuclock_hint">Hanya Adreno. Lebih sedikit tersendat, lebih banyak penggunaan baterai dan panas.</string>
     <string name="perf_fixes">Perbaikan sesi</string>

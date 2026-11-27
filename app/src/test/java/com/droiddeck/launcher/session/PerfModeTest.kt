@@ -30,6 +30,19 @@ class PerfModeTest {
         assertEquals(modes[1], PerfMode.selectMode(modes, modes[2], 45, 90f))
     }
 
+    @Test fun aGameCapGetsARefreshRateItDividesOnA144HzPanel() {
+        val modes = arrayOf(mode(1, 60f), mode(2, 90f), mode(3, 120f), mode(4, 144f))
+        val top = modes[3]
+        assertEquals(modes[2], PerfMode.selectMode(modes, top, GameFpsCap.forMode(SessionPrefs.FPS_UNPACED, 60), Float.POSITIVE_INFINITY))
+        assertEquals(modes[2], PerfMode.selectMode(modes, top, 40, Float.POSITIVE_INFINITY))
+        assertEquals(modes[2], PerfMode.selectMode(modes, top, 30, Float.POSITIVE_INFINITY))
+        assertEquals(modes[3], PerfMode.selectMode(modes, top, 72, Float.POSITIVE_INFINITY))
+        assertEquals(modes[3], PerfMode.selectMode(modes, top, 48, Float.POSITIVE_INFINITY))
+        assertEquals(modes[1], PerfMode.selectMode(modes, top, 45, Float.POSITIVE_INFINITY))
+        assertEquals(modes[3], PerfMode.selectMode(modes, top, GameFpsCap.forMode(SessionPrefs.FPS_UNPACED, 0), Float.POSITIVE_INFINITY))
+        assertEquals(modes[3], PerfMode.selectMode(modes, top, 50, Float.POSITIVE_INFINITY))
+    }
+
     @Test fun selectionPreservesResolutionAndUsesTheLowestModeIfTheCapIsUnsupported() {
         val low = mode(1, 90f)
         val high = mode(2, 120f)

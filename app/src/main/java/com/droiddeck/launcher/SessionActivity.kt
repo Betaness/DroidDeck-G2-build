@@ -498,6 +498,10 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private val drawerComponentMenu by lazy { ComponentsMenu(this, uiHandler) }
     private var drawerGameProfileId by mutableStateOf<Long?>(null)
     private var fpsLimit by mutableStateOf(SessionState.fpsLimit)
+    private var presentCadence by mutableStateOf(false)
+    /** [mali-g2] BL_FPS from droiddeck-env, the cap droiddeck-game-env gives Vortek and libhybris games (0: none). */
+    private val gameFpsCap: Int by lazy { com.droiddeck.launcher.session.GameFpsCap.read(this) }
+    private val gameCapHold by lazy { com.droiddeck.launcher.session.GameFpsCap.Hold(gameFpsCap) }
 
     private fun noSteamSession(): Boolean = (SessionState.mode == SessionService.MODE_RUN &&
         SessionState.program in setOf(
@@ -658,6 +662,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         val changed = sessionActivityDisplayId != current
         sessionActivityDisplayId = current
         SessionState.activityDisplayId = current
+        applyPresentCadence()
         return changed
     }
 
@@ -1368,6 +1373,13 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 fpsLimit = fps
                 applyOutputPacing()
             },
+            presentCadence = presentCadence,
+            presentCadenceAvailable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU,
+            onPresentCadence = { on ->
+                SessionPrefs.setPresentCadence(this@SessionActivity, on)
+                presentCadence = on
+                applyPresentCadence()
+            },
             onFrameGenPick = { mode ->
                 val zeroFgBefore = FrameGen.engine(this@SessionActivity) == FrameGen.ENGINE_ZEROFG
                 FrameGen.set(this@SessionActivity, mode)
@@ -2040,6 +2052,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         textureAnisotropy = SessionPrefs.textureAnisotropy(this)
         textureLodBias = SessionPrefs.textureLodBias(this)
         gameFill = SessionPrefs.gameFill(this)
+        presentCadence = SessionPrefs.presentCadence(this)
+        applyPresentCadence()
         val nextTouchMode = SessionPrefs.touchMode(this)
         if (touchMode != nextTouchMode) {
             if (::touchpad.isInitialized) touchpad.cancel()
@@ -2497,8 +2511,51 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         return minOf(hz, PerfMode.peakRefreshCap(this), mirrorCap)
     }
 
+    /** [mali-g2] Even frame pacing plans on the built-in screen's frame timeline: it waits while the game is shown
+     *  anywhere else ([com.droiddeck.launcher.session.PresentCadenceGate]). */
+    private fun applyPresentCadence() {
+        val waits = if (!presentCadence) null else com.droiddeck.launcher.session.PresentCadenceGate.waitsFor(
+            Build.VERSION.SDK_INT, glassesOutputActive, bottomOutputActive, sessionActivityDisplayId)
+        if (waits != null && waits != presentCadenceWaits) Log.i(TAG, "even frame pacing waits: $waits")
+        presentCadenceWaits = waits
+        CompositorHost.setPresentCadence(presentCadence && waits == null)
+    }
+    private var presentCadenceWaits: String? = null
+
+    /** [mali-g2] Once a second while BL_FPS is set: whether the game's frames hold it, which decides the panel mode. */
+    private val gameCapSampler = object : Runnable {
+        private var frames = -1L
+        private var at = 0L
+        override fun run() {
+            val now = SystemClock.elapsedRealtimeNanos()
+            val count = WaylandCompositor.gameFrameCount()
+            if (frames >= 0 && now > at && CompositorHost.isStarted) {
+                val changed = gameCapHold.sample((count - frames) * 1e9 / (now - at))
+                if (changed != null) {
+                    Log.i(TAG, "perf: game frames " + (if (changed) "hold" else "no longer hold") + " BL_FPS=$gameFpsCap")
+                    applyOutputPacing()
+                }
+            }
+            frames = count
+            at = now
+            uiHandler.postDelayed(this, 1000)
+        }
+
+        fun start() {
+            if (gameFpsCap <= 0) return
+            uiHandler.removeCallbacks(this)
+            frames = -1L
+            uiHandler.post(this)
+        }
+
+        fun stop() = uiHandler.removeCallbacks(this)
+    }
+
     private fun applyOutputPacing() {
-        Log.i(TAG, "perf: " + PerfMode.apply(this, outputFpsLimit(false), mirrorRefreshLimit()))
+        val gameCap = if (gameCapHold.held) gameFpsCap else 0
+        val modeLimit = com.droiddeck.launcher.session.GameFpsCap.forMode(outputFpsLimit(false), gameCap)
+        Log.i(TAG, "perf: " + PerfMode.apply(this, modeLimit, mirrorRefreshLimit()) +
+            if (modeLimit > 0 && modeLimit == gameCap) " · mode divides the games' BL_FPS=$gameCap, which they hold" else "")
         SessionState.wantedHz = runCatching { wantedRefreshHz() }.getOrDefault(0f)
         if (CompositorHost.isStarted) {
             val hz = refreshHz()
@@ -4970,6 +5027,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         started = true
         if (::hud.isInitialized) hud.setBackgrounded(false)
         refreshActivityDisplayId()
+        gameCapSampler.start()
         displayManager.registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
         com.droiddeck.launcher.input.DualScreen.watchTaken(bottomScreenListener)
         for (name in arrayOf("peak_refresh_rate", "min_refresh_rate")) {
@@ -4996,6 +5054,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         started = false
         if (::hud.isInitialized) hud.setBackgrounded(true)
         updateHandCamera()
+        gameCapSampler.stop()
         displayManager.unregisterDisplayListener(displayListener)
         com.droiddeck.launcher.input.DualScreen.unwatchTaken(bottomScreenListener)
         contentResolver.unregisterContentObserver(refreshSettingObserver)
@@ -5358,6 +5417,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         updatePointerCapture("output attached")
         if (bottomOutputActive) bottomRecoveries = 0
         if (CompositorHost.isStarted) WaylandCompositor.nativeSetCursorComposite(glassesOutputActive || bottomOutputActive)
+        applyPresentCadence()
         surfaceView.visibility = if (glassesOutputActive || bottomOutputActive) View.INVISIBLE else View.VISIBLE
         Log.i(TAG, "compositor output attached: " +
             if (glassesOutputActive) "glasses display ${glassesScreen?.display?.displayId}"

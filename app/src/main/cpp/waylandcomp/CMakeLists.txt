@@ -6,6 +6,7 @@ add_library(droiddeckwayland SHARED
         src/spatialpose.c
         src/vk_loader.c
         src/sc_layer.c
+        src/present_cadence.c
         src/ahb_swapchain.c
         src/vortek_present.c
         src/frame_sched_feed.c

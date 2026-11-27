@@ -197,6 +197,12 @@ public final class WaylandCompositor {
 
     public static native void nativeVsync(long frameTimeNanos);
 
+    /** [mali-g2] Choreographer's preferred frame timeline (API 33+): expected present time, SurfaceFlinger's deadline, refresh period (ns). */
+    public static native void nativeFrameTimeline(long presentNanos, long deadlineNanos, long periodNanos);
+
+    /** [mali-g2] Even frame pacing for games capped below the refresh rate (upstream #2743). */
+    public static native void nativeSetPresentCadence(boolean on);
+
     public static native int nativeCompositorTid();
 
     private static native String nativeCompositorFault();

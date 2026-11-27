@@ -18,6 +18,15 @@ def run_bash(script, env=None):
     return subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10, env=env)
 
 
+def state_source():
+    source = SCRIPT.read_text()
+    start = source.index('        declare -A _bl_deaf=()')
+    return source[start:source.index('        while kill -0', start)]
+
+
+STATE = state_source()
+
+
 class ClientZramFocusTest(unittest.TestCase):
     def test_the_hidden_epic_launcher_is_compressed_with_the_client(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -78,125 +87,60 @@ class ClientZramFocusTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual('|6000021 6000022 6000020|0', result.stdout.strip())
 
-    def test_refocus_restarts_the_delay_and_game_exit_restores_a_packed_client(self):
-        source = SCRIPT.read_text()
-        start = source.index('          if [ "$_bl_game" = 1 ] && bl_game_focused; then')
-        stop = source.index('          bl_watch_nap\n', start)
-        body = source[start:stop]
-        harness = '''
-_bl_since=-1 _bl_since_apps= _bl_packed=-1 _bl_unpack=0 _bl_apps=" 413150"
-_bl_pids=(123)
-bl_game_focused() { [ "$focused" = 1 ]; }
-bl_over_cap() { return 1; }
-bl_client_can_pageout() { return 0; }
-bl_client_can_readback() { return 0; }
-bl_zram_send() { echo "send:$1"; }
-tick() {
-  SECONDS=$1 _bl_game=$2 focused=$3
-''' + body + '''
-}
-tick 0 1 1
-tick 5 1 0
-tick 30 1 1
-echo "refocus:$_bl_packed"
-tick 49 1 1
-tick 50 1 1
-tick 55 1 0
-tick 60 0 0
-'''
-        result = run_bash(harness)
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual('', result.stderr)
-        self.assertEqual(['refocus:-1', 'send:1', 'send:0'], result.stdout.splitlines())
-
-    def monitor_harness(self):
-        source = SCRIPT.read_text()
-        start = source.index('          bl_zram_scan\n          bl_memory_read\n')
-        stop = source.index('          bl_watch_nap\n', start)
-        return '''
-_bl_since=-1 _bl_since_apps= _bl_packed=-1 _bl_measured=-1 _bl_unpack=0 _bl_capped=-1 _bl_backoff=30
-_bl_apps=" 413150"
-_bl_pids=(123)
+    TICK = '''
+bl_zram_scan() { _bl_game=$game _bl_pids=(10) _bl_others=() _bl_apps=" 413150"; }
+bl_game_focused() { return $focus; }
+bl_memory_read() { _bl_available=$((available * 1024)) _bl_mem_total=$((7168 * 1024)) _bl_floor=$((896 * 1024)); _bl_target=$((target * 1024)) _bl_swap_room=$((4096 * 1024)) _bl_saving=500 _bl_rate=0 _bl_psi=0; }
+bl_zram_trim() { echo "trim:$NOW"; _bl_trimmed=$((64 * 1024)); }
+bl_zram_usage() { _bl_swap=$((64 * 1024)); }
+bl_session_others() { :; }
 step() { :; }
-bl_zram_scan() { :; }
-bl_memory_read() { :; }
-bl_client_pressure() { :; }
-bl_session_pressure() { :; }
-bl_client_can_pageout() { return 0; }
-bl_client_can_readback() { [ "${readback:-1}" = 1 ]; }
-bl_game_focused() { [ "$focused" = 1 ]; }
-bl_cap_due() { [ "$cap_due" = 1 ]; }
-bl_over_cap() { [ "$over_cap" = 1 ]; }
-bl_zram_send() { echo "send:$1:$3"; }
-tick() {
-  SECONDS=$1 _bl_game=$2 focused=$3 over_cap=$4 cap_due=$5
-''' + source[start:stop] + '\n}\n'
+kill() { echo "back:$NOW"; }
+game=1 focus=0 available=1500 target=1600
+run() { for NOW in $(seq "$1" "$2"); do bl_memory_tick; done; }
+'''
 
-    def test_client_toggle_still_disables_automatic_compression(self):
-        result = run_bash(self.monitor_harness() + '''
-BL_ZRAM_CLIENT=0
-tick 0 1 1 0 0
-tick 25 1 1 0 0
-tick 30 0 0 0 0
-''')
+    def tick(self, body):
+        functions = '\n'.join(function_source(name) for name in (
+            'bl_memory_need', 'bl_memory_relieve', 'bl_memory_note', 'bl_client_readback', 'bl_memory_psi_note',
+            'bl_memory_tick'))
+        with tempfile.TemporaryDirectory() as tmp:
+            script = (functions + self.TICK + body).replace('/tmp/.bl-zram', tmp + '/ctl')
+            result = run_bash(('NOW=0\nset -u\n' + STATE + script).replace('SECONDS', 'NOW'))
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual('', result.stderr)
-        self.assertEqual('', result.stdout)
+        return result.stdout.splitlines()
 
-    def test_a_new_game_restarts_the_compression_delay(self):
-        result = run_bash(self.monitor_harness() + '''
-tick 0 1 1 0 0
-_bl_apps=" 413150 1245620"
-tick 15 1 1 0 0
-tick 20 1 1 0 0
-echo "starting:$_bl_packed"
-tick 34 1 1 0 0
-tick 35 1 1 0 0
-''')
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual('', result.stderr)
-        self.assertEqual(['starting:-1', 'send:1:client'], result.stdout.splitlines())
+    def test_the_client_behind_a_game_is_trimmed_while_memory_is_short_of_the_target(self):
+        self.assertEqual(['trim:0', 'trim:1', 'trim:2'], self.tick('run 0 2\navailable=1700; run 3 9\n'))
 
-    def test_ram_cap_can_still_compress_an_unfocused_client(self):
-        result = run_bash(self.monitor_harness() + '''
-BL_ZRAM_CLIENT=0 BL_RAM_CAP_MB=1024
-bl_zram_usage() { _bl_rss=$((768 * 1024)); }
-tick 0 1 0 1 1
-echo "cap:$_bl_packed:$_bl_since:$_bl_backoff"
-tick 5 0 0 0 0
-''')
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual('', result.stderr)
-        self.assertEqual(['send:1:client', 'send:1:session', 'cap:0:-1:60', 'send:0:client'], result.stdout.splitlines())
+    def test_nothing_is_requested_while_the_app_holds_the_control_file(self):
+        self.assertEqual(['trim:3'], self.tick(
+            ': > /tmp/.bl-zram.hold; run 0 2\nrm /tmp/.bl-zram.hold; run 3 3\n'))
 
-    def test_game_exit_defers_restore_until_the_session_is_under_the_ram_cap(self):
-        result = run_bash(self.monitor_harness() + '''
-tick 0 1 1 0 0
-tick 20 1 1 0 0
-tick 25 1 0 0 0
-tick 30 0 0 1 0
-echo "deferred:$_bl_unpack:$_bl_packed"
-tick 35 0 0 0 0
-echo "restored:$_bl_unpack"
-''')
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual('', result.stderr)
-        self.assertEqual(['send:1:client', 'deferred:1:-1', 'send:0:client', 'restored:0'], result.stdout.splitlines())
+    def test_nothing_is_read_back_while_memory_is_still_needed(self):
+        self.assertEqual(['trim:0'], self.tick(
+            'run 0 0\ngame=0 available=4000; bl_memory_need() { _bl_need=1 _bl_hard=0 _bl_force=0; }\n'
+            'bl_memory_relieve() { bl_memory_need; }; run 1 40\n'))
 
-    def test_game_exit_defers_readback_under_pressure_even_without_a_ram_cap(self):
-        result = run_bash(self.monitor_harness() + """
-tick 0 1 1 0 0
-tick 20 1 1 0 0
-readback=0
-tick 25 0 0 0 0
-echo "deferred:$_bl_unpack"
-readback=1
-tick 30 0 0 0 0
-echo "restored:$_bl_unpack"
-""")
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual('', result.stderr)
-        self.assertEqual(['send:1:client', 'deferred:1', 'send:0:client', 'restored:0'], result.stdout.splitlines())
+    def test_game_exit_reads_the_client_back_after_a_quiet_half_minute(self):
+        self.assertEqual(['trim:0', 'back:30'], self.tick('run 0 0\ngame=0 available=4000; run 1 40\n'))
+
+    def test_client_in_front_of_a_running_game_is_read_back_and_trimmed_again_later(self):
+        self.assertEqual(['trim:0', 'back:30', 'trim:60'],
+                         self.tick('run 0 0\nfocus=1 available=4000; run 1 44\nfocus=0 available=1500; run 45 60\n'))
+
+    def test_a_short_look_at_the_client_keeps_it_compressed(self):
+        self.assertEqual(['trim:0'], self.tick('run 0 0\navailable=4000; run 1 34\nfocus=1; run 35 38\nfocus=0; run 39 60\n'))
+
+    def test_unknown_focus_keeps_the_client_compressed(self):
+        self.assertEqual(['trim:0'], self.tick('run 0 0\nfocus=2 available=4000; run 1 60\n'))
+
+    def test_client_in_front_waits_for_memory(self):
+        self.assertEqual(['trim:0', 'back:50'], self.tick('run 0 0\nfocus=1 available=1800 target=896; run 1 49\navailable=2500; run 50 60\n'))
+
+    def test_a_client_that_was_never_trimmed_reads_nothing_back(self):
+        self.assertEqual([], self.tick('focus=1 available=4000; run 0 60\n'))
 
     def test_scan_keeps_the_running_game_and_ignores_steams_own_reaper(self):
         temp = tempfile.TemporaryDirectory()
@@ -218,7 +162,8 @@ echo "restored:$_bl_unpack"
 %s
 check() {
   BL_DESKTOP=$1 BL_LAUNCH_DIR=$2 _bl_apps=$3
-  if bl_game_focused; then echo yes; else echo no; fi
+  bl_game_focused
+  echo $?
 }
 check "" "$dir" " 413150"
 check "" "$dir" " 1245620"
@@ -226,7 +171,10 @@ printf '%%s\\n' '{"focusedApp": 999}' > "$dir/agent/focus.json"
 check "" "$dir" " 413150"
 printf '%%s\\n' '{"focusedApp": 769}' > "$dir/agent/focus.json"
 check "" "$dir" " 413150"
+printf '%%s\\n' '{"t": 2}' > "$dir/agent/focus.json"
+check "" "$dir" " 413150"
 rm -f "$dir/agent/focus.json"
+check "" "$dir" " 413150"
 check 1 "$dir" " 413150"
 check "" "" " 413150"
 ''' % focus
@@ -237,7 +185,7 @@ check "" "" " 413150"
         (launch / 'agent' / 'focus.json').write_text('{"t": 1, "focusedApp": 413150}\n')
         result = run_bash('dir=%s\n%s' % (launch, script))
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual(['yes', 'no', 'no', 'no', 'yes', 'yes'], result.stdout.splitlines())
+        self.assertEqual(['0', '1', '1', '1', '2', '2', '0', '0'], result.stdout.splitlines())
 
     @staticmethod
     def write_cmd(root, pid, args):

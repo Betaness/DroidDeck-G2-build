@@ -150,6 +150,7 @@ clear_stale_tmp() {
 [ -z "${BL_INSIDE:-}" ] && clear_stale_tmp
 if [ -z "${BL_INSIDE:-}" ]; then
   if [ "${BL_ZRAM:-0}" = 1 ]; then printf 0 > /tmp/.bl-zram; else rm -f /tmp/.bl-zram; fi
+  rm -f /tmp/.bl-zram.hold
   rm -f /tmp/.bl-clock
   head -c 8 /dev/zero > /tmp/.bl-clock
 fi
@@ -898,13 +899,6 @@ case $mode in
     fi
     if [ "${BL_ZRAM:-0}" = 1 ]; then
       step "zRAM compression: on"
-      [ "${BL_ZRAM_CLIENT:-1}" = 1 ] || step "zRAM: Steam, the hidden Epic Games Launcher and Battle.net are not compressed while games run (turned off in Performance)"
-      _bl_ram_cap=0
-      case ${BL_RAM_CAP_MB:-} in
-        ''|0) ;;
-        *[!0-9]*|0*|???????*) step "RAM cap: ignored invalid value '$BL_RAM_CAP_MB'" ;;
-        *) _bl_ram_cap=$((BL_RAM_CAP_MB * 1024)); step "RAM cap: ${BL_RAM_CAP_MB} MB" ;;
-      esac
       (
         bl_zram_scan() {
           _bl_game=0 _bl_pids=() _bl_others=() _bl_apps=
@@ -912,7 +906,7 @@ case $mode in
           for _d in /proc/[0-9]*; do
             [ "${_d##*/}" != "$BASHPID" ] || continue
             _args=()
-            while IFS= read -r -d '' _c; do _args+=("$_c"); done 2>/dev/null < "$_d/cmdline" || true
+            mapfile -d '' -t _args 2>/dev/null < "$_d/cmdline" || true
             [ "${#_args[@]}" -gt 0 ] || continue
             _name=${_args[0]} _fex=0
             if [ "${#_args[@]}" -gt 1 ]; then
@@ -962,216 +956,254 @@ case $mode in
           fi
         }
         bl_zram_usage() {
-          local _p _k _v _u _rss=0 _swap=0
+          local _p _k _v _u _resident _anonymous _rss=0 _anon=0 _swap=0
           for _p in "$@"; do
+            _resident=0 _anonymous=-1
             while read -r _k _v _u; do
-              case $_k in VmRSS:) _rss=$((_rss + _v)) ;; VmSwap:) _swap=$((_swap + _v)) ;; esac
+              case $_v in ''|*[!0-9]*) continue ;; esac
+              case $_k in
+                VmRSS:) _resident=$_v ;;
+                RssAnon:) _anonymous=$_v ;;
+                VmSwap:) _swap=$((_swap + _v)) ;;
+              esac
             done 2>/dev/null < "/proc/$_p/status"
+            [ "$_anonymous" -ge 0 ] || _anonymous=$_resident
+            _rss=$((_rss + _resident)) _anon=$((_anon + _anonymous))
           done
-          _bl_rss=$_rss
+          _bl_rss=$_rss _bl_anon=$_anon
           _bl_swap=$_swap
           echo "$# processes, resident $((_rss / 1024)) MB, in zram $((_swap / 1024)) MB"
         }
         bl_memory_read() {
-          local _k _v _u _kind _fields _avg
-          _bl_mem_total=0 _bl_available=-1 _bl_swap_total=0 _bl_swap_free=-1 _bl_psi=0
+          local _k _v _u _kind _fields _name _type _size _used _orig _comp _mem _dt _fall
+          local _stall=-1 _swap_total=0 _swap_free=0 _total=0 _room=0 _listed=0 _in=-1
+          _bl_mem_total=0 _bl_available=-1
           while read -r _k _v _u; do
             case $_v in ''|*[!0-9]*) continue ;; esac
             case $_k in
               MemTotal:) _bl_mem_total=$_v ;;
               MemAvailable:) _bl_available=$_v ;;
-              SwapTotal:) _bl_swap_total=$_v ;;
-              SwapFree:) _bl_swap_free=$_v ;;
+              SwapTotal:) _swap_total=$_v ;;
+              SwapFree:) _swap_free=$_v ;;
             esac
           done 2>/dev/null < /proc/meminfo
+          while read -r _name _type _size _used _u; do
+            _listed=1
+            case $_name in */zram[0-9]*) ;; *) continue ;; esac
+            case $_size$_used in ''|*[!0-9]*) continue ;; esac
+            _total=$((_total + _size)) _room=$((_room + _size - _used))
+          done 2>/dev/null < /proc/swaps
+          [ "$_listed" = 1 ] || _total=$_swap_total _room=$_swap_free
+          _bl_swap_room=$((_total / 8))
+          [ "$_bl_swap_room" -ge $((128 * 1024)) ] || _bl_swap_room=$((128 * 1024))
+          _bl_swap_room=$((_room - _bl_swap_room))
+          _bl_saving=600
+          if [ -r /sys/block/zram0/mm_stat ] && read -r _orig _comp _mem _u 2>/dev/null < /sys/block/zram0/mm_stat; then
+            case $_orig$_mem in
+              ''|*[!0-9]*) ;;
+              *) [ "$_orig" -lt $((64 << 20)) ] || _bl_saving=$(((_orig - _mem) / (_orig / 1000))) ;;
+            esac
+            [ "$_bl_saving" -ge 167 ] || _bl_saving=167
+            [ "$_bl_saving" -le 833 ] || _bl_saving=833
+          fi
           if [ -r /proc/pressure/memory ]; then
             while read -r _kind _fields; do
               [ "$_kind" = some ] || continue
-              _avg=${_fields#avg10=} _avg=${_avg%% *} _avg=${_avg%%.*}
-              case $_avg in ''|*[!0-9]*) ;; *) _bl_psi=$((10#$_avg)) ;; esac
+              _fields=${_fields##*total=}
+              case $_fields in ''|*[!0-9]*) ;; *) _stall=$_fields ;; esac
             done 2>/dev/null < /proc/pressure/memory
           fi
-          _bl_headroom=$((_bl_mem_total / 5))
-          [ "$_bl_headroom" -ge $((512 * 1024)) ] || _bl_headroom=$((512 * 1024))
-          [ "$_bl_headroom" -le $((1536 * 1024)) ] || _bl_headroom=$((1536 * 1024))
-          _bl_tier_headroom=$((_bl_mem_total / 4))
-          [ "$_bl_tier_headroom" -ge $((768 * 1024)) ] || _bl_tier_headroom=$((768 * 1024))
-          [ "$_bl_tier_headroom" -le $((2560 * 1024)) ] || _bl_tier_headroom=$((2560 * 1024))
-          _bl_swap_reserve=$((_bl_swap_total / 5))
-          [ "$_bl_swap_reserve" -ge $((256 * 1024)) ] || _bl_swap_reserve=$((256 * 1024))
-        }
-        bl_memory_tight() {
-          [ "$_bl_mem_total" -gt 0 ] && [ "$_bl_available" -ge 0 ] &&
-            { [ "$_bl_available" -lt "$_bl_headroom" ] ||
-              { [ "$_bl_psi" -ge 1 ] && [ "$_bl_available" -lt $((_bl_mem_total / 3)) ]; }; }
-        }
-        bl_client_can_pageout() {
-          bl_memory_read
-          bl_zram_usage "${_bl_pids[@]}" > /dev/null
-          [ "$_bl_mem_total" -gt 0 ] && [ "$_bl_swap_total" -gt 0 ] &&
-            [ $((_bl_swap_free - _bl_rss)) -ge "$_bl_swap_reserve" ]
-        }
-        bl_client_can_readback() {
-          bl_memory_read
-          bl_zram_usage "${_bl_pids[@]}" > /dev/null
-          [ "$_bl_mem_total" -gt 0 ] && ! bl_memory_tight &&
-            [ "$_bl_available" -ge $((_bl_swap * 2)) ] &&
-            [ $((_bl_available - _bl_swap)) -ge "$_bl_headroom" ]
-        }
-        bl_client_pressure() {
-          [ "${BL_ZRAM_CLIENT:-1}" = 1 ] && [ "$_bl_game" = 1 ] &&
-            [ "${#_bl_pids[@]}" -gt 0 ] && bl_memory_tight || return 0
-          [ "$_bl_pressure_at" -lt 0 ] ||
-            [ $((SECONDS - _bl_pressure_at)) -ge "$_bl_pressure_backoff" ] || return 0
-          [ "$_bl_packed" -lt 0 ] || [ $((SECONDS - _bl_packed)) -ge 30 ] || return 0
-          _bl_pressure_at=$SECONDS
-          if ! bl_client_can_pageout; then
-            step "zRAM: pressure reclaim skipped, swap headroom too small ($((_bl_swap_free / 1024)) MB free)"
-            return 0
+          while read -r _k _v; do
+            [ "$_k" = pswpin ] || continue
+            case $_v in ''|*[!0-9]*) ;; *) _in=$((_v * _bl_page_kb)) ;; esac
+            break
+          done 2>/dev/null < /proc/vmstat
+          _dt=$((SECONDS - ${_bl_sample_at:-$SECONDS}))
+          if [ -z "${_bl_sample_at:-}" ]; then
+            _bl_rate=0 _bl_psi=0 _bl_returned=0
+          elif [ "$_dt" -gt 0 ] && [ "$_bl_available" -ge 0 ]; then
+            _fall=$(((_bl_sample_available - _bl_available + _bl_freed) / _dt))
+            _bl_rate=$((_bl_rate * 3 / 4))
+            [ "$_fall" -le "$_bl_rate" ] || _bl_rate=$_fall
+            _bl_psi=0
+            [ "$_stall" -lt 0 ] || [ "$_bl_sample_stall" -lt 0 ] || _bl_psi=$(((_stall - _bl_sample_stall) / (_dt * 100)))
+            _bl_returned=$((_dt < 30 ? _bl_returned * (30 - _dt) / 30 : 0))
+            [ "$_in" -lt "$_bl_sample_in" ] || [ "$_bl_sample_in" -lt 0 ] || _bl_returned=$((_bl_returned + _in - _bl_sample_in))
           fi
-          [ "$_bl_rss" -ge $((128 * 1024)) ] || return 0
-          local _before=$_bl_rss
-          bl_zram_send 1 "memory pressure, compressing the client (available $((_bl_available / 1024)) MB, swap free $((_bl_swap_free / 1024)) MB)" client
-          _bl_packed=$SECONDS
-          [ "${_bl_pageout_complete:-0}" = 1 ] || return 0
-          bl_zram_usage "${_bl_pids[@]}" > /dev/null
-          if [ $((_before - _bl_rss)) -lt $((16 * 1024)) ]; then
-            _bl_pressure_backoff=$((_bl_pressure_backoff * 2 > 300 ? 300 : _bl_pressure_backoff * 2))
-          else
-            _bl_pressure_backoff=30
+          if [ "$_bl_available" -ge 0 ] && { [ -z "${_bl_sample_at:-}" ] || [ "$_dt" -gt 0 ]; }; then
+            _bl_sample_at=$SECONDS _bl_sample_available=$_bl_available _bl_sample_stall=$_stall _bl_sample_in=$_in _bl_freed=0
           fi
+          _bl_floor=$((_bl_mem_total / 8))
+          [ "$_bl_floor" -ge $((640 * 1024)) ] || _bl_floor=$((640 * 1024))
+          [ "$_bl_floor" -le $((1280 * 1024)) ] || _bl_floor=$((1280 * 1024))
+          _bl_target=$((_bl_floor + _bl_rate * 10))
         }
-        bl_memory_critical() {
-          [ "$_bl_mem_total" -gt 0 ] && [ "$_bl_available" -ge 0 ] &&
-            { [ "$_bl_available" -lt "$_bl_tier_headroom" ] ||
-              { [ "$_bl_psi" -ge 1 ] && [ "$_bl_available" -lt $((_bl_tier_headroom * 3 / 2)) ]; }; }
-        }
-        bl_low_ram() {
-          [ "$_bl_mem_total" -gt 0 ] && [ "$_bl_mem_total" -le $((13 * 1024 * 1024)) ]
-        }
-        bl_session_pressure() {
-          bl_memory_read
-          [ "$_bl_game" = 1 ] && bl_low_ram && bl_memory_critical || return 0
-          local _wait=$_bl_tier_backoff _before _pids _targets
-          [ "$_bl_available" -ge $((_bl_headroom / 2)) ] || [ "$_bl_tier_pushed" -lt 0 ] || _wait=30
-          [ "$_bl_tier_at" -lt 0 ] || [ $((SECONDS - _bl_tier_at)) -ge "$_wait" ] || return 0
-          if [ "$_bl_tier_at" -ge 0 ] && [ "$_bl_tier_pushed" -gt 0 ]; then
-            bl_tier_readback
-            if [ "$_bl_tier_back" -le $((_bl_tier_pushed / 2)) ]; then
-              _bl_tier_backoff=30
-            else
-              _bl_tier_backoff=$((_bl_tier_backoff * 2 > 300 ? 300 : _bl_tier_backoff * 2))
-              _bl_tier_at=$SECONDS _bl_tier_pushed=-1
-              step "zRAM: the game read back most of its last page-out, next try in ${_bl_tier_backoff} s"
-              return 0
-            fi
+        bl_memory_need() {
+          local _burst=$((_bl_rate * 2))
+          _bl_need=0 _bl_hard=0 _bl_force=0
+          [ "$_bl_mem_total" -gt 0 ] && [ "$_bl_available" -ge 0 ] || return 0
+          _bl_need=$((_bl_target - _bl_available)) _bl_hard=$((_bl_floor - _bl_available))
+          if [ "$_burst" -ge $((64 * 1024)) ] && [ "$_bl_available" -lt $((_bl_mem_total * 2 / 5)) ] && [ "$_burst" -gt "$_bl_need" ]; then
+            _bl_need=$_burst
           fi
-          _bl_tier_at=$SECONDS _bl_tier_pushed=0
-          bl_zram_pick game
-          bl_zram_usage "${_pids[@]}" > /dev/null
-          [ "$_bl_rss" -ge $((256 * 1024)) ] || return 0
-          if [ "$_bl_swap_total" -le 0 ] || [ $((_bl_swap_free - _bl_rss)) -lt "$_bl_swap_reserve" ]; then
-            step "zRAM: low-memory page-out skipped, swap headroom too small ($((_bl_swap_free / 1024)) MB free)"
-            return 0
+          if [ "$_bl_psi" -ge 100 ] && [ "$_burst" -gt "$_bl_hard" ]; then
+            _bl_hard=$_burst
           fi
-          _targets=("${_pids[@]}") _before=$_bl_swap
-          bl_zram_send 1 "low memory (available $((_bl_available / 1024)) MB), compressing idle game memory" game
-          bl_zram_usage "${_targets[@]}" > /dev/null
-          _bl_tier_pushed=$((_bl_swap - _before))
-          bl_tier_note "${_targets[@]}"
-          if [ "${_bl_pageout_complete:-0}" = 1 ] && [ "${BL_ZRAM_CLIENT:-1}" = 1 ] && [ "${#_bl_pids[@]}" -gt 0 ]; then
-            _bl_pressure_at=$SECONDS _bl_packed=$SECONDS
-          fi
+          [ "$_bl_hard" -gt 0 ] || _bl_hard=0
+          [ "$_bl_need" -ge "$_bl_hard" ] || _bl_need=$_bl_hard
+          [ "$_bl_available" -ge $((_bl_floor / 2)) ] || _bl_force=1
         }
-        bl_proc_start() {
-          local _s=
-          _bl_start=
-          read -r _s 2>/dev/null < "/proc/$1/stat" || return 1
-          _s=${_s##*) }
-          set -- $_s
-          [ "$1" != Z ] && [ "$#" -ge 20 ] || return 1
-          _bl_start=${20}
-        }
-        bl_tier_note() {
-          local _p
-          _bl_tier_targets=() _bl_tier_swaps=() _bl_tier_starts=()
-          for _p in "$@"; do
-            bl_proc_start "$_p" || continue
-            bl_zram_usage "$_p" > /dev/null
-            _bl_tier_targets+=("$_p") _bl_tier_swaps+=("$_bl_swap") _bl_tier_starts+=("$_bl_start")
-          done
-        }
-        bl_tier_readback() {
-          local _i _back=0
-          for _i in "${!_bl_tier_targets[@]}"; do
-            bl_proc_start "${_bl_tier_targets[$_i]}" && [ "$_bl_start" = "${_bl_tier_starts[$_i]}" ] || continue
-            bl_zram_usage "${_bl_tier_targets[$_i]}" > /dev/null
-            [ "${_bl_tier_swaps[$_i]}" -le "$_bl_swap" ] || _back=$((_back + _bl_tier_swaps[_i] - _bl_swap))
-          done
-          _bl_tier_back=$_back
-        }
-        bl_watch_nap() {
-          local _i
-          if [ "$_bl_game" = 1 ] && bl_low_ram && [ "$_bl_available" -ge 0 ] && [ "$_bl_available" -lt $((_bl_tier_headroom * 2)) ]; then
-            for _i in 1 2 3 4 5; do
-              nap 1
-              bl_memory_read
-              bl_memory_critical && return 0
-            done
-          else
-            nap 5
-          fi
-          return 0
+        bl_pid_key() {
+          local _s
+          _bl_key=$1
+          read -r _s 2>/dev/null < "/proc/$1/stat" || return 0
+          set -- ${_s##*) }
+          _bl_key=$_bl_key.${20:-}
         }
         bl_session_others() {
           local _p
+          local -A _known=()
           _bl_session=()
           for _p in "${_bl_others[@]}"; do
-            grep -q -m1 '/libblsession\.so$' "/proc/$_p/maps" 2>/dev/null && _bl_session+=("$_p")
+            bl_pid_key "$_p"
+            [ -n "${_bl_preloaded[$_bl_key]:-}" ] ||
+              grep -q -m1 '/libblsession\.so$' "/proc/$_p/maps" 2>/dev/null || continue
+            _known[$_bl_key]=1
+            bl_zram_usage "$_p" > /dev/null
+            _bl_session+=("$_bl_anon $_p")
           done
+          _bl_preloaded=()
+          for _p in "${!_known[@]}"; do
+            _bl_preloaded[$_p]=1
+          done
+          [ "${#_bl_session[@]}" -gt 0 ] || return 0
+          mapfile -t _bl_session < <(printf '%s\n' "${_bl_session[@]}" | sort -rn)
+          _bl_session=("${_bl_session[@]#* }")
         }
-        bl_zram_pick() {
-          if [ "$1" = game ]; then
-            bl_session_others
-            _pids=("${_bl_session[@]}")
-            [ "${BL_ZRAM_CLIENT:-1}" != 1 ] || _pids+=("${_bl_pids[@]}")
-          elif [ "$1" = session ]; then
-            bl_session_others
-            _pids=("${_bl_session[@]}")
+        bl_memory_relieved() {
+          local _k _v _u
+          while read -r _k _v _u; do
+            [ "$_k" = MemAvailable: ] || continue
+            case $_v in ''|*[!0-9]*) return 1 ;; esac
+            [ "$_v" -ge "$_bl_goal" ]
+            return
+          done 2>/dev/null < /proc/meminfo
+          return 1
+        }
+        bl_zram_trim() {
+          local _mode=$1 _left=$2 _p _k _n _i _acks=()
+          shift 2
+          _bl_trimmed=0
+          for _k in "${!_bl_deaf[@]}"; do
+            [ "${_bl_deaf[$_k]}" -gt "$SECONDS" ] || unset "_bl_deaf[$_k]"
+          done
+          for _p in "$@"; do
+            [ "$_left" -ge 4096 ] && [ "$_bl_polls" -lt 250 ] && [ $((SECONDS - _bl_pass_at)) -lt 6 ] &&
+              [ ! -e /tmp/.bl-zram.hold ] || break
+            ! bl_memory_relieved || break
+            bl_pid_key "$_p"
+            _k=$_bl_key
+            [ "${_bl_deaf[$_k]:-0}" -le "$SECONDS" ] || continue
+            bl_zram_usage "$_p" > /dev/null
+            [ "$_bl_anon" -ge 8192 ] || continue
+            printf %s - > "/tmp/.bl-zram.trim.$_p"
+            _acks+=("/tmp/.bl-zram.trim.$_p")
+            printf '%s %s\n' "$_mode" "$_left" > /tmp/.bl-zram
+            kill -URG "$_p" 2>/dev/null || continue
+            _bl_deaf[$_k]=$((SECONDS + 60))
+            for ((_i = 0; _bl_polls < 250 && SECONDS - _bl_pass_at < 6; _i++, _bl_polls++)); do
+              [ ! -e /tmp/.bl-zram.hold ] || { _bl_deaf[$_k]=0; break; }
+              _n=
+              read -r _n 2>/dev/null < "/tmp/.bl-zram.trim.$_p" || :
+              case $_n in
+                -) [ "$_i" -lt 25 ] || break ;;
+                ''|*[!0-9]*) ;;
+                *) _bl_trimmed=$((_bl_trimmed + _n)) _left=$((_left - _n)) _bl_deaf[$_k]=0; break ;;
+              esac
+              nap 0.02
+            done
+          done
+          [ ! -e /tmp/.bl-zram.hold ] || return 0
+          printf '2 0\n' > /tmp/.bl-zram
+          [ "${#_acks[@]}" = 0 ] || rm -f "${_acks[@]}"
+        }
+        bl_memory_relieve() {
+          local _mode=2 _budget _gain=0 _rest _cap=$((256 * 1024)) _all=$((1024 * 1024))
+          bl_memory_need
+          _bl_polls=0 _bl_pass_at=$SECONDS
+          if [ "$_bl_need" -le 0 ]; then
+            _bl_rest=0
+            return 0
+          fi
+          [ "$_bl_rest" = 0 ] || [ "$_bl_force" = 1 ] || [ "$SECONDS" -ge "$_bl_rest_until" ] ||
+            [ "$_bl_available" -lt $((_bl_rest_available - _bl_floor / 8)) ] || return 0
+          if [ "$_bl_swap_room" -lt $((64 * 1024)) ]; then
+            if [ $((SECONDS - _bl_full_at)) -ge 60 ]; then
+              _bl_full_at=$SECONDS
+              step "memory: available $((_bl_available / 1024)) MB and zRAM has no room left"
+            fi
+            return 0
+          fi
+          if [ "$_bl_force" = 1 ] && [ $((SECONDS - _bl_forced_at)) -ge 10 ]; then
+            _mode=3 _bl_forced_at=$SECONDS _cap=$_all
           else
-            _pids=("${_bl_pids[@]}")
+            _cap=$((_cap - _bl_returned)) _all=$((_all - _bl_returned))
+          fi
+          if [ "${#_bl_pids[@]}" -gt 0 ] && [ "$_all" -ge 4096 ] &&
+             { [ "$_bl_hard" -gt 0 ] ||
+               { [ "$_bl_game" = 1 ] && [ "$_bl_focus" != 1 ] && [ $((SECONDS - _bl_back_at)) -ge 30 ]; }; }; then
+            _budget=$((_bl_need * 1000 / _bl_saving))
+            [ "$_budget" -le "$_all" ] || _budget=$_all
+            [ "$_budget" -le "$_bl_swap_room" ] || _budget=$_bl_swap_room
+            _bl_goal=$((_bl_available + _bl_need))
+            bl_zram_trim "$_mode" "$_budget" "${_bl_pids[@]}"
+            _gain=$((_bl_trimmed * _bl_saving / 1000))
+            _bl_swap_room=$((_bl_swap_room - _bl_trimmed)) _all=$((_all - _bl_trimmed))
+            [ "$_cap" -le "$_all" ] || _cap=$_all
+            _bl_client_out=$((_bl_client_out + _bl_trimmed)) _bl_note_client=$((_bl_note_client + _bl_trimmed))
+            [ "$_bl_trimmed" = 0 ] || _bl_trim_at=$SECONDS
+          fi
+          _rest=$((_bl_hard - _gain))
+          if [ "$_rest" -gt 0 ] && [ "$_cap" -ge 4096 ] && [ "$_bl_swap_room" -ge $((64 * 1024)) ]; then
+            [ "$_bl_session_at" = "$_bl_scan_at" ] || bl_session_others
+            _bl_session_at=$_bl_scan_at
+            _budget=$((_rest * 1000 / _bl_saving))
+            [ "$_budget" -le "$_cap" ] || _budget=$_cap
+            [ "$_budget" -le "$_bl_swap_room" ] || _budget=$_bl_swap_room
+            _bl_goal=$((_bl_available + _bl_hard))
+            bl_zram_trim "$_mode" "$_budget" "${_bl_session[@]}"
+            _gain=$((_gain + _bl_trimmed * _bl_saving / 1000))
+            _bl_note_session=$((_bl_note_session + _bl_trimmed))
+          fi
+          _bl_freed=$((_bl_freed + _gain))
+          if [ "$_bl_hard" -gt 0 ] && [ "$_gain" -lt $((_bl_hard / 4)) ]; then
+            _bl_rest=$((_bl_rest > 0 ? _bl_rest * 2 : 5))
+            [ "$_bl_rest" -le 60 ] || _bl_rest=60
+            _bl_rest_until=$((SECONDS + _bl_rest)) _bl_rest_available=$_bl_available
+          else
+            _bl_rest=0
           fi
         }
-        bl_zram_wait() {
-          local _p _left _start=$SECONDS
-          while [ $((SECONDS - _start)) -lt 12 ]; do
-            _left=0
-            for _p in "$@"; do
-              [ -s "/tmp/.bl-zram.ack.$_p" ] && continue
-              [ -d "/proc/$_p" ] || continue
-              [ $((SECONDS - _start)) -ge 2 ] && [ ! -e "/tmp/.bl-zram.ack.$_p" ] && continue
-              _left=1
-            done
-            [ "$_left" = 1 ] || break
-            nap 0.2
-          done
-          _bl_pageout_complete=1
-          for _p in "$@"; do
-            if [ -d "/proc/$_p" ] && [ ! -s "/tmp/.bl-zram.ack.$_p" ]; then _bl_pageout_complete=0; fi
-            rm -f "/tmp/.bl-zram.ack.$_p"
-          done
+        bl_memory_note() {
+          [ $((_bl_note_client + _bl_note_session)) -ge $((16 * 1024)) ] && [ $((SECONDS - _bl_noted_at)) -ge 5 ] || return 0
+          step "memory: available $((_bl_available / 1024)) MB, falling $((_bl_rate / 1024)) MB/s, compressed $((_bl_note_client / 1024)) MB of the client and $((_bl_note_session / 1024)) MB of the session"
+          _bl_note_client=0 _bl_note_session=0 _bl_noted_at=$SECONDS
         }
-        bl_zram_send() {
-          local _mode=$1 _what=$2 _which=$3 _pids _p
-          bl_zram_pick "$_which"
-          step "zRAM: $_what ($(bl_zram_usage "${_pids[@]}"))"
-          for _p in "${_pids[@]}"; do rm -f "/tmp/.bl-zram.ack.$_p"; done
-          printf '%s' "$_mode" > /tmp/.bl-zram
-          [ "${#_pids[@]}" = 0 ] || kill -URG "${_pids[@]}" 2>/dev/null
-          if [ "$_mode" = 1 ]; then bl_zram_wait "${_pids[@]}"; else nap 5; fi
-          bl_zram_scan
-          bl_zram_pick "$_which"
-          step "zRAM: done ($(bl_zram_usage "${_pids[@]}"))"
+        bl_client_readback() {
+          [ "$_bl_client_out" -gt 0 ] && [ "${#_bl_pids[@]}" -gt 0 ] || return 0
+          [ "$_bl_game" = 0 ] || { [ -n "$_bl_away" ] && [ $((SECONDS - _bl_away)) -ge 5 ]; } || return 0
+          [ $((SECONDS - _bl_trim_at)) -ge 30 ] || return 0
+          bl_zram_usage "${_bl_pids[@]}" > /dev/null
+          if [ "$_bl_swap" -lt $((16 * 1024)) ]; then
+            _bl_client_out=0
+            return 0
+          fi
+          [ $((_bl_available - _bl_swap)) -ge $((_bl_target + _bl_floor)) ] || return 0
+          step "memory: available $((_bl_available / 1024)) MB, reading $((_bl_swap / 1024)) MB of the client back"
+          printf 0 > /tmp/.bl-zram || return 0
+          kill -URG "${_bl_pids[@]}" 2>/dev/null || return 0
+          _bl_freed=$((_bl_freed - _bl_swap * _bl_saving / 1000))
+          _bl_client_out=0 _bl_back_at=$SECONDS
         }
         bl_game_focused() {
           if [ "${BL_DESKTOP:-}" = 1 ] || [ -z "${BL_LAUNCH_DIR:-}" ]; then
@@ -1180,74 +1212,55 @@ case $mode in
           local id
           id=$(sed -n 's/.*"focusedApp"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
             "$BL_LAUNCH_DIR/agent/focus.json" 2>/dev/null | head -1)
-          [ -n "$id" ] || return 1
+          [ -n "$id" ] || return "${1:-2}"
           case " ${_bl_apps-} " in
             *" $id "*) return 0 ;;
           esac
           return 1
         }
-        bl_over_cap() {
-          [ "$_bl_ram_cap" -gt 0 ] || return 1
-          _bl_measured=$SECONDS
-          bl_session_others
-          bl_zram_usage "${_bl_pids[@]}" "${_bl_session[@]}" > /dev/null
-          [ "$_bl_rss" -gt "$_bl_ram_cap" ]
+        # [mali-g2] Said once: where the app may not read PSI (SELinux on HyperOS), the stall share stays 0
+        # and only MemAvailable decides how much to trim.
+        bl_memory_psi_note() {
+          [ -z "${_bl_psi_said:-}" ] && [ -n "${_bl_sample_at:-}" ] || return 0
+          _bl_psi_said=1
+          [ "${_bl_sample_stall:-0}" -ge 0 ] ||
+            step "memory: the kernel's memory pressure (PSI) is not readable here, so trims follow MemAvailable alone"
         }
-        bl_cap_due() {
-          [ "$_bl_ram_cap" -gt 0 ] && { [ "$_bl_measured" -lt 0 ] || [ $((SECONDS - _bl_measured)) -ge 30 ]; }
-        }
-        _bl_since=-1 _bl_since_apps= _bl_packed=-1 _bl_measured=-1 _bl_unpack=0 _bl_capped=-1 _bl_backoff=30
-        _bl_pressure_at=-1 _bl_pressure_backoff=30 _bl_tier_at=-1 _bl_tier_backoff=30 _bl_tier_pushed=0 _bl_tier_back=0 _bl_tier_targets=() _bl_tier_swaps=() _bl_tier_starts=()
-        while kill -0 $$ 2>/dev/null; do
-          bl_zram_scan
-          bl_memory_read
-          if bl_cap_due; then
-            if bl_over_cap; then
-              if [ "$_bl_capped" -lt 0 ] || [ $((SECONDS - _bl_capped)) -ge "$_bl_backoff" ]; then
-                bl_zram_usage "${_bl_pids[@]}" > /dev/null
-                if [ "$_bl_rss" -ge $((512 * 1024)) ]; then
-                  bl_zram_send 1 "over the ${BL_RAM_CAP_MB} MB RAM cap, compressing the client" client
-                  [ "$_bl_game" = 1 ] && _bl_packed=$SECONDS
-                else
-                  step "RAM cap: over, client already small ($((_bl_rss / 1024)) MB resident), skipping it"
-                fi
-                bl_over_cap && bl_zram_send 1 "still over the RAM cap, compressing the rest of the session" session
-                if bl_over_cap; then
-                  _bl_backoff=$((_bl_backoff * 2 > 600 ? 600 : _bl_backoff * 2))
-                  step "RAM cap: still over after paging out, next try in ${_bl_backoff} s"
-                else
-                  _bl_backoff=30
-                fi
-                _bl_capped=$SECONDS
-              fi
+        bl_memory_tick() {
+          if [ $((SECONDS - _bl_scan_at)) -ge 5 ]; then
+            _bl_scan_at=$SECONDS
+            bl_zram_scan
+            _bl_focus=1
+            if [ "$_bl_game" = 1 ]; then
+              bl_game_focused && _bl_focus=0 || _bl_focus=$?
+            fi
+            if [ "$_bl_game" = 1 ] && [ "$_bl_focus" = 1 ]; then
+              [ -n "$_bl_away" ] || _bl_away=$SECONDS
             else
-              _bl_backoff=30
+              _bl_away=
             fi
           fi
-          bl_session_pressure
-          bl_client_pressure
-          if [ "$_bl_game" = 1 ] && bl_game_focused; then
-            if [ "$_bl_since" -lt 0 ] || [ "$_bl_since_apps" != "$_bl_apps" ]; then
-              _bl_since=$SECONDS _bl_since_apps=$_bl_apps
-            fi
-            if [ "${BL_ZRAM_CLIENT:-1}" = 1 ] && [ $((SECONDS - _bl_since)) -ge 20 ] && [ "${#_bl_pids[@]}" -gt 0 ] &&
-               { [ "$_bl_packed" -lt 0 ] || [ $((SECONDS - _bl_packed)) -ge 300 ]; } && bl_client_can_pageout; then
-              bl_zram_send 1 "compressing the client" client
-              _bl_packed=$SECONDS
-            fi
-          elif [ "$_bl_game" != 1 ]; then
-            if [ "$_bl_packed" -ge 0 ]; then
-              _bl_unpack=1
-            fi
-            _bl_since=-1 _bl_packed=-1 _bl_tier_at=-1 _bl_tier_backoff=30 _bl_tier_pushed=0 _bl_tier_targets=() _bl_tier_swaps=() _bl_tier_starts=()
+          bl_memory_read
+          bl_memory_psi_note
+          [ ! -e /tmp/.bl-zram.hold ] || return 0
+          bl_memory_relieve
+          bl_memory_note
+          [ "$_bl_need" -gt 0 ] || bl_client_readback
+        }
+        declare -A _bl_deaf=() _bl_preloaded=()
+        _bl_scan_at=-5 _bl_session_at=-1 _bl_session=() _bl_focus=1 _bl_away=
+        _bl_page_kb=$(($(getconf PAGESIZE 2>/dev/null || echo 4096) / 1024)) _bl_returned=0 _bl_polls=0 _bl_pass_at=0 _bl_goal=0
+        _bl_sample_at= _bl_freed=0 _bl_client_out=0 _bl_note_client=0 _bl_note_session=0
+        _bl_trim_at=-30 _bl_back_at=-30 _bl_forced_at=-10 _bl_full_at=-60 _bl_noted_at=-5
+        _bl_rest=0 _bl_rest_until=0 _bl_rest_available=0
+        while kill -0 $$ 2>/dev/null; do
+          bl_memory_tick
+          if [ "$_bl_available" -ge 0 ] &&
+             { [ "$_bl_available" -lt $((_bl_mem_total * 2 / 5)) ] || [ "$_bl_rate" -ge $((16 * 1024)) ]; }; then
+            nap 1
           else
-            _bl_since=-1
+            nap 5
           fi
-          if [ "$_bl_unpack" = 1 ] && [ "$_bl_game" = 0 ] && ! bl_over_cap && bl_client_can_readback; then
-            bl_zram_send 0 "memory recovered, reading the client back" client
-            _bl_unpack=0
-          fi
-          bl_watch_nap
         done
       ) &
     fi

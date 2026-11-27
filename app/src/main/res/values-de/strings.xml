@@ -577,16 +577,7 @@
     <string name="perf_gsrealtime">gamescope: Echtzeit-GPU-Warteschlange</string>
     <string name="perf_gsrealtime_hint">Priorisiert die GPU-Arbeit des Compositors. Kann das Frame-Pacing glätten, kostet Spiele aber etwas Leistung.</string>
     <string name="perf_gpu">GPU</string>
-    <string name="perf_memory">Arbeitsspeicher</string>
     <string name="perf_cap_off">Aus</string>
-    <string name="perf_cap_auto">Treiberstandard</string>
-    <string name="perf_zram_client">Steam komprimieren, während ein Spiel läuft</string>
-    <string name="perf_zram_client_hint">20 s nach dem Spielstart wird der Steam-Client in zRAM komprimiert, um dem Spiel mehr Speicher zu lassen, und beim Beenden des Spiels zurückgelesen. Schalte dies aus, wenn sich die Sitzung kurz nach dem Spielstart schließt. Ein RAM-Limit oben komprimiert Steam weiterhin, wenn die Sitzung es überschreitet.</string>
-    <string name="perf_ram_cap">RAM-Limit</string>
-    <string name="perf_ram_cap_hint">Gilt, solange der Steam-Client läuft, im Steam-Modus oder vom Desktop aus. Verbraucht die Sitzung mehr als diesen Wert, werden Steam und danach die übrigen unterstützten Prozesse der Sitzung in zRAM komprimiert. Ein weiches Limit: Nichts wird geschlossen, aber Spiele können ruckeln, während Seiten zurückgeladen werden.</string>
-    <string name="perf_ram_cap_unavailable">Benötigt zRAM-Swap, den dieses Gerät nicht hat.</string>
-    <string name="perf_vram_cap">VRAM-Limit</string>
-    <string name="perf_vram_cap_hint">Meldet Direct3D-9-bis-12-Spielen dieses Videospeicherbudget, um den Speicherverbrauch zu senken. Spiele können es überschreiten; dies fügt kein GPU-Paging hinzu und garantiert keinen Schutz vor Abstürzen durch Speichermangel. Gilt ab der nächsten Sitzung.</string>
     <string name="perf_gpuclock">GPU auf höchstem Takt halten</string>
     <string name="perf_gpuclock_hint">Nur Adreno. Weniger Ruckler, mehr Akkuverbrauch und Wärme.</string>
     <string name="perf_fixes">Sitzungskorrekturen</string>

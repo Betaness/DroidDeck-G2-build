@@ -581,16 +581,7 @@
     <string name="perf_gsrealtime">gamescope: fronta GPU v reálném čase</string>
     <string name="perf_gsrealtime_hint">Dává prioritu práci GPU kompozitoru. Může vyhladit tempo snímků na úkor her.</string>
     <string name="perf_gpu">GPU</string>
-    <string name="perf_memory">Paměť</string>
     <string name="perf_cap_off">Vypnuto</string>
-    <string name="perf_cap_auto">Výchozí ovladače</string>
-    <string name="perf_zram_client">Komprimovat Steam během hry</string>
-    <string name="perf_zram_client_hint">20 s po spuštění hry se klient Steam zkomprimuje do zRAM, aby hře zbylo více paměti, a po zavření hry se načte zpět. Vypněte, pokud se relace krátce po spuštění her zavírá. Limit RAM výše stále komprimuje Steam, když ho relace překročí.</string>
-    <string name="perf_ram_cap">Limit RAM</string>
-    <string name="perf_ram_cap_hint">Platí, když běží klient Steam, v režimu Steam nebo z Plochy. Když relace použije víc, zkomprimuje se do zRAM Steam a poté další podporované procesy relace. Měkký limit: nic se nezavře, ale hry mohou trhat, než se stránky načtou zpět.</string>
-    <string name="perf_ram_cap_unavailable">Vyžaduje swap zRAM, který toto zařízení nemá.</string>
-    <string name="perf_vram_cap">Limit VRAM</string>
-    <string name="perf_vram_cap_hint">Hlásí hrám s Direct3D 9 až 12 tento rozpočet videopaměti, aby snížily její využití. Hry jej mohou překročit; nepřidává stránkování GPU ani nezaručuje ochranu před pády kvůli nedostatku paměti. Platí od příští relace.</string>
     <string name="perf_gpuclock">Udržet GPU na nejvyšších taktech</string>
     <string name="perf_gpuclock_hint">Jen Adreno. Méně zadrhávání, více spotřeby baterie a tepla.</string>
     <string name="perf_fixes">Opravy relace</string>

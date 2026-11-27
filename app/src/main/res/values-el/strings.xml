@@ -577,16 +577,7 @@
     <string name="perf_gsrealtime">gamescope: ουρά GPU πραγματικού χρόνου</string>
     <string name="perf_gsrealtime_hint">Δίνει προτεραιότητα στην εργασία GPU του compositor. Μπορεί να εξομαλύνει τον ρυθμό καρέ με κάποιο κόστος για τα παιχνίδια.</string>
     <string name="perf_gpu">GPU</string>
-    <string name="perf_memory">Μνήμη</string>
     <string name="perf_cap_off">Ανενεργό</string>
-    <string name="perf_cap_auto">Προεπιλογή προγράμματος οδήγησης</string>
-    <string name="perf_zram_client">Συμπίεση του Steam όσο τρέχει παιχνίδι</string>
-    <string name="perf_zram_client_hint">20 s μετά την εκκίνηση ενός παιχνιδιού, ο πελάτης Steam συμπιέζεται στη zRAM για να μείνει περισσότερη μνήμη στο παιχνίδι, και διαβάζεται πίσω όταν το παιχνίδι κλείσει. Απενεργοποιήστε το αν η συνεδρία κλείνει λίγο μετά την εκκίνηση παιχνιδιών. Ένα όριο RAM παραπάνω εξακολουθεί να συμπιέζει το Steam όταν η συνεδρία το ξεπεράσει.</string>
-    <string name="perf_ram_cap">Όριο RAM</string>
-    <string name="perf_ram_cap_hint">Ισχύει όσο τρέχει ο πελάτης Steam, σε λειτουργία Steam ή από την επιφάνεια εργασίας. Όταν η συνεδρία χρησιμοποιεί περισσότερη, το Steam και έπειτα οι άλλες υποστηριζόμενες διεργασίες της συνεδρίας συμπιέζονται στη zRAM. Ήπιο όριο: τίποτα δεν κλείνει, αλλά τα παιχνίδια μπορεί να κολλάνε όσο επιστρέφουν οι σελίδες.</string>
-    <string name="perf_ram_cap_unavailable">Απαιτεί zRAM swap, που δεν υπάρχει σε αυτή τη συσκευή.</string>
-    <string name="perf_vram_cap">Όριο VRAM</string>
-    <string name="perf_vram_cap_hint">Αναφέρει αυτόν τον προϋπολογισμό μνήμης βίντεο σε παιχνίδια Direct3D 9 έως 12 για να μειωθεί η χρήση μνήμης. Τα παιχνίδια μπορεί να τον υπερβούν· δεν προσθέτει σελιδοποίηση GPU ούτε εγγυάται προστασία από σφάλματα έλλειψης μνήμης. Ισχύει από την επόμενη συνεδρία.</string>
     <string name="perf_gpuclock">Διατήρηση της GPU στη μέγιστη συχνότητά της</string>
     <string name="perf_gpuclock_hint">Μόνο Adreno. Λιγότερα κολλήματα, μεγαλύτερη χρήση μπαταρίας και θερμότητα.</string>
     <string name="perf_fixes">Διορθώσεις συνεδρίας</string>

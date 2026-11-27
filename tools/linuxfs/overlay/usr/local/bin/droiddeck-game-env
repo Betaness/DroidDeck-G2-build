@@ -433,19 +433,6 @@ def game_gpu(env, keep=False):
     return result
 
 
-def vram_cap(env):
-    value = env.get("BL_VRAM_MB", "")
-    if not re.fullmatch(r"[1-9][0-9]{0,6}", value):
-        return env
-    result = env.copy()
-    cap = "dxgi.maxDeviceMemory = %d" % int(value)
-    own = result.get("DXVK_CONFIG", "").strip().strip(";").strip()
-    result["DXVK_CONFIG"] = cap + "; " + own if own else cap
-    result["DROIDDECK_VRAM_CAP"] = "1"
-    result["DROIDDECK_VRAM_CAP_MB"] = value
-    return result
-
-
 def parse_cores(text):
     cores = set()
     for part in text.replace(" ", "").split(","):
@@ -1635,7 +1622,6 @@ def main():
     if mic_enabled == "0":
         env["AUDIO_DIRECT_MIC"] = "0"
     env = directaudio_settings(env)
-    env = vram_cap(env)
     note = render_path_defaults(command, env) if app_id else None
     if note:
         print("droiddeck-game-env: " + note, file=sys.stderr)

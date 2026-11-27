@@ -759,24 +759,6 @@ object SessionPrefs {
         prefs(context).edit().putBoolean("gamescopeRealtime", on).apply()
     }
 
-    fun ramCapMb(context: Context): Int = prefs(context).getInt("ramCapMb", 0).coerceAtLeast(0)
-
-    fun setRamCapMb(context: Context, mb: Int) {
-        prefs(context).edit().putInt("ramCapMb", mb.coerceAtLeast(0)).apply()
-    }
-
-    fun zramClient(context: Context): Boolean = prefs(context).getBoolean("zramClient", true)
-
-    fun setZramClient(context: Context, on: Boolean) {
-        prefs(context).edit().putBoolean("zramClient", on).apply()
-    }
-
-    fun vramCapMb(context: Context): Int = prefs(context).getInt("vramCapMb", 0).coerceAtLeast(0)
-
-    fun setVramCapMb(context: Context, mb: Int) {
-        prefs(context).edit().putInt("vramCapMb", mb.coerceAtLeast(0)).apply()
-    }
-
     fun gpuClockPin(context: Context): Boolean = prefs(context).getBoolean("gpuClockPin", false)
 
     fun setGpuClockPin(context: Context, on: Boolean) {
@@ -911,6 +893,10 @@ object SessionPrefs {
     fun mangoapp(context: Context): Boolean = prefs(context).getBoolean("mangoapp", true)
     fun vsyncThread(context: Context): Boolean = prefs(context).getBoolean("vsyncThread", true)
     fun renderOnCommit(context: Context): Boolean = prefs(context).getBoolean("renderOnCommit", true)
+
+    /** [mali-g2] Even frame pacing (upstream #2743): games capped below the refresh rate are held to an even rhythm. Off by default, it adds latency. */
+    fun presentCadence(context: Context): Boolean = prefs(context).getBoolean("presentCadence", false)
+    fun setPresentCadence(context: Context, on: Boolean) { prefs(context).edit().putBoolean("presentCadence", on).apply() }
     fun setMangoapp(context: Context, on: Boolean) { prefs(context).edit().putBoolean("mangoapp", on).apply() }
 
     fun zinkLazy(context: Context): Boolean = prefs(context).getBoolean("zinkLazy", true)

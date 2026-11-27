@@ -264,6 +264,9 @@ class DrawerActions(
     val onFrameGenPick: (FrameGen.Mode) -> Unit,
     val fpsLimit: Int = 0,
     val onFpsLimit: (Int) -> Unit = {},
+    val presentCadence: Boolean = false,
+    val presentCadenceAvailable: Boolean = false,
+    val onPresentCadence: (Boolean) -> Unit = {},
     val onImportLossless: () -> Unit,
     val onKeyboard: () -> Unit,
     val onHardwareKeyboard: () -> Unit,
@@ -579,6 +582,10 @@ internal fun SessionDrawer(open: Boolean, requestedPage: SessionDrawerPage, cont
                                     format = { if (it <= SessionPrefs.FPS_LIMIT_OFF) offLabel else it.toString() },
                                     modifier = focus.track(page, "fps-limit"),
                                     onChange = { a.onFpsLimit(if (it <= SessionPrefs.FPS_LIMIT_OFF) 0 else it) })
+                                if (a.presentCadenceAvailable) ToggleRow(
+                                    host, "present-cadence", stringResource(R.string.drawer_present_cadence),
+                                    stringResource(R.string.drawer_present_cadence_note), a.presentCadence,
+                                    chipModifier = focus.track(page, "present-cadence"), onChange = a.onPresentCadence)
                             }
                             SettingsGroup(stringResource(R.string.display_image_scaling)) {
                                 ChoiceRow(host, "upscaler", stringResource(R.string.display_filter), null,

@@ -1,4 +1,5 @@
 #include "../../app/src/main/cpp/waylandcomp/src/sc_layer.c"
+#include "../../app/src/main/cpp/waylandcomp/src/present_cadence.c"
 #include "../../app/src/main/cpp/waylandcomp/src/quest_device.h"
 #include <assert.h>
 

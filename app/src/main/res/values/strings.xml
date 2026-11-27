@@ -628,16 +628,7 @@
     <string name="perf_gsrealtime">gamescope: realtime GPU queue</string>
     <string name="perf_gsrealtime_hint">Prioritizes the compositor\'s GPU work. Can smooth frame pacing at some cost to games.</string>
     <string name="perf_gpu">GPU</string>
-    <string name="perf_memory">Memory</string>
     <string name="perf_cap_off">Off</string>
-    <string name="perf_cap_auto">Driver default</string>
-    <string name="perf_zram_client">Compress Steam while a game runs</string>
-    <string name="perf_zram_client_hint">Compresses Steam while a game runs, starting sooner when memory is tight. Steam is read back after the game closes once enough RAM is available. Turn this off if the session closes shortly after games start. A RAM cap above still compresses Steam when the session goes over it.</string>
-    <string name="perf_ram_cap">RAM cap</string>
-    <string name="perf_ram_cap_hint">Applies while the Steam client runs, in Steam mode or from the desktop. When the session uses more than this, Steam and then the session\'s other supported processes are compressed into zRAM. A soft cap: nothing is closed, but games may stutter while pages come back.</string>
-    <string name="perf_ram_cap_unavailable">Needs zRAM swap, which this device does not have.</string>
-    <string name="perf_vram_cap">VRAM cap</string>
-    <string name="perf_vram_cap_hint">Reports this video memory budget to Direct3D 9 to 12 games to encourage lower memory use. Games may exceed it; this does not add GPU paging or guarantee protection from out-of-memory crashes. Takes effect at the next session.</string>
     <string name="perf_gpuclock">Hold the GPU at its top clock</string>
     <string name="perf_gpuclock_hint">Adreno only. Fewer hitches, more battery use and heat.</string>
     <string name="perf_fixes">Session fixes</string>
@@ -674,6 +665,8 @@
     <string name="drawer_page_display">Display</string>
     <string name="drawer_frame_limit">Frame limit</string>
     <string name="drawer_frame_limit_note">Caps this game. The display switches to a refresh rate the cap divides evenly when it has one; other caps can look uneven. Steam games use Steam\'s Frame Limit in the Quick Access menu.</string>
+    <string name="drawer_present_cadence">Even frame pacing</string>
+    <string name="drawer_present_cadence_note">Holds games capped below the refresh rate to an even rhythm, so each frame stays on screen for the same number of refreshes. Frames reach the screen up to about two refreshes later, and the display composes every refresh while a capped game runs. Needs Android 13.</string>
     <string name="drawer_page_effects">Effects</string>
     <string name="drawer_page_controls">Controls</string>
     <string name="drawer_page_components">Components</string>

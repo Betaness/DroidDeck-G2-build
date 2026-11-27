@@ -581,16 +581,7 @@
     <string name="perf_gsrealtime">gamescope: черга GPU реального часу</string>
     <string name="perf_gsrealtime_hint">Надає пріоритет роботі композитора на GPU. Може вирівняти темп кадрів ціною частини продуктивності ігор.</string>
     <string name="perf_gpu">GPU</string>
-    <string name="perf_memory">Памʼять</string>
     <string name="perf_cap_off">Вимк.</string>
-    <string name="perf_cap_auto">Типово для драйвера</string>
-    <string name="perf_zram_client">Стискати Steam під час гри</string>
-    <string name="perf_zram_client_hint">Через 20 с після запуску гри клієнт Steam стискається в zRAM, щоб залишити грі більше памʼяті, і зчитується назад, коли гра закривається. Вимкніть, якщо сеанс закривається невдовзі після запуску ігор. Ліміт RAM вище все одно стискає Steam, коли сеанс його перевищує.</string>
-    <string name="perf_ram_cap">Ліміт RAM</string>
-    <string name="perf_ram_cap_hint">Діє, поки працює клієнт Steam, у режимі Steam або з робочого столу. Коли сеанс використовує більше цього значення, Steam, а потім інші підтримувані процеси сеансу стискаються в zRAM. Мʼякий ліміт: нічого не закривається, але ігри можуть підвисати, поки сторінки повертаються.</string>
-    <string name="perf_ram_cap_unavailable">Потрібен своп zRAM, якого на цьому пристрої немає.</string>
-    <string name="perf_vram_cap">Ліміт VRAM</string>
-    <string name="perf_vram_cap_hint">Повідомляє іграм Direct3D 9–12 цей бюджет відеопам’яті для зменшення її використання. Ігри можуть його перевищити; це не додає підкачку пам’яті GPU й не гарантує захисту від збоїв через нестачу пам’яті. Діє з наступного сеансу.</string>
     <string name="perf_gpuclock">Тримати GPU на максимальній частоті</string>
     <string name="perf_gpuclock_hint">Лише Adreno. Менше запинок, вища витрата заряду та нагрів.</string>
     <string name="perf_fixes">Виправлення сеансу</string>
