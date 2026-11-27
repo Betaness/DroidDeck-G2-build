@@ -1,26 +1,43 @@
 # ZeroFG on the zero-copy path
 
-`src/zerofg_zc.c` runs ZeroFG v1.1.0 (`../thirdparty/zerofg`, Apache-2.0) on the zero-copy main window: the frame
-generation menu's "ZeroFG ReallyZero 2×" and "ZeroFG Zero 2×" (`FrameGen.ENGINE_ZEROFG`, compositor engine 2).
-Selected, it does not pause zero-copy (`vkp_framegen_active()` is 0 for it), so hybris games keep presenting
+`src/zerofg_zc.c` runs ZeroFG v1.2.1 (`../thirdparty/zerofg`, Apache-2.0) on the zero-copy main window: the frame
+generation menu's "ZeroFG RZ+ 2×/3×/4×" and "ZeroFG Zero 2×/3×/4×" (`FrameGen.ENGINE_ZEROFG`, compositor engine 2;
+the multiplier is `FrameGen.Mode.multiplier`, pref `zerofg_multiplier`, armed with `nativeSetFrameGenArmed`). RZ+ is
+ZeroFG 1.2's one engine, `Mode::kReallyZero` (the 1.1 ReallyZero's dense flow with the old Zero's camera start,
+HUD hold and wipe handling; 1.2.1 adds the Vector Trail Fill at occlusion edges); it is the default. Zero is
+`Mode::kZero`, 1.1's layered engine, kept upstream as it was (`CreateInfo::zero_options` 0). Upstream turns one
+optimisation of Zero's render on only where the device name says Adreno 800 or up (2c6a44bf), so on Mali that
+pass runs in its general form. Selected, it does not pause zero-copy (`vkp_framegen_active()` is 0 for it), so hybris games keep presenting
 zero-copy. The copy path runs no frame generation while it is selected. Off, nothing on the zero-copy path or in
 LSFG / DD-FG changes.
 
 ## Per real frame B of the main window
 
 1. Imports B (the game's AHardwareBuffer) into ZeroFG's own VkDevice.
-2. A is the real frame shown before B. With an engine ready, a free job and a free pool buffer, ZeroFG records
-   `Interpolate(A, B, 0.5)` into a buffer of the layer's pool (RGBA8, written through ZeroFG's internal
-   A2B10G10R10 image and a blit). The job waits for B's acquire fence, for A's when no earlier job waited for it,
-   and for the pool buffer's display release fence.
-3. S goes to the display in a transaction of its own, then B (the game's buffer itself) in another. Both wait on
-   the event loop for their times (below), S also until its generation is complete. S waits for B to be rendered,
-   so it can be complete only after the next real frames arrived: their pairs queue behind (up to 4 pairs).
+2. A is the real frame shown before B. With an engine ready, a free job, free frame contexts and free pool
+   buffers, ZeroFG records the pair's N - 1 generated frames S1 .. S(N-1) for the multiplier N in force (below):
+   `Interpolate(A, B, k / N)` for k = 1 .. N - 1, one after another in the job's command buffer, each with the
+   next of the engine's 8 frame contexts (`frame_context_count`, at least N + 1 as INTEGRATION.md asks for xN),
+   each into a buffer of the layer's pool (RGBA8, written through ZeroFG's internal A2B10G10R10 image and a
+   blit). The calls after the first record only what depends on the phase (same pair, same sequence numbers). A
+   pair is submitted only while the Interpolate calls of the jobs still running and its own fit the 8 contexts
+   (x4: two pairs in flight). With fewer free pool buffers than N - 1 the pair has fewer outputs (`pool_short`).
+   The pool may grow to 3 (x2, as before), 6 (x3) or 9 (x4) buffers, allocated as needed and freed with the
+   rest when ZeroFG stops using the layer. The job waits for B's acquire fence, for A's when no earlier job
+   waited for it, and for the pool buffers' display release fences.
+3. Each S goes to the display in a transaction of its own, then B (the game's buffer itself) in another. All
+   wait on the event loop for their times (below), the generated frames also until the generation is complete.
+   The generation waits for B to be rendered, so it can be complete only after the next real frames arrived:
+   their pairs queue behind (up to 4 pairs).
+4. Each output is placed when it goes to the display, by the window's rectangle through the scene-to-output
+   mapping in force then, as B always was (`sc_layer_present_vortek`). A game window crop (game fill,
+   `game_fill.h`) that changes while pairs wait so moves their generated frames with their B; a generated frame
+   never shows the place the screen has left.
 
 Retention of A is "hold" (design option b): the image on the screen is the next pair's A, so nothing is
 copied. The pairs waiting for their time hold their B, so a game image stays out of the game's hands from its
-present until the next pair's S replaces it on the screen: about B's target (`b_target_ms_avg`) plus half a
-period. A game with few swapchain images (4 on the tablet) can then wait for a free one. A game image's release
+present until the next pair's S1 replaces it on the screen: about B's target (`b_target_ms_avg`) plus a period
+/ N. A game with few swapchain images (4 on the tablet) can then wait for a free one. A game image's release
 fence is merged with the end of the last generation that read it (`zfg_release_fence`, called from
 `vortek_present_release`).
 
@@ -41,40 +58,52 @@ frames: the menu items are greyed out with that reason, and picking ZeroFG says 
   takes its buffers, one refresh unless `DROIDDECK_ZEROFG_LATCH_MS` says otherwise.
 - Lead L: how long after B arrives S is ready (seen as its completion fence signalling on the event loop);
   rises at once, falls by 1/8 per frame; plus a margin (2 ms), at most 2 P; plus W and r/2.
-- S's target is half a period after the previous B's target, kept within [arrival + L, arrival + L +
-  max(P/4, r)] and at least a refresh after the previous B; B's target is max(P/2, r) after S's. When S would
-  have to pass the upper bound to keep that refresh, the pair has no S (`early`) and B goes half a period after
-  arrival + L, at least a refresh after the previous B, but never later than B of a pair with S could be: where
-  twice the real rate is above the refresh rate, S frames are left out, never a real one; real frames faster
-  than the refresh rate do not push the targets later and later. Both targets are given to
+- The outputs of a pair are N apart by Q = max(P / N, r): S1's target is P / N after the previous B's target,
+  kept within [arrival + L, arrival + L + max(P/4, r)] and at least the spacing max(0.8 P / N, r) after the
+  previous B (the rule SkyNetEmu 0.2.4 uses: no two outputs closer than 80 % of their mean interval); S2 ..
+  S(N-1) and B follow Q apart (`zfg_schedule_n`). When S1 would have to pass the upper bound to keep that
+  spacing, the pair has no generated frames (`early`) and B goes (N - 1) P / N after arrival + L, at least the
+  spacing after the previous B, but never later than B of a pair with generated frames could be: where N times
+  the real rate is above the refresh rate, generated frames are left out, never a real one; real frames faster
+  than the refresh rate do not push the targets later and later. Every target is given to
   `ASurfaceTransaction_setDesiredPresentTime` half a refresh early (SurfaceFlinger shows a transaction on the
-  first refresh whose expected present time is later).
+  first refresh whose expected present time is later), so every refresh between two real frames has an output
+  aimed at it, as in upstream #2743.
+- The multiplier in force N is the menu's (or `DROIDDECK_ZEROFG_MULT`), lowered one step at a time, never below
+  2 (`zfg_mult_update`): at once while N times the real rate is more than 5 % above the peak rate (3 % to go back
+  up), or while the GPU time of a pair's generated frames, (N - 1) times the median GPU time per generated frame
+  of the last 16 pairs, is more than half the real-frame period (40 % to go back up; a multiplier lowered for
+  this is not tried again for 10 s); and after N times the real rate stayed more than 5 % above the running
+  refresh rate for 2 s (3 % to go back up). A higher multiplier comes back once it has fitted for 2 s. Every
+  change is logged with its reason. x2's own limits are `fast` below.
 - SurfaceFlinger takes the transactions of a process in order and holds every later one behind one whose
   desired present time has not come, or whose buffer is not ready. So S and B are not handed over at once:
   S goes when it is complete and W + margin before its desired present time, B the same before its own, after
-  S (a CLOCK_MONOTONIC timerfd). The pairs of later real frames wait behind in order; they are not hurried by
-  the next frame, so when SurfaceFlinger commits earlier than W + margin, S and B both slip by a refresh instead
-  of S being taken with B. An S not complete when only W + margin before the refresh ahead of B's is left
-  (`missed`) stays off the screen, as SurfaceFlinger would take it with B; its buffer goes back with the
-  generation's fence, and B goes on time. A frame of the layer shown at once (the skips that restart the
+  S (a CLOCK_MONOTONIC timerfd); with N > 2 each Sk the same after S(k-1). The pairs of later real frames wait
+  behind in order; they are not hurried by the next frame, so when SurfaceFlinger commits earlier than W +
+  margin, the outputs slip by a refresh together instead of one being taken with the next. An Sk not complete
+  when only W + margin before the refresh ahead of the next output's is left (`missed`) stays off the screen, as
+  SurfaceFlinger would take it with that one; its buffer goes back with the generation's fence, and the next
+  output goes on time. A frame of the layer shown at once (the skips that restart the
   rhythm) lets the waiting pairs go first, S only if complete; a fifth pair pushes out the oldest; hiding the
   layer, its swapchain or the window going drops them (their B goes back to the game without waiting).
-- Without a desired present time (`DROIDDECK_ZEROFG_DPT=0`, or no `setDesiredPresentTime`) S and B are
-  handed over at the same times, so S still has a refresh of its own.
-- When S is skipped for `early`, `late` or `busy`, B keeps its place in the rhythm. Other skips show B at once
-  and restart the rhythm.
+- Without a desired present time (`DROIDDECK_ZEROFG_DPT=0`, or no `setDesiredPresentTime`) the outputs are
+  handed over at the same times, so each still has a refresh of its own.
+- When the generated frames are skipped for `early`, `late` or `busy`, B keeps its place in the rhythm. Other
+  skips show B at once and restart the rhythm.
 - `fast` (B shown as it comes, no S): 2x the real rate more than 5 % above the peak rate (below), until it is
   3 % or less above; or the real rate itself more than 2 % above the running refresh rate, until it is no
   longer above it; or 2x the real rate more than 5 % above the running refresh rate (until 3 % or less) for
   2 s, the panel having stayed below the peak after the vote (a power or thermal cap, the system's refresh
   policy, a peak the panel never reaches).
 - The layer votes the lowest of the panel's rates (modes of its current size up to the peak, from
-  `SessionActivity`; none known: the peak over 1 .. 8) that is a whole multiple of 2x the real rate within 3 %, so
-  every output keeps the same number of refreshes; where none is, the highest rate up to the peak (the smallest
-  unevenness). The rate is judged on P smoothed further (each frame moves it an eighth of the way). The vote stays
-  while 2x the real rate is at most 5 % above or 8 % below a whole fraction of it and no lower rate fits within
-  3 %; it changes once another rate has been chosen for 1 s without a break, so a few uneven frames do not move it
-  (`zfg_vote_step`). It asks for seamless mode switches only. The peak rate is the requested mode, else the
+  `SessionActivity`; none known: the peak over 1 .. 8) that is a whole multiple of N times the real rate within
+  3 %, so every output keeps the same number of refreshes (30 fps: x2 60 Hz, x3 90 Hz, x4 120 Hz); where none is,
+  the highest rate up to the peak (the smallest unevenness). N here is the multiplier in force, or a higher one
+  that only the running rate holds down, so the panel can come up for it. The rate is judged on P smoothed
+  further (each frame moves it an eighth of the way). The vote stays while N times the real rate is at most 5 %
+  above or 8 % below a whole fraction of it and no lower rate fits within 3 %; it changes once another rate has been chosen for 1 s without a break, so a few uneven frames do not move it
+  (`zfg_vote_step_n`). It asks for seamless mode switches only. The peak rate is the requested mode, else the
   fastest mode of the panel's size, after the caps (`FrameGen.apply`). While ZeroFG is selected the session's own
   vote is that rate too, so the panel comes back up after ZeroFG's vote lowered it, and for 10 s after ZeroFG was
   turned off while the panel still runs below it; then the running rate, as without ZeroFG. Frames skipped as
@@ -83,7 +112,9 @@ frames: the menu items are greyed out with that reason, and picking ZeroFG says 
 The pure arithmetic is `src/zerofg_pace.c`, tested by `tests/zerofg_pace_test.c` (CI: "ZeroFG pacing test"),
 which also drives it as `zfg_present` does against a model of SurfaceFlinger's queue (one apply token, a
 commit W before each refresh, one buffer per layer and refresh), with the pairs queued as `pend_run` handles
-them, also where S is complete only 40-64 ms after B arrived (the tablet at its native size).
+them, also where S is complete only 40-64 ms after B arrived (the tablet at its native size); x3 and x4 at 30 fps
+on 90, 120 and 144 Hz, the multiplier lowered for the peak, the GPU time and a panel held below the peak; and a
+game fill crop and option change (`game_fill.c`, `scene_map.c`) while pairs wait.
 
 ## Device and priority
 
@@ -109,7 +140,8 @@ picked.
 
 | Variable | Effect |
 | --- | --- |
-| `DROIDDECK_ZEROFG_MODE=zero\|reallyzero` | this engine whatever the menu says |
+| `DROIDDECK_ZEROFG_MODE=zero\|reallyzero\|rz+` | this engine whatever the menu says (reallyzero and rz+: RZ+) |
+| `DROIDDECK_ZEROFG_MULT=2\|3\|4` | this multiplier whatever the menu says (still lowered where it does not fit) |
 | `DROIDDECK_ZEROFG_PRIORITY=0\|high\|realtime` | global priority asked for (default high; 0: none) |
 | `DROIDDECK_ZEROFG_DPT=0` | no desired present time: S and B are handed over at their times all the same |
 | `DROIDDECK_ZEROFG_VOTE=0` | the layer keeps the session's frame-rate vote |
@@ -124,15 +156,28 @@ picked.
 - `device: <GPU>, Vulkan 1.x, queue family N, subgroup N, fp16 on|off, GPU timestamps on|off; global priority
   HIGH accepted by vkCreateDevice (VK_KHR_global_priority)` | `HIGH refused (VK_ERROR_NOT_PERMITTED): default
   priority` | `not requested (...)` | `unavailable: ...`, once, when ZeroFG first runs.
-- `on: <mode> WxH (...), backend auto|compat, built in N ms; ...; desired present time on|off, ...` once the
-  engine is ready.
+- `on: ZeroFG 1.2.1 rz+|zero xN WxH (...), backend auto|compat, built in N ms; ...; desired present time on|off,
+  ...` once the engine is ready.
+- `multiplier xA -> xB (xN asked for): <why>` when the multiplier in force changes: `x4 of the real rate R fps is
+  F fps, above the peak refresh rate P Hz`, `x4 needs about T ms of GPU time per real frame (G ms per generated
+  frame), more than 50 % of the real-frame period`, `... above the running refresh rate H Hz for 2 s`, or `it
+  fits again (...)`; `multiplier xN asked for (was xM)` when the menu changes it.
 - Every 5 s while active, one line of `key=value`:
   `stats 5.0s real_fps= gen= gen_fps= skip= skip_first= skip_cut= skip_fast= skip_early= skip_late= skip_busy=
   skip_missed= skip_unsupported= skip_error= skip_prep= gpu_ms_med= gpu_ms_avg= gpu_ms_max= gpu_n=
   ready_ms_avg= ready_ms_max= s_after_target= b_rendered_ms_avg= b_rendered_ms_max= s_after_b_ms_avg=
-  b_target_ms_avg= queue_max= dpt= period_ms= lead_ms= refresh_hz= vote_hz= fast= mode= size=`
-  - `gen`: S frames handed to the display. `gpu_ms_*`: GPU time of `Interpolate` from timestamp queries
-    around it. `ready_ms_*`: from B's arrival to S's completion as the event loop saw it. `s_after_target`: S
+  b_target_ms_avg= queue_max= dpt= period_ms= lead_ms= refresh_hz= vote_hz= fast= mult= mult_want= mult_vote=
+  mult_lo= mult_hi= mult_why= pairs_x2= pairs_x3= pairs_x4= gen_ph= missed_ph= pool_short= gpu_ms_frame=
+  rec_ms_max= mode= size=`
+  - `gen`: generated frames handed to the display. `mult`: the multiplier in force at the end of the interval,
+    `mult_want` the one asked for, `mult_vote` the one the vote is for, `mult_lo`/`mult_hi` the lowest and
+    highest in force during it, `mult_why` what holds it below the one asked for (`none`, `peak`, `gpu`,
+    `refresh`). `pairs_xN`: pairs generated with N outputs. `gen_ph=a/b/c`: generated frames shown at the first,
+    second and third phase (x2: a only; x3: a, b; x4: a, b, c), `missed_ph` those left out as `missed`.
+    `pool_short`: pairs with fewer outputs for want of pool buffers. `gpu_ms_frame`: the median GPU time per
+    generated frame the multiplier is judged on (0 before 8 pairs). `rec_ms_max`: longest CPU time recording a
+    pair. `gpu_ms_*`: GPU time of a pair's `Interpolate` calls from timestamp
+    queries around them. `ready_ms_*`: from B's arrival to S's completion as the event loop saw it. `s_after_target`: S
     completed later than W before the refresh its desired present time picks. `b_rendered_ms_*`: from B's
     arrival to the signal time of B's acquire fence (the game's GPU work for B; 0 when it had signalled),
     `s_after_b_ms_avg`: from then to the signal time of S's completion (the generation plus the time it waited
@@ -140,9 +185,10 @@ picked.
     to its target on the screen. `queue_max`: most pairs waiting at once. `dpt=1`: desired present time used.
     `fast=1`: frames shown as they come right now.
   - Skips: `first` (no previous frame: start, new swapchain or size, after a hidden window), `cut` (frames
-    more than max(4 P, 250 ms) apart), `fast` (above), `early` (no refresh of its own left for S), `late` (all
-    three jobs still running), `busy` (the display holds every pool buffer), `missed` (S generated but not
-    complete while a refresh before B's was left), `unsupported`, `error`, `prep` (engine being built).
+    more than max(4 P, 250 ms) apart), `fast` (above), `early` (no refresh of its own left for S1), `late` (all
+    three jobs still running, or their Interpolate calls and the pair's would not fit the 8 frame contexts),
+    `busy` (the display holds every pool buffer), `missed` (a generated frame not complete while a refresh before
+    the next output's was left; counted per frame), `unsupported`, `error`, `prep` (engine being built).
 - `off: <why> (N frames generated)`; `off for this session: <why>`; `ZeroFG (<mode>) could not be built at WxH:
   <status>; frames of this size and mode are shown as they are`; `new session: ZeroFG may run again`;
   `swapchain N of presenter P (WxH, AHardwareBuffer format F) cannot be used: <why>; its frames are shown as

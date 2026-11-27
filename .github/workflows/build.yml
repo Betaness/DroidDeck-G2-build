@@ -362,8 +362,11 @@ jobs:
         run: |
           set -euo pipefail
           W=app/src/main/cpp/waylandcomp
-          cc -O2 -Wall -Wextra -Werror -I$W/src -o mali-g2/vortek/out/zerofg_pace_test $W/tests/zerofg_pace_test.c $W/src/zerofg_pace.c -lm
+          cc -O2 -Wall -Wextra -Werror -I$W/src -o mali-g2/vortek/out/zerofg_pace_test $W/tests/zerofg_pace_test.c $W/src/zerofg_pace.c \
+            $W/src/scene_map.c $W/src/game_fill.c -lm
           mali-g2/vortek/out/zerofg_pace_test
+      - name: ZeroFG vendored copy and menu strings (mali-g2)
+        run: python3 -I tools/tests/test_zerofg.py
       - name: Compositor pointer sync test (mali-g2)
         run: |
           set -euo pipefail

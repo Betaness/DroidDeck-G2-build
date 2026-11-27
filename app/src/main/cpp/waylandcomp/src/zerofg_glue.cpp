@@ -96,9 +96,9 @@ zfg_engine *zfg_engine_build(const struct zfg_build *b, int *status, const char 
 }
 
 int zfg_engine_interpolate(zfg_engine *e, VkCommandBuffer cmd, uint32_t context, const struct zfg_image *previous,
-                           const struct zfg_image *current, const struct zfg_image *output) {
-    if (!e || !e->fg) return ZFG_ST_INVALID;
-    return status_of(e->fg->Interpolate(cmd, context, wrap(*previous), wrap(*current), 0.5f, wrap(*output)));
+                           const struct zfg_image *current, float phase, const struct zfg_image *output) {
+    if (!e || !e->fg || !(phase > 0.0f && phase < 1.0f)) return ZFG_ST_INVALID;
+    return status_of(e->fg->Interpolate(cmd, context, wrap(*previous), wrap(*current), phase, wrap(*output)));
 }
 
 void zfg_engine_destroy(zfg_engine *e) { delete e; }

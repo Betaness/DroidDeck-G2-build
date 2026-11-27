@@ -58,10 +58,30 @@ class FrameGenZeroFgTest {
         assertEquals(FrameGen.ZEROFG_REALLY_ZERO, FrameGen.zeroFg("").zeroFg)
     }
 
-    @Test fun alwaysTimesTwoWithoutATarget() {
+    @Test fun aChoiceFromBeforeTimesThreeIsTimesTwoWithoutATarget() {
         prefs().edit().putString("engine", FrameGen.ENGINE_ZEROFG).putString("zerofg", FrameGen.ZEROFG_ZERO)
             .putInt("multiplier", 4).putInt("target", 90).commit()
         assertEquals(FrameGen.Mode(FrameGen.ENGINE_ZEROFG, 2, 0, FrameGen.ZEROFG_ZERO), FrameGen.mode(context))
+    }
+
+    @Test fun theMultiplierIsKeptPerChoice() {
+        FrameGen.set(context, FrameGen.zeroFg(FrameGen.ZEROFG_ZERO, 4))
+        assertEquals(FrameGen.Mode(FrameGen.ENGINE_ZEROFG, 4, 0, FrameGen.ZEROFG_ZERO), FrameGen.mode(context))
+        FrameGen.set(context, FrameGen.zeroFg(FrameGen.ZEROFG_REALLY_ZERO, 3))
+        assertEquals(FrameGen.Mode(FrameGen.ENGINE_ZEROFG, 3, 0, FrameGen.ZEROFG_REALLY_ZERO), FrameGen.mode(context))
+        FrameGen.set(context, FrameGen.Mode(FrameGen.ENGINE_LSFG, 2))
+        assertEquals(FrameGen.Mode(FrameGen.ENGINE_LSFG, 2), FrameGen.mode(context))
+        prefs().edit().putString("engine", FrameGen.ENGINE_ZEROFG).commit()
+        assertEquals(FrameGen.zeroFg(FrameGen.ZEROFG_REALLY_ZERO, 3), FrameGen.mode(context))
+    }
+
+    @Test fun theMultiplierStaysWithinTwoToFour() {
+        assertEquals(4, FrameGen.zeroFg(FrameGen.ZEROFG_ZERO, 7).multiplier)
+        assertEquals(2, FrameGen.zeroFg(FrameGen.ZEROFG_ZERO, 1).multiplier)
+        prefs().edit().putString("engine", FrameGen.ENGINE_ZEROFG).putInt("zerofg_multiplier", 9).commit()
+        assertEquals(4, FrameGen.mode(context).multiplier)
+        prefs().edit().putInt("zerofg_multiplier", 0).commit()
+        assertEquals(2, FrameGen.mode(context).multiplier)
     }
 
     @Test fun otherEnginesCarryNoZeroFgEngine() {
@@ -72,17 +92,28 @@ class FrameGenZeroFgTest {
         assertEquals(FrameGen.Mode(FrameGen.ENGINE_DDFG, 2), FrameGen.mode(context))
     }
 
-    @Test fun theMenuOffersReallyZeroThenZero() {
+    @Test fun theMenuOffersRzPlusThenZeroEachAtTwoThreeAndFour() {
         assertEquals(
-            listOf(FrameGen.Mode(FrameGen.ENGINE_ZEROFG, 2, 0, FrameGen.ZEROFG_REALLY_ZERO),
-                FrameGen.Mode(FrameGen.ENGINE_ZEROFG, 2, 0, FrameGen.ZEROFG_ZERO)),
+            listOf(2, 3, 4).map { FrameGen.Mode(FrameGen.ENGINE_ZEROFG, it, 0, FrameGen.ZEROFG_REALLY_ZERO) } +
+                listOf(2, 3, 4).map { FrameGen.Mode(FrameGen.ENGINE_ZEROFG, it, 0, FrameGen.ZEROFG_ZERO) },
             FrameGen.ZEROFG_MENU,
         )
     }
 
     @Test fun labels() {
-        assertEquals("ZeroFG ReallyZero 2×", FrameGen.label(context, FrameGen.zeroFg(FrameGen.ZEROFG_REALLY_ZERO)))
+        assertEquals("ZeroFG RZ+ 2×", FrameGen.label(context, FrameGen.zeroFg(FrameGen.ZEROFG_REALLY_ZERO)))
         assertEquals("ZeroFG Zero 2×", FrameGen.label(context, FrameGen.zeroFg(FrameGen.ZEROFG_ZERO)))
+        assertEquals("ZeroFG RZ+ 3×", FrameGen.label(context, FrameGen.zeroFg(FrameGen.ZEROFG_REALLY_ZERO, 3)))
+        assertEquals("ZeroFG Zero 4×", FrameGen.label(context, FrameGen.zeroFg(FrameGen.ZEROFG_ZERO, 4)))
+        assertEquals(FrameGen.ZEROFG_MENU.size, FrameGen.ZEROFG_MENU.map { FrameGen.label(context, it) }.toSet().size)
+    }
+
+    @Test fun theMultiplierIsArmed() {
+        assertNull(FrameGen.apply(context, FrameGen.zeroFg(FrameGen.ZEROFG_REALLY_ZERO, 4), 144f))
+        assertEquals(listOf("engine 2", "zerofg 0", "tuning 144.0", "peak 144.0", "armed true 4 0"), FakeCompositor.calls)
+        FakeCompositor.calls.clear()
+        assertNull(FrameGen.apply(context, FrameGen.zeroFg(FrameGen.ZEROFG_ZERO, 3), 120f))
+        assertEquals("armed true 3 0", FakeCompositor.calls.last())
     }
 
     @Test fun zeroArmsTheZeroCopyEngine() {
@@ -162,12 +193,14 @@ class FrameGenZeroFgTest {
 
     @Test fun knobsComeFromTheSessionEnvironment() {
         val env = FrameGen.zeroFgEnv(listOf("DROIDDECK_ZEROFG_DPT=0", "FOO=1", "DROIDDECK_ZEROFG_MODE=zero",
-            "DROIDDECK_ZEROFG_MODE=reallyzero", "DROIDDECK_ZEROFG_MARGIN_MS=4", "DROIDDECK_ZEROFG_LATCH_MS=12"))
+            "DROIDDECK_ZEROFG_MODE=reallyzero", "DROIDDECK_ZEROFG_MARGIN_MS=4", "DROIDDECK_ZEROFG_LATCH_MS=12",
+            "DROIDDECK_ZEROFG_MULT=3"))
         assertEquals(FrameGen.ZEROFG_ENV.toSet(), env.keys)
         assertEquals("0", env["DROIDDECK_ZEROFG_DPT"])
         assertEquals("reallyzero", env["DROIDDECK_ZEROFG_MODE"])
         assertEquals("4", env["DROIDDECK_ZEROFG_MARGIN_MS"])
         assertEquals("12", env["DROIDDECK_ZEROFG_LATCH_MS"])
+        assertEquals("3", env["DROIDDECK_ZEROFG_MULT"])
         assertNull(env["DROIDDECK_ZEROFG_PRIORITY"])
     }
 

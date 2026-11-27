@@ -3,13 +3,14 @@
 #include <stdint.h>
 #include <vulkan/vulkan.h>
 
-/* [mali-g2] C interface to ZeroFG (thirdparty/zerofg) for zerofg_zc.c. */
+/* [mali-g2] C interface to ZeroFG (thirdparty/zerofg, v1.2.1) for zerofg_zc.c. */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 enum { ZFG_ST_OK = 0, ZFG_ST_INVALID, ZFG_ST_UNSUPPORTED, ZFG_ST_OOM, ZFG_ST_VULKAN };
+/* REALLYZERO: Mode::kReallyZero, which 1.2 made RZ+; ZERO: Mode::kZero, 1.1's layered engine. */
 enum { ZFG_MODE_REALLYZERO = 0, ZFG_MODE_ZERO = 1 };
 
 /* What is enabled on the device ZeroFG records for. */
@@ -48,8 +49,9 @@ typedef struct zfg_engine zfg_engine;
 
 /* Create and Resize, with Auto then Compat (unless compat_only). NULL: *status says why. */
 zfg_engine *zfg_engine_build(const struct zfg_build *b, int *status, const char **backend);
+/* phase in (0, 1). The phases of one pair are recorded one after another, each with its own context. */
 int zfg_engine_interpolate(zfg_engine *e, VkCommandBuffer cmd, uint32_t context, const struct zfg_image *previous,
-                           const struct zfg_image *current, const struct zfg_image *output);
+                           const struct zfg_image *current, float phase, const struct zfg_image *output);
 void zfg_engine_destroy(zfg_engine *e);
 const char *zfg_status_name(int status);
 

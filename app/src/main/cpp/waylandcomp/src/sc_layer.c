@@ -143,7 +143,9 @@ void sc_layer_set_frame_rate(float fps) {
 float sc_layer_frame_rate_want(void) { return atomic_load(&g_fps_want); }
 
 
-#define POOL_MAX 5
+#define POOL_MAX SC_VORTEK_POOL_MAX
+#define GAME_POOL 5
+_Static_assert(POOL_MAX >= GAME_POOL, "the game layer's pool");
 
 struct slot {
     AHardwareBuffer *ahb;
@@ -203,7 +205,7 @@ static int g_base_w, g_base_h, g_base_shown;
 static void layers_init(void) {
     if (g_layers_ready) return;
     g_layers_ready = 1;
-    g_layers[SC_LAYER_GAME] = (struct layer){.name = "droiddeck_wayland_game", .z = 1, .pool_n = POOL_MAX,
+    g_layers[SC_LAYER_GAME] = (struct layer){.name = "droiddeck_wayland_game", .z = 1, .pool_n = GAME_POOL,
                                              .cur_slot = -1, .votes_rate = 1, .fps_applied = -1.0f, .hr_applied = -1.0f,
                                              .ds_applied = -1};
     g_layers[SC_LAYER_OVERLAY] = (struct layer){.name = "droiddeck_wayland_overlay", .z = SC_OVERLAY_Z, .pool_n = 3,
@@ -944,6 +946,15 @@ int sc_layer_vortek_pool_take(int slot, int w, int h, struct vkp_image **img, in
     return idx;
 }
 
+void sc_layer_vortek_pool_reserve(int slot, int n) {
+    struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
+    if (!l) return;
+    if (n > POOL_MAX) n = POOL_MAX;
+    pthread_mutex_lock(&g_lock);
+    if (n > l->pool_n) l->pool_n = n;
+    pthread_mutex_unlock(&g_lock);
+}
+
 AHardwareBuffer *sc_layer_vortek_pool_ahb(int slot, int idx) {
     struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
     return l && idx >= 0 && idx < POOL_MAX ? l->slots[idx].ahb : NULL;
@@ -992,6 +1003,8 @@ int sc_layer_vortek_pool_trim(int slot) {
         s->release_fd = -1;
         freed++;
     }
+    /* empty: the next take starts at SC_VORTEK_POOL again */
+    if (!left) l->pool_n = 0;
     pthread_mutex_unlock(&g_lock);
     if (freed) {
         droiddeck_log("layer", "%s: %d upscaling buffer%s freed (no upscaled frame for a while)%s", l->name, freed,

@@ -13,11 +13,13 @@ object FrameGen {
     const val ENGINE_DDFG = "ddfg"
     private const val LEGACY_ENGINE_WINFG = "winfg"
     const val ENGINE_LSFG = "lsfg"
-    /** [mali-g2] ZeroFG on the zero-copy main window (waylandcomp/ZEROFG.md): ×2 only, two engines. */
+    /** [mali-g2] ZeroFG on the zero-copy main window (waylandcomp/ZEROFG.md): ×2, ×3 or ×4, two engines.
+     *  [ZEROFG_REALLY_ZERO] is ZeroFG 1.2's RZ+ engine (Mode::kReallyZero), [ZEROFG_ZERO] the layered Zero. */
     const val ENGINE_ZEROFG = "zerofg"
     const val ZEROFG_REALLY_ZERO = "reallyzero"
     const val ZEROFG_ZERO = "zero"
     val ZEROFG_MODES = listOf(ZEROFG_REALLY_ZERO, ZEROFG_ZERO)
+    val ZEROFG_MULTIPLIERS = 2..4
 
     private const val DDFG_PERF_PRESET = 2
     private const val DDFG_MODEL = 4
@@ -35,10 +37,13 @@ object FrameGen {
         }
     }
 
-    fun zeroFg(engine: String): Mode = Mode(ENGINE_ZEROFG, zeroFg = engine.takeIf { it in ZEROFG_MODES } ?: ZEROFG_REALLY_ZERO)
+    fun zeroFg(engine: String, multiplier: Int = 2): Mode = Mode(
+        ENGINE_ZEROFG, multiplier.coerceIn(ZEROFG_MULTIPLIERS.first, ZEROFG_MULTIPLIERS.last),
+        zeroFg = engine.takeIf { it in ZEROFG_MODES } ?: ZEROFG_REALLY_ZERO,
+    )
 
-    /** The ZeroFG items of the frame-generation menu, in order. */
-    val ZEROFG_MENU: List<Mode> = ZEROFG_MODES.map { zeroFg(it) }
+    /** The ZeroFG items of the frame-generation menu, in order: each engine at ×2, ×3 and ×4. */
+    val ZEROFG_MENU: List<Mode> = ZEROFG_MODES.flatMap { engine -> ZEROFG_MULTIPLIERS.map { zeroFg(engine, it) } }
 
     fun engine(context: Context): String = mode(context).engine
 
@@ -46,7 +51,8 @@ object FrameGen {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val engine = prefs.getString("engine", ENGINE_OFF).let { if (it == LEGACY_ENGINE_WINFG) ENGINE_DDFG else it ?: ENGINE_OFF }
         val target = prefs.getInt("target", 0)
-        if (engine == ENGINE_ZEROFG) return zeroFg(prefs.getString("zerofg", ZEROFG_REALLY_ZERO) ?: ZEROFG_REALLY_ZERO)
+        if (engine == ENGINE_ZEROFG)
+            return zeroFg(prefs.getString("zerofg", ZEROFG_REALLY_ZERO) ?: ZEROFG_REALLY_ZERO, prefs.getInt("zerofg_multiplier", 2))
         if (engine == ENGINE_LSFG && target in ADAPTIVE_TARGETS) return Mode(engine, target = target)
         return Mode(engine, prefs.getInt("multiplier", 2).coerceIn(2, 4))
     }
@@ -54,7 +60,10 @@ object FrameGen {
     fun set(context: Context, mode: Mode) {
         val edit = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString("engine", mode.engine).putInt("multiplier", mode.multiplier).putInt("target", mode.target)
-        if (mode.engine == ENGINE_ZEROFG) edit.putString("zerofg", zeroFg(mode.zeroFg).zeroFg)
+        if (mode.engine == ENGINE_ZEROFG) {
+            val z = zeroFg(mode.zeroFg, mode.multiplier)
+            edit.putString("zerofg", z.zeroFg).putInt("zerofg_multiplier", z.multiplier)
+        }
         edit.apply()
     }
 
@@ -78,8 +87,9 @@ object FrameGen {
 
     /** The compositor reads these when ZeroFG turns on (waylandcomp/ZEROFG.md). */
     val ZEROFG_ENV = listOf(
-        "DROIDDECK_ZEROFG_MODE", "DROIDDECK_ZEROFG_PRIORITY", "DROIDDECK_ZEROFG_DPT", "DROIDDECK_ZEROFG_VOTE",
-        "DROIDDECK_ZEROFG_MARGIN_MS", "DROIDDECK_ZEROFG_LATCH_MS", "DROIDDECK_ZEROFG_BACKEND", "DROIDDECK_ZEROFG_TRACE",
+        "DROIDDECK_ZEROFG_MODE", "DROIDDECK_ZEROFG_MULT", "DROIDDECK_ZEROFG_PRIORITY", "DROIDDECK_ZEROFG_DPT",
+        "DROIDDECK_ZEROFG_VOTE", "DROIDDECK_ZEROFG_MARGIN_MS", "DROIDDECK_ZEROFG_LATCH_MS", "DROIDDECK_ZEROFG_BACKEND",
+        "DROIDDECK_ZEROFG_TRACE",
     )
 
     /** Each ZeroFG knob's value in [env] (KEY=value lines, the last one counts); null: not given. */
@@ -100,8 +110,8 @@ object FrameGen {
     fun label(context: Context): String = label(context, mode(context))
 
     fun label(context: Context, mode: Mode): String = when {
-        mode.engine == ENGINE_ZEROFG && mode.zeroFg == ZEROFG_ZERO -> context.getString(R.string.frame_gen_zerofg_zero)
-        mode.engine == ENGINE_ZEROFG -> context.getString(R.string.frame_gen_zerofg_really)
+        mode.engine == ENGINE_ZEROFG && mode.zeroFg == ZEROFG_ZERO -> context.getString(R.string.frame_gen_zerofg_zero, mode.multiplier)
+        mode.engine == ENGINE_ZEROFG -> context.getString(R.string.frame_gen_zerofg_really, mode.multiplier)
         mode.engine == ENGINE_DDFG -> context.getString(R.string.frame_gen_ddfg, mode.multiplier)
         mode.engine == ENGINE_LSFG && mode.target > 0 -> context.getString(R.string.frame_gen_lsfg_adaptive, mode.target)
         mode.engine == ENGINE_LSFG -> context.getString(R.string.frame_gen_lsfg, mode.multiplier)
@@ -111,8 +121,9 @@ object FrameGen {
     fun apply(context: Context, refreshHz: Float, peakHz: Float = refreshHz, modesHz: FloatArray? = null): String? =
         apply(context, mode(context), refreshHz, peakHz, modesHz)
 
-    /** [peakHz]: the highest rate the session lets the panel run at; ZeroFG judges twice the real rate against
-     *  it, so a vote that lowered the panel can raise it again. [modesHz]: the panel's rates up to [peakHz], which
+    /** [peakHz]: the highest rate the session lets the panel run at; ZeroFG judges its multiplier times the real
+     *  rate against it (lowering the multiplier where that is above it), so a vote that lowered the panel can
+     *  raise it again. [modesHz]: the panel's rates up to [peakHz], which
      *  ZeroFG's frame-rate vote picks from (null: unchanged; none known: whole fractions of the peak). */
     fun apply(context: Context, mode: Mode, refreshHz: Float, peakHz: Float = refreshHz, modesHz: FloatArray? = null): String? {
         when (mode.engine) {
@@ -139,7 +150,7 @@ object FrameGen {
                 WaylandCompositor.nativeSetFrameGenTuning(FLOW_SCALE_LSFG, refreshHz)
                 WaylandCompositor.nativeSetZeroFgPeakHz(maxOf(peakHz, refreshHz))
                 modesHz?.let { WaylandCompositor.nativeSetZeroFgModes(it) }
-                WaylandCompositor.nativeSetFrameGenArmed(true, 2, 0)
+                WaylandCompositor.nativeSetFrameGenArmed(true, mode.multiplier.coerceIn(ZEROFG_MULTIPLIERS.first, ZEROFG_MULTIPLIERS.last), 0)
                 val problem = runCatching { WaylandCompositor.nativeZeroFgProblem() }.getOrNull()
                 if (problem != null) noteZeroFgProblem(context, problem)
                 if (!problem.isNullOrBlank()) {

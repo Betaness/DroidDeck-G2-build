@@ -33,6 +33,8 @@
     <string name="frame_gen_ddfg">DD-FG %1$d×</string>
     <string name="frame_gen_lsfg">LSFG %1$d×</string>
     <string name="frame_gen_lsfg_adaptive">LSFG 적응형 %1$d</string>
+    <string name="frame_gen_zerofg_really">ZeroFG RZ+ %1$d×</string>
+    <string name="frame_gen_zerofg_zero">ZeroFG Zero %1$d×</string>
     <string name="lsfg_needs_steam">Steam에서 Lossless Scaling이 필요합니다</string>
     <string name="lsfg_needs_install">Steam에서 Lossless Scaling을 설치하거나 Lossless.dll을 가져오세요</string>
     <string name="lsfg_import">Lossless.dll 가져오기…</string>

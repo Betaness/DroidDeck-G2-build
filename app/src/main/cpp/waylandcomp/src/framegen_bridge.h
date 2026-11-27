@@ -28,6 +28,8 @@ void vkp_framegen_device_lost(void);
 
 int vkp_framegen_active(void);
 int vkp_framegen_zerofg_armed(void);
+/* The multiplier the menu armed frame generation with (2 .. VKP_FG_MAX_GENERATIONS + 1). Any thread. */
+int vkp_framegen_multiplier(void);
 /* The panel's refresh rate from vkp_framegen_set_tuning (0: not given). */
 float vkp_framegen_refresh_hz(void);
 int vkp_framegen_extra_images(void);

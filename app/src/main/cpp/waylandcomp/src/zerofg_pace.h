@@ -37,20 +37,34 @@ int64_t zfg_target_lead(int64_t measured, int64_t period, int64_t margin, int64_
  * twice the real rate is above the refresh rate, leaving one S out frees a whole refresh). */
 int64_t zfg_slack(int64_t period, int64_t refresh);
 
+/* xN: N - 1 generated frames per pair of real frames, at phases 1/N .. (N - 1)/N, then the real one. */
+#define ZFG_MULT_MAX 4
+/* Outputs are at least this share of their mean interval (a real-frame period / N) apart, and at least a refresh. */
+#define ZFG_SPACING 0.8
+
 struct zfg_slots {
     int64_t s, b;
-    int no_s; /* no refresh of its own is left for S: B alone, s 0 */
+    int no_s;     /* no refresh of its own is left for the generated frames: B alone, s 0 */
+    int n;        /* the multiplier: outputs of the pair, n - 1 generated then B */
+    int64_t step; /* between the outputs: generated frame k (0 .. n - 2) at s + k * step, b at s + (n - 1) * step */
 };
-/* Display targets of the generated frame (s) and of the real frame it precedes (b), for a real frame that
- * arrived at `arrival`. s is half a period after the previous real frame's target (prev_b; 0: none), kept
- * between arrival + lead and arrival + lead + slack and at least one refresh after prev_b; b is half a period
- * after s, at least one refresh. When s would have to pass arrival + lead + slack to stay a refresh after
- * prev_b, there is no S: b is half a period after arrival + lead, at least one refresh after prev_b, but never
- * later than b of a pair with S could be (arrival + lead + slack + max(half a period, a refresh)): real frames
- * that come faster than the refresh rate do not push the targets later and later; one of them is then
- * replaced on the screen by the next. */
+/* How far apart two outputs must be: ZFG_SPACING of a period / n, at least a refresh. */
+int64_t zfg_spacing(int64_t period, int n, int64_t refresh);
+/* Display targets of the generated frames and of the real frame they precede, for a real frame that arrived at
+ * `arrival`, with n outputs per real frame. The first generated frame (s) is a period / n after the previous real
+ * frame's target (prev_b; 0: none), kept between arrival + lead and arrival + lead + slack and at least
+ * zfg_spacing after prev_b; the others and b follow a period / n apart (at least a refresh). When s would have to
+ * pass arrival + lead + slack to stay that far after prev_b, there are no generated frames: b is (n - 1) periods
+ * / n after arrival + lead, at least zfg_spacing after prev_b, but never later than b of a pair with generated
+ * frames could be (arrival + lead + slack + (n - 1) steps): real frames that come faster than the refresh rate
+ * do not push the targets later and later; one of them is then replaced on the screen by the next. */
+struct zfg_slots zfg_schedule_n(int64_t arrival, int64_t prev_b, int64_t period, int64_t lead, int64_t slack,
+                                int64_t refresh, int n);
+/* x2. */
 struct zfg_slots zfg_schedule(int64_t arrival, int64_t prev_b, int64_t period, int64_t lead, int64_t slack,
                               int64_t refresh);
+/* Target of generated frame k (0 .. t->n - 2). */
+int64_t zfg_slot_s(const struct zfg_slots *t, int k);
 
 /* The desired present time that puts a frame on the refresh nearest `target`: SurfaceFlinger holds a
  * transaction until a refresh whose expected present time is later than its desired present time. */
@@ -64,29 +78,32 @@ int64_t zfg_latch_deadline(int64_t target, int64_t refresh_period, int64_t latch
 int64_t zfg_apply_at(int64_t desired, int64_t latch, int64_t margin);
 
 /* The layer's frame-rate vote: the lowest of the panel's rates (`modes`, n of them; none given: the peak rate
- * over 1 .. 8) that is a whole multiple of twice the real rate within 3 %, so every output keeps the same
+ * over 1 .. 8) that is a whole multiple of `mult` times the real rate within 3 %, so every output keeps the same
  * number of refreshes; where none is, the highest rate up to the peak (the smallest unevenness). The previous
- * vote (0: none) stays while twice the real rate is at most 5 % above or 8 % below a whole fraction of it
+ * vote (0: none) stays while mult times the real rate is at most 5 % above or 8 % below a whole fraction of it
  * (ZFG_VOTE_KEEP_*) and no lower rate fits within 3 %. Rates above the peak are not voted. 0 while the period
- * or the peak rate is unknown. */
+ * or the peak rate is unknown. zfg_vote_pick: mult 2. */
 #define ZFG_VOTE_FIT 0.03
 #define ZFG_VOTE_KEEP_ABOVE 0.05
 #define ZFG_VOTE_KEEP_BELOW 0.08
+float zfg_vote_pick_n(int64_t period, int mult, const float *modes, int n, float peak_hz, float prev);
 float zfg_vote_pick(int64_t period, const float *modes, int n, float peak_hz, float prev);
 
 /* The vote over the frames. The period is smoothed further (each frame's period moves it an eighth of the way:
- * the period of a few uneven frames hardly moves it). The first vote is zfg_vote_pick's choice for it; then
- * that choice (with `hz` as the previous vote) replaces the vote once zfg_vote_pick has chosen other rates for
- * ZFG_VOTE_HOLD_NS without a break. */
+ * the period of a few uneven frames hardly moves it). The first vote is zfg_vote_pick_n's choice for it; then
+ * that choice (with `hz` as the previous vote) replaces the vote once zfg_vote_pick_n has chosen other rates for
+ * ZFG_VOTE_HOLD_NS without a break (also after the multiplier changed). zfg_vote_step: mult 2. */
 #define ZFG_VOTE_HOLD_NS 1000000000LL
 struct zfg_vote {
     float hz;           /* the vote in force; 0: none */
-    int away;           /* zfg_vote_pick has chosen another rate since away_since */
+    int away;           /* zfg_vote_pick_n has chosen another rate since away_since */
     int64_t away_since;
     int64_t period;     /* smoothed; 0: none yet */
 };
 void zfg_vote_reset(struct zfg_vote *v);
 /* The vote for a real frame at `now`; 0 while there is none. */
+float zfg_vote_step_n(struct zfg_vote *v, int64_t now, int64_t period, int mult, const float *modes, int n,
+                      float peak_hz);
 float zfg_vote_step(struct zfg_vote *v, int64_t now, int64_t period, const float *modes, int n, float peak_hz);
 
 /* Twice the real rate is more than 5 % above the peak refresh rate; once it was (was_fast), until it is 3 %
@@ -105,6 +122,49 @@ struct zfg_fast {
     int64_t over_since; /* twice the real rate above the running refresh rate since then; 0: not */
 };
 int zfg_fast_update(struct zfg_fast *f, int64_t now, int64_t period, float refresh_hz, float peak_hz);
+
+/* The multiplier in force for a wanted one (2 .. ZFG_MULT_MAX), lowered one step at a time, never below 2 (x2's
+ * own limits are zfg_fast_update's):
+ * - ZFG_CAP_PEAK at once while mult times the real rate is more than 5 % above the peak refresh rate (3 % to go
+ *   back up);
+ * - ZFG_CAP_GPU at once while the GPU time of a pair's generated frames, (mult - 1) times `gpu_ms` (per generated
+ *   frame, 0: unknown), is more than ZFG_GPU_SHARE of the real-frame period (ZFG_GPU_SHARE * ZFG_GPU_RAISE to go
+ *   back up; a multiplier lowered for this is not tried again for ZFG_GPU_BLOCK_NS);
+ * - ZFG_CAP_REFRESH after mult times the real rate stayed more than 5 % above the running refresh rate (refresh_hz,
+ *   0: unknown) for ZFG_FAST_GRACE_NS (3 % to go back up).
+ * A higher multiplier comes back once it has fitted for ZFG_MULT_RAISE_NS. vote_n is the multiplier the layer's
+ * frame-rate vote is for: n, or the highest one only the running rate holds down, so the panel can come up. */
+#define ZFG_GPU_SHARE 0.5
+#define ZFG_GPU_RAISE 0.8
+#define ZFG_GPU_BLOCK_NS 10000000000LL
+#define ZFG_MULT_RAISE_NS 2000000000LL
+enum { ZFG_CAP_NONE = 0, ZFG_CAP_PEAK, ZFG_CAP_GPU, ZFG_CAP_REFRESH };
+struct zfg_mult {
+    int n;               /* in force; 0: none yet */
+    int want;            /* the multiplier asked for: a new one is taken at once, then lowered as needed */
+    int vote_n;
+    int why;             /* ZFG_CAP_*: what keeps n below the wanted multiplier */
+    int64_t over_since;  /* n x the real rate above the running refresh rate since then; 0: not */
+    int raise;           /* a higher multiplier that has fitted since raise_since; 0: none */
+    int64_t raise_since;
+    int gpu_block;       /* lowered from this for the GPU time: not tried again before gpu_block_until */
+    int64_t gpu_block_until;
+};
+void zfg_mult_reset(struct zfg_mult *m);
+int zfg_mult_update(struct zfg_mult *m, int64_t now, int want, int64_t period, float refresh_hz, float peak_hz,
+                    double gpu_ms);
+const char *zfg_cap_name(int why);
+
+/* Interpolator::Create's frame_context_count. Each Interpolate call takes the next of them and must not reuse one
+ * whose submission still runs: a pair of n outputs records n - 1 calls, so a pair may be submitted while the calls
+ * of the pairs in flight and its own fit (at least n + 1, as INTEGRATION.md asks for xN). */
+#define ZFG_CONTEXTS 8
+int zfg_calls_fit(int calls_in_flight, int n);
+
+/* Buffers of the layer's pool for xN: the generated frames of three pairs (x2: 3, SC_VORTEK_POOL, as before). */
+#define ZFG_POOL_PAIRS 3
+#define ZFG_POOL_MAX ((ZFG_MULT_MAX - 1) * ZFG_POOL_PAIRS)
+int zfg_pool_size(int n);
 
 /* The Vulkan format a game's AHardwareBuffer is imported as: the one the driver gives for it
  * (vkGetAndroidHardwareBufferPropertiesANDROID; 0 = VK_FORMAT_UNDEFINED: none of its own); where that is none,
