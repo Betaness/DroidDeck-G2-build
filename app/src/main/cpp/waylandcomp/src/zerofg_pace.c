@@ -1,6 +1,7 @@
 #include "zerofg_pace.h"
 
 #include <math.h>
+#include <string.h>
 
 void zfg_period_reset(struct zfg_period *p) {
     p->n = 0;
@@ -38,6 +39,28 @@ int64_t zfg_lead_update(int64_t lead, int64_t ready_delay) {
     return lead - (lead - ready_delay) / 8;
 }
 
+void zfg_ready_reset(struct zfg_ready *r) { memset(r, 0, sizeof(*r)); }
+
+void zfg_ready_add(struct zfg_ready *r, int64_t delay) {
+    if (delay <= 0) return;
+    r->v[r->next] = delay;
+    r->next = (r->next + 1) % ZFG_READY_HIST;
+    if (r->n < ZFG_READY_HIST) r->n++;
+}
+
+int64_t zfg_ready_get(const struct zfg_ready *r) {
+    if (r->n < ZFG_READY_HIST / 2) return 0;
+    int64_t v[ZFG_READY_HIST];
+    memcpy(v, r->v, sizeof(v));
+    for (int i = 1; i < r->n; i++)
+        for (int k = i; k > 0 && v[k] < v[k - 1]; k--) {
+            const int64_t t = v[k];
+            v[k] = v[k - 1];
+            v[k - 1] = t;
+        }
+    return r->n % 2 ? v[r->n / 2] : (v[r->n / 2 - 1] + v[r->n / 2]) / 2;
+}
+
 int64_t zfg_target_lead(int64_t measured, int64_t period, int64_t margin, int64_t latch, int64_t refresh) {
     int64_t ready = (measured > 0 ? measured : period / 2) + (margin > 0 ? margin : 0);
     if (period > 0 && ready > 2 * period) ready = 2 * period;
@@ -49,29 +72,75 @@ int64_t zfg_slack(int64_t period, int64_t refresh) {
     return q > refresh ? q : refresh > 0 ? refresh : 0;
 }
 
-struct zfg_slots zfg_schedule(int64_t arrival, int64_t prev_b, int64_t period, int64_t lead, int64_t slack,
-                              int64_t refresh) {
-    const int64_t half = period > 0 ? period / 2 : 0;
-    const int64_t gap = refresh > 0 ? refresh : 0;
-    const int64_t step = half > gap ? half : gap;
+static int mult_of(int n) { return n < 2 ? 2 : n > ZFG_MULT_MAX ? ZFG_MULT_MAX : n; }
+
+int64_t zfg_spacing(int64_t period, int n, int64_t refresh) {
+    n = mult_of(n);
+    const int64_t share = period > 0 && n > 2 ? (int64_t)((double)period / n * ZFG_SPACING) : 0;
+    return share > refresh ? share : refresh > 0 ? refresh : 0;
+}
+
+struct zfg_slots zfg_schedule_n(int64_t arrival, int64_t prev_b, int64_t period, int64_t lead, int64_t slack,
+                                int64_t refresh, int n) {
+    n = mult_of(n);
+    const int64_t q = period > 0 ? period / n : 0;
+    const int64_t gap = zfg_spacing(period, n, refresh);
+    const int64_t step = q > refresh ? q : refresh > 0 ? refresh : 0;
     const int64_t lo = arrival + (lead > 0 ? lead : 0), hi = lo + (slack > 0 ? slack : 0);
-    int64_t s = prev_b ? prev_b + half : lo;
+    int64_t s = prev_b ? prev_b + q : lo;
     if (s < lo) s = lo;
     if (s > hi) s = hi;
-    struct zfg_slots r = {s, s + step, 0};
-    if (prev_b && s < prev_b + gap) {
-        if (prev_b + gap <= hi) {
-            r.s = prev_b + gap;
-            r.b = r.s + step;
-        } else {
-            r.no_s = 1;
-            r.s = 0;
-            r.b = lo + half > prev_b + gap ? lo + half : prev_b + gap;
-            if (r.b > hi + step) r.b = lo + half;
+    struct zfg_slots r = {s, s + (n - 1) * step, 0, n, step, 0};
+    if (!prev_b || s >= prev_b + gap) return r;
+    if (prev_b + gap <= hi) {
+        r.s = prev_b + gap;
+        r.b = r.s + (n - 1) * step;
+        return r;
+    }
+    /* the first m generated frames left out, where n outputs fit the refresh rate (within 5 %, as the multiplier
+     * is kept); else (the multiplier is about to be lowered for the running rate) none */
+    const int fit = refresh <= 0 || q * 105 >= refresh * 100;
+    for (int m = 1; fit && m < n - 1; m++) {
+        int64_t f = prev_b + gap;
+        if (f < lo + m * step) f = lo + m * step;
+        if (f <= hi + m * step) {
+            r.first = m;
+            r.s = f;
+            r.b = f + (n - 1 - m) * step;
+            return r;
         }
     }
+    r.no_s = 1;
+    r.first = n - 1;
+    r.s = 0;
+    const int64_t rest = lo + (n - 1) * q;
+    r.b = rest > prev_b + gap ? rest : prev_b + gap;
+    if (r.b > hi + (n - 1) * step) r.b = rest;
     return r;
 }
+
+struct zfg_slots zfg_schedule(int64_t arrival, int64_t prev_b, int64_t period, int64_t lead, int64_t slack,
+                              int64_t refresh) {
+    return zfg_schedule_n(arrival, prev_b, period, lead, slack, refresh, 2);
+}
+
+int64_t zfg_slot_s(const struct zfg_slots *t, int k) {
+    return t->no_s || k < t->first || k > t->n - 2 ? 0 : t->s + (int64_t)(k - t->first) * t->step;
+}
+
+void zfg_slots_drop_first(struct zfg_slots *t, int m) {
+    if (m <= 0 || t->no_s) return;
+    if (t->first + m >= t->n - 1) {
+        t->no_s = 1;
+        t->first = t->n - 1;
+        t->s = 0;
+        return;
+    }
+    t->first += m;
+    t->s += (int64_t)m * t->step;
+}
+
+int zfg_slots_shown(const struct zfg_slots *t) { return t->no_s ? 0 : t->n - 1 - t->first; }
 
 int64_t zfg_desired(int64_t target, int64_t refresh_period) {
     return refresh_period > 0 ? target - refresh_period / 2 : target;
@@ -85,6 +154,30 @@ int64_t zfg_apply_at(int64_t desired, int64_t latch, int64_t margin) {
     return desired - (latch > 0 ? latch : 0) - (margin > 0 ? margin : 0);
 }
 
+void zfg_pair_times(const struct zfg_slots *t, int64_t refresh, int64_t latch, int64_t margin,
+                    struct zfg_pair_times *out) {
+    memset(out, 0, sizeof(*out));
+    out->ns = zfg_slots_shown(t);
+    out->b_desired = zfg_desired(t->b, refresh);
+    out->b_apply = zfg_apply_at(out->b_desired, latch, margin);
+    for (int k = 0; k < out->ns; k++) {
+        out->s_desired[k] = zfg_desired(zfg_slot_s(t, t->first + k), refresh);
+        out->s_apply[k] = zfg_apply_at(out->s_desired[k], latch, margin);
+    }
+    for (int k = 0; k < out->ns; k++) {
+        const int64_t next = k + 1 < out->ns ? out->s_apply[k + 1] : out->b_apply;
+        out->s_last[k] = next + (margin > 0 ? margin : 0) - refresh;
+        if (out->s_last[k] < out->s_apply[k] + 1000000) out->s_last[k] = out->s_apply[k] + 1000000;
+    }
+}
+
+int zfg_s_action(int ready, int64_t now, int64_t apply, int64_t last, int force) {
+    const int late = now >= last;
+    if (ready && !late && (force || now >= apply)) return ZFG_S_SHOW;
+    if (late || force) return ZFG_S_DROP;
+    return ZFG_S_WAIT;
+}
+
 /* Twice the real rate `out` is within (1 - below) .. (1 + above) of c / m for a whole m: c shows every output
  * for m refreshes. */
 static int vote_fits(double c, double out, double below, double above) {
@@ -96,9 +189,9 @@ static int vote_fits(double c, double out, double below, double above) {
     return 0;
 }
 
-float zfg_vote_pick(int64_t period, const float *modes, int n, float peak_hz, float prev) {
+float zfg_vote_pick_n(int64_t period, int mult, const float *modes, int n, float peak_hz, float prev) {
     if (period <= 0 || peak_hz <= 0.0f) return 0.0f;
-    const double out = 2e9 / (double)period, peak = peak_hz;
+    const double out = mult_of(mult) * 1e9 / (double)period, peak = peak_hz;
     float cand[16];
     int nc = 0;
     for (int i = 0; modes && i < n && nc < 16; i++)
@@ -118,6 +211,10 @@ float zfg_vote_pick(int64_t period, const float *modes, int n, float peak_hz, fl
     return best > 0.0f ? best : top;
 }
 
+float zfg_vote_pick(int64_t period, const float *modes, int n, float peak_hz, float prev) {
+    return zfg_vote_pick_n(period, 2, modes, n, peak_hz, prev);
+}
+
 void zfg_vote_reset(struct zfg_vote *v) {
     v->hz = 0.0f;
     v->away = 0;
@@ -125,9 +222,10 @@ void zfg_vote_reset(struct zfg_vote *v) {
     v->period = 0;
 }
 
-float zfg_vote_step(struct zfg_vote *v, int64_t now, int64_t period, const float *modes, int n, float peak_hz) {
+float zfg_vote_step_n(struct zfg_vote *v, int64_t now, int64_t period, int mult, const float *modes, int n,
+                      float peak_hz) {
     if (period > 0) v->period = v->period > 0 ? v->period + (period - v->period) / 8 : period;
-    const float pick = zfg_vote_pick(v->period, modes, n, peak_hz, v->hz);
+    const float pick = zfg_vote_pick_n(v->period, mult, modes, n, peak_hz, v->hz);
     if (pick <= 0.0f || pick == v->hz) {
         v->away = 0;
         return v->hz;
@@ -146,6 +244,10 @@ float zfg_vote_step(struct zfg_vote *v, int64_t now, int64_t period, const float
         v->away = 0;
     }
     return v->hz;
+}
+
+float zfg_vote_step(struct zfg_vote *v, int64_t now, int64_t period, const float *modes, int n, float peak_hz) {
+    return zfg_vote_step_n(v, now, period, 2, modes, n, peak_hz);
 }
 
 int zfg_too_fast(int64_t period, float peak_hz, int was_fast) {
@@ -169,6 +271,122 @@ int zfg_fast_update(struct zfg_fast *f, int64_t now, int64_t period, float refre
             (over_run && now - f->over_since >= ZFG_FAST_GRACE_NS);
     return f->on;
 }
+
+void zfg_mult_reset(struct zfg_mult *m) { memset(m, 0, sizeof(*m)); }
+
+int zfg_flight_pairs(int64_t ready_ns, int64_t period) {
+    return ready_ns > 0 && period > 0 ? (int)(ready_ns / period) + 1 : 0;
+}
+
+double zfg_pair_gpu_ms(int mult, double first_ms, double phase_ms) {
+    mult = mult_of(mult);
+    return (first_ms > 0.0 ? first_ms : 0.0) + (mult - 2) * (phase_ms > 0.0 ? phase_ms : 0.0);
+}
+
+/* Whether `mult` times the real rate fits: below a rate (peak or running refresh rate, 0: unknown), the GPU time
+ * of a pair within the share of the period, and its pairs in flight within the frame contexts and jobs. keep: the
+ * limits that keep a multiplier in force (else those that let one come back). */
+static int fits_rate(int mult, double real, float hz, int keep) {
+    return hz <= 0.0f || mult * real <= (double)hz * (keep ? 1.05 : 1.03);
+}
+
+static int fits_gpu(int mult, const struct zfg_mult_in *in, int keep) {
+    return in->gpu_first_ms <= 0.0 || zfg_pair_gpu_ms(mult, in->gpu_first_ms, in->gpu_phase_ms) <=
+                                          (double)in->period / 1e6 * ZFG_GPU_SHARE * (keep ? 1.0 : ZFG_GPU_RAISE);
+}
+
+static int fits_flight(int mult, const struct zfg_mult_in *in, int keep) {
+    const int64_t ready = keep ? in->ready_ns : (int64_t)((double)in->ready_ns * ZFG_FLIGHT_RAISE);
+    const int pairs = zfg_flight_pairs(ready, in->period);
+    return !pairs || (pairs <= ZFG_JOBS && pairs * (mult_of(mult) - 1) <= ZFG_CONTEXTS);
+}
+
+int zfg_mult_update(struct zfg_mult *m, int64_t now, const struct zfg_mult_in *in) {
+    const int want = mult_of(in->want);
+    const int limit = in->limit >= 2 ? mult_of(in->limit) : ZFG_MULT_MAX;
+    if (!m->n || want != m->want) {
+        m->n = m->want = want;
+        m->raise = 0;
+        m->over_since = 0;
+        m->gpu_block = 0;
+    }
+    if (m->gpu_block && now >= m->gpu_block_until) m->gpu_block = 0;
+    const int64_t period = in->period;
+    if (period <= 0) {
+        if (m->n > limit) m->n = limit;
+        m->vote_n = m->n;
+        m->why = m->n < want ? (m->n >= limit ? ZFG_CAP_ENGINE : m->why) : ZFG_CAP_NONE;
+        return m->n;
+    }
+    const double real = 1e9 / (double)period;
+    int n = m->n;
+    while (n > limit) n--;
+    while (n > 2 && !fits_rate(n, real, in->peak_hz, 1)) n--;
+    while (n > 2 && !fits_gpu(n, in, 1)) {
+        m->gpu_block = n;
+        m->gpu_block_until = now + ZFG_GPU_BLOCK_NS;
+        n--;
+    }
+    while (n > 2 && !fits_flight(n, in, 1)) n--;
+    if (n > 2 && !fits_rate(n, real, in->refresh_hz, 1)) {
+        if (!m->over_since) m->over_since = now;
+        if (now - m->over_since >= ZFG_FAST_GRACE_NS)
+            while (n > 2 && !fits_rate(n, real, in->refresh_hz, 1)) n--;
+    }
+    if (n != m->n) m->raise = 0;
+    if (n > 2 && fits_rate(n, real, in->refresh_hz, 1)) m->over_since = 0;
+    if (n == 2) m->over_since = 0;
+    int up = 0;
+    for (int k = want < limit ? want : limit; k > n && !up; k--)
+        if (fits_rate(k, real, in->peak_hz, 0) && fits_rate(k, real, in->refresh_hz, 0) && fits_gpu(k, in, 0) &&
+            fits_flight(k, in, 0) && !(m->gpu_block && k >= m->gpu_block))
+            up = k;
+    if (!up) m->raise = 0;
+    else if (m->raise != up) {
+        m->raise = up;
+        m->raise_since = now;
+    } else if (now - m->raise_since >= ZFG_MULT_RAISE_NS) {
+        n = up;
+        m->raise = 0;
+        m->over_since = 0;
+    }
+    m->n = n;
+    const int voted = m->vote_n;
+    m->vote_n = n;
+    for (int k = want < limit ? want : limit; k > n; k--)
+        if (fits_rate(k, real, in->peak_hz, k <= voted) && fits_gpu(k, in, 1) && fits_flight(k, in, 1) &&
+            !(m->gpu_block && k >= m->gpu_block)) {
+            m->vote_n = k;
+            break;
+        }
+    m->why = ZFG_CAP_NONE;
+    if (n < want) {
+        const int k = n + 1;
+        m->why = k > limit                                                         ? ZFG_CAP_ENGINE
+                 : !fits_rate(k, real, in->peak_hz, 0)                              ? ZFG_CAP_PEAK
+                 : !fits_gpu(k, in, 0) || (m->gpu_block && k >= m->gpu_block)       ? ZFG_CAP_GPU
+                 : !fits_flight(k, in, 0)                                           ? ZFG_CAP_LATE
+                                                                                    : ZFG_CAP_REFRESH;
+    }
+    return n;
+}
+
+const char *zfg_cap_name(int why) {
+    switch (why) {
+        case ZFG_CAP_PEAK: return "peak";
+        case ZFG_CAP_GPU: return "gpu";
+        case ZFG_CAP_REFRESH: return "refresh";
+        case ZFG_CAP_LATE: return "late";
+        case ZFG_CAP_ENGINE: return "engine";
+        default: return "none";
+    }
+}
+
+int zfg_calls_fit(int calls_in_flight, int calls) {
+    return calls_in_flight + (calls > 0 ? calls : 1) <= ZFG_CONTEXTS;
+}
+
+int zfg_pool_size(int n) { return (mult_of(n) - 1) * ZFG_POOL_PAIRS; }
 
 uint32_t zfg_import_format(uint32_t ahb_format, uint32_t reported) {
     if (reported) return reported;

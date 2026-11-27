@@ -33,6 +33,8 @@
     <string name="frame_gen_ddfg">DD-FG %1$d×</string>
     <string name="frame_gen_lsfg">LSFG %1$d×</string>
     <string name="frame_gen_lsfg_adaptive">LSFG Adaptiv %1$d</string>
+    <string name="frame_gen_zerofg_really">ZeroFG RZ+ %1$d×</string>
+    <string name="frame_gen_zerofg_zero">ZeroFG Zero %1$d×</string>
     <string name="lsfg_needs_steam">Krever Lossless Scaling på Steam</string>
     <string name="lsfg_needs_install">Installer Lossless Scaling via Steam, eller importer Lossless.dll</string>
     <string name="lsfg_import">Importer Lossless.dll…</string>

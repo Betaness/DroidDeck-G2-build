@@ -33,6 +33,8 @@
     <string name="frame_gen_ddfg">DD-FG %1$d×</string>
     <string name="frame_gen_lsfg">LSFG %1$d×</string>
     <string name="frame_gen_lsfg_adaptive">LSFG 自适应 %1$d</string>
+    <string name="frame_gen_zerofg_really">ZeroFG RZ+ %1$d×</string>
+    <string name="frame_gen_zerofg_zero">ZeroFG Zero %1$d×</string>
     <string name="zerofg_problem">ZeroFG 无法在此运行：%1$s</string>
     <string name="zerofg_needs_zero_copy">ZeroFG 需要游戏以零拷贝显示（Vortek GPU 路径）</string>
     <string name="zerofg_failed">ZeroFG：%1$s</string>

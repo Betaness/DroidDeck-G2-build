@@ -21,6 +21,7 @@ layout(std140, binding = 0) uniform Params {
   vec4 H[18];    // A to B per surface, 3 rows, normalised coordinates
   vec4 Hi[18];   // B to A
   vec4 Mid[18];  // middle to A (the square root's inverse)
+  vec4 gainB;    // B's per-channel gain to A's exposure (rc7_gain.comp), applied where the decisions read B (sampleReal); exactly 1 without a light change
 } u;
 
 layout(std430, binding = 1) buffer CostBuf { float cost[]; };      // [kind 0 sharp, 1 soft][side][surface][point]
@@ -57,6 +58,10 @@ layout(std430, binding = 24) buffer TileBuf { uint tiles[]; };     // [marked, w
 layout(binding = 28, rgb10_a2) uniform writeonly image2D halfOutA;  // the half-size pictures the decisions read when the Reals are large
 layout(binding = 29, rgb10_a2) uniform writeonly image2D halfOutB;
 layout(std430, binding = 32) buffer SnapBuf { vec4 snap[]; };      // the cells as they were when the search under way started
+// kSkip (slimming round 13): the dispatch arguments of the passes after the gates, one record per size of dispatch: k_full as the host
+// writes them each pair, k_live as this pair's gates left them (k_full when the pair is interpolated, zero groups when it is the base's
+// whole or a cut: rc7_sgate.comp).
+layout(std430, binding = 39) buffer SkipBuf { uvec4 k_full[8]; uvec4 k_live[8]; };
 layout(binding = 30) uniform sampler2D cubicA;                     // the Reals through the hardware's cubic filter, when it has one: only the render reads them
 layout(binding = 31) uniform sampler2D cubicB;
 // The matte's points of each picture, x | y << 16, and the dispatches over them; after them, the picture's groups by class (one list per surface, then everything else), and theirs.
@@ -80,6 +85,17 @@ layout(push_constant) uniform Push {
   ivec4 b;
   vec4 p;
 } pc;
+
+// The phase form (MFG, compiled with ZFG_PHASE: the block marks and the render only): the picture at pc.p.x between A (0) and B (1) instead
+// of the middle. Every decision lives on the two Reals, so only the last passes change: how far each sample goes back along its motion
+// (PH_A from A, PH_B from B) and how the two weigh. Without it these are the middle's 0.5, the very source the product had.
+#ifdef ZFG_PHASE
+#define PH_A pc.p.x
+#define PH_B (1.0 - pc.p.x)
+#else
+#define PH_A 0.5
+#define PH_B 0.5
+#endif
 
 #define W u.dim.x
 #define H_ u.dim.y
@@ -110,7 +126,13 @@ const int P_JFLAG = 14;   // the layer contradicts itself here: the judge asks
 const int P_JC1 = 15;     // what the base took
 const int P_JC2 = 16;     // what the dense picture took
 const int P_PRESENT = 17;  // which mattes are not empty here: bit 0 the front, bit 1 + k the surface k
-const int P_COUNT = 18;
+const int P_HUDMEM = 18;  // the screen by cells (O_HUDCELL): side 0 the cell's memory, side 1 this pair's cells whose pixels take the screen one by one
+const int P_COUNT = 19;
+
+// The screen by cells (R_OPTS bit 19, review 12.4): a remembered cell gives the screen only its pixels that are the same in both pictures,
+// within HUD_SAME (l1, the mean over rgb); what moves in the cell stays the layers'.
+const bool O_HUDCELL = (R_OPTS & 524288) != 0;
+const float HUD_SAME = 0.02;
 
 const int BEND_STEP = 4;  // lattice points per point of the coarse grid of the bends
 int ln() { return LW * LH; }
@@ -127,7 +149,8 @@ int alphaOf(int side, int k, int p) { return (side * PLANES + k) * ln() + p; }
 
 vec2 latCentre(ivec2 q) { return (vec2(q) + 0.5) * float(S); }
 vec2 sizeF() { return vec2(float(W), float(H_)); }
-vec3 sampleReal(int side, vec2 pos) { return (side == 0 ? textureLod(realA, pos / sizeF(), 0.0) : textureLod(realB, pos / sizeF(), 0.0)).rgb; }
+// The decisions read B at A's exposure (u.gainB); the render composes from the true pictures (sharpSample, cubicA / cubicB).
+vec3 sampleReal(int side, vec2 pos) { return side == 0 ? textureLod(realA, pos / sizeF(), 0.0).rgb : textureLod(realB, pos / sizeF(), 0.0).rgb * u.gainB.rgb; }
 vec3 sampleSoft(int side, vec2 pos) { return (side == 0 ? textureLod(softA, pos / sizeF(), 0.0) : textureLod(softB, pos / sizeF(), 0.0)).rgb; }
 float l1(vec3 a, vec3 b) { vec3 d = abs(a - b); return (d.x + d.y + d.z) / 3.0; }
 
@@ -144,7 +167,14 @@ vec2 surfaceGo(int side, int k, vec2 pos) {
 // From the middle to both pictures along a surface.
 void surfaceMid(int k, vec2 pos, out vec2 pa, out vec2 pb) {
   int t = k * 3;
+#ifdef ZFG_PHASE
+  // The point of A that is at pos at the phase, along the surface's straight path: a fixed point on H itself (H is smooth: two rounds). The
+  // middle's own map is the matrix square root, which follows the surface's path in its group; the two differ in the second order.
+  pa = pos - PH_A * (homo(u.H[t], u.H[t + 1], u.H[t + 2], pos) - pos);
+  pa = pos - PH_A * (homo(u.H[t], u.H[t + 1], u.H[t + 2], pa) - pa);
+#else
   pa = homo(u.Mid[t], u.Mid[t + 1], u.Mid[t + 2], pos);
+#endif
   pb = homo(u.H[t], u.H[t + 1], u.H[t + 2], pa);
 }
 bool insideP(vec2 q) { return all(bvec4(q.x >= 0.0, q.y >= 0.0, q.x < float(W), q.y < float(H_))); }

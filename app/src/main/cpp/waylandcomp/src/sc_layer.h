@@ -65,9 +65,14 @@ int sc_layer_vortek_remap(int slot, int buf_w, int buf_h, int x, int y, int w, i
  * on the GPU; -1: none free, -2: allocation failed. A reserved buffer goes back with pool_put (with
  * the fence that must signal before its next use) unless present_vortek_pooled shows it: r[0..3] is
  * the part of the buffer to show, r[4..7] where on the screen; z < 0 keeps the layer's z. pool_trim
- * frees the buffers that are neither shown nor reserved and returns how many are left. */
+ * frees the buffers that are neither shown nor reserved and returns how many are left. pool_reserve sets the
+ * pool's size to n buffers (SC_VORTEK_POOL .. SC_VORTEK_POOL_MAX), allocated as they are needed; a smaller size
+ * frees the buffers beyond it once they are neither shown nor reserved and their release fence has signalled. A
+ * pool pool_trim emptied starts again at SC_VORTEK_POOL. */
 #define SC_VORTEK_POOL 3
+#define SC_VORTEK_POOL_MAX 9
 int sc_layer_vortek_pool_take(int slot, int w, int h, struct vkp_image **img, int *wait_fd);
+void sc_layer_vortek_pool_reserve(int slot, int n);
 void sc_layer_vortek_pool_put(int slot, int idx, int release_fd);
 int sc_layer_vortek_pool_trim(int slot);
 int sc_layer_present_vortek_pooled(int slot, int z, int idx, int acquire_fd, const int r[8],

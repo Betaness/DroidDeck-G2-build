@@ -27,8 +27,8 @@ layout(binding = 13) uniform sampler2D realA;
 layout(binding = 14) uniform sampler2D realB;
 layout(binding = 15) uniform sampler2D flowT0;
 layout(binding = 16) uniform sampler2D flowT1;
-layout(binding = 17, rg16f) uniform writeonly image2D flowO0;
-layout(binding = 18, rg16f) uniform writeonly image2D flowO1;
+layout(binding = 17, rgba16f) uniform writeonly image2D flowO0;   // rg: the flow; b: its own Real's luma at that texel (the guide of full_flow_g)
+layout(binding = 18, rgba16f) uniform writeonly image2D flowO1;
 
 // The mobile patch search (df_patch_t): per level, I0's luma and its central differences packed (T, gx, gy) in an RGBA16F texture per Real
 // (df_grad writes them through the storage views), so a patch pixel costs one fetch instead of five.
@@ -57,7 +57,14 @@ layout(constant_id = 1) const int DF_OPTS = 0;
 // Exact standalone-product optimizations: 1 direct args, 2 grouped cut,
 // 4 lazy sharp colour, 8 identity cleanup stores, 16 texture-only fine flow.
 // DenseFlowSource consumers leave these off, retaining their FP32 flow buffer.
+// RZ+ (2026-11-20): 32 the camera's shift as a start of the patch search (df_cam.comp), 64 the HUD hold (df_final.comp), 128 the cut
+// over the lit points (df_cut.comp).
 layout(constant_id = 2) const int DF_PRODUCT_OPTS = 0;
+// RZ+: the camera search's reach on the coarsest level, in its pixels (+-12 on a ~40 px wide level is about +-380 px at 1280).
+#define DF_CAM_R 12
+// RZ+ HUD hold: a pixel within DF_HUD_BAR in place, with texture, for DF_HUD_PAIRS pairs in a row is the screen.
+#define DF_HUD_PAIRS 6u
+#define DF_HUD_BAR 0.01  // a game hands exact frames; the 6 % of the screen recordings held slow motion in place (raycaster katamari -2 dB)
 #ifndef DF_LEVEL_SIZE
 #define DF_LEVEL_SIZE(T) textureSize(T, 0)
 #endif
@@ -142,6 +149,31 @@ vec2 full_flow_t(int d, int scale, float x, float y) {
   return float(scale) * textureLod(flowT0, q / vec2(DF_FLOW_SIZE(flowT0)), 0.0).rg;
 }
 
+// The flow guided by colour (RZ+ 1.2.1, DF_PRODUCT_OPTS 256; after Kopf et al.'s joint bilateral upsampling, the owner's occlusion halo of
+// 2026-11-23): the 2 x 2 flow texels around the pixel in three gathers (x, y and the guide luma store_flow_t packs beside the flow), each
+// weighted bilinearly and by how much its guide looks like the pixel's own luma l0 (0..255). At a motion edge a background pixel stops taking
+// the occluder's vector from the texel next to it, so the solved level's 4 px steps (16-32 px squares on screen) follow the object's own
+// outline. Texel t is the Real's pixel scale * t (df_down), so the gather at x / scale is aligned. Equal lumas give the bilinear read.
+vec2 full_flow_g(int d, int scale, float x, float y, float l0) {
+  ivec2 fs = d != 0 ? DF_FLOW_SIZE(flowT1) : DF_FLOW_SIZE(flowT0);
+  vec2 st = vec2(x, y) / float(scale);
+  vec2 uv = (st + 0.5) / vec2(fs);
+  vec4 gx = d != 0 ? textureGather(flowT1, uv, 0) : textureGather(flowT0, uv, 0);
+  vec4 gy = d != 0 ? textureGather(flowT1, uv, 1) : textureGather(flowT0, uv, 1);
+  vec4 gl = d != 0 ? textureGather(flowT1, uv, 2) : textureGather(flowT0, uv, 2);
+  vec2 f = fract(st);
+  vec4 wb = vec4((1.0 - f.x) * f.y, f.x * f.y, f.x * (1.0 - f.y), (1.0 - f.x) * (1.0 - f.y));   // the gather order: (0,1) (1,1) (1,0) (0,0)
+  vec4 dl = (gl - l0) * (1.0 / 12.0);
+  vec4 w = wb * (exp(-0.5 * dl * dl) + 1e-3);
+  return float(scale) * vec2(dot(w, gx), dot(w, gy)) / dot(w, vec4(1.0));
+}
+
+// The final pass's own reads of the motion at a point: guided by colour in RZ+ (DF_PRODUCT_OPTS 256), the bilinear read otherwise.
+vec2 full_flow_m(int d, int scale, float x, float y) {
+  if ((DF_PRODUCT_OPTS & 256) == 0) return full_flow_t(d, scale, x, y);
+  return full_flow_g(d, scale, x, y, dot(real_bil(d, x, y), 255.0 * vec3(0.299, 0.587, 0.114)));
+}
+
 // The sharp colour: Catmull-Rom over the 4 x 4 texels around the sample, in nine bilinear taps (the outer pairs of weights folded into one tap
 // each axis), clamped to the range of the 2 x 2 texels around the sample so a hard edge cannot ring. The same kernel as the RC3 resolve's
 // Compat sharp form, written from the spline's weights.
@@ -219,7 +251,9 @@ vec3 grad_at(bool b_side, int x, int y) {
   return texelFetch(gradA, clamp(ivec2(x, y), ivec2(0), textureSize(gradA, 0) - 1), 0).xyz;
 }
 
+// The finest flow and, beside it, the luma of the flow's own Real at that texel (the level the flow is solved on): the guide full_flow_g reads
+// with the flow in the same gathers, written here for free.
 void store_flow_t(int d, int x, int y, vec2 f) {
-  if (d != 0) imageStore(flowO1, ivec2(x, y), vec4(f, 0.0, 0.0));
-  else imageStore(flowO0, ivec2(x, y), vec4(f, 0.0, 0.0));
+  if (d != 0) imageStore(flowO1, ivec2(x, y), vec4(f, tex_at(true, x, y), 0.0));
+  else imageStore(flowO0, ivec2(x, y), vec4(f, tex_at(false, x, y), 0.0));
 }

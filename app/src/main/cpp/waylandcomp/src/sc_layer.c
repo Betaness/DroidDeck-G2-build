@@ -143,7 +143,9 @@ void sc_layer_set_frame_rate(float fps) {
 float sc_layer_frame_rate_want(void) { return atomic_load(&g_fps_want); }
 
 
-#define POOL_MAX 5
+#define POOL_MAX SC_VORTEK_POOL_MAX
+#define GAME_POOL 5
+_Static_assert(POOL_MAX >= GAME_POOL, "the game layer's pool");
 
 struct slot {
     AHardwareBuffer *ahb;
@@ -203,7 +205,7 @@ static int g_base_w, g_base_h, g_base_shown;
 static void layers_init(void) {
     if (g_layers_ready) return;
     g_layers_ready = 1;
-    g_layers[SC_LAYER_GAME] = (struct layer){.name = "droiddeck_wayland_game", .z = 1, .pool_n = POOL_MAX,
+    g_layers[SC_LAYER_GAME] = (struct layer){.name = "droiddeck_wayland_game", .z = 1, .pool_n = GAME_POOL,
                                              .cur_slot = -1, .votes_rate = 1, .fps_applied = -1.0f, .hr_applied = -1.0f,
                                              .ds_applied = -1};
     g_layers[SC_LAYER_OVERLAY] = (struct layer){.name = "droiddeck_wayland_overlay", .z = SC_OVERLAY_Z, .pool_n = 3,
@@ -506,10 +508,28 @@ static int fence_signalled(int fd) {
     return r > 0;
 }
 
+/* The buffers a pool keeps beyond its size (pool_reserve lowered it) go once nothing uses them: neither shown nor
+ * reserved, their release fence signalled. Under g_lock. */
+static int pool_free_above(struct layer *l) {
+    int freed = 0;
+    for (int i = l->pool_n ? l->pool_n : POOL_MAX; i < POOL_MAX; i++) {
+        struct slot *s = &l->slots[i];
+        if (!s->ahb || s->busy || i == l->cur_slot || (s->release_fd >= 0 && !fence_signalled(s->release_fd))) continue;
+        if (s->release_fd >= 0) close(s->release_fd);
+        vkp_image_destroy(s->img);
+        AHardwareBuffer_release(s->ahb);
+        memset(s, 0, sizeof(*s));
+        s->release_fd = -1;
+        freed++;
+    }
+    return freed;
+}
+
 static int take_free_slot(struct layer *l, int w, int h, uint32_t fmt, int *wait_fd) {
     int idx = -1, pending = -1, fd = -1;
     *wait_fd = -1;
     pthread_mutex_lock(&g_lock);
+    pool_free_above(l);
     for (int i = 0; i < l->pool_n; i++) {
         if (i == l->cur_slot || l->slots[i].busy) continue;
         const int rf = l->slots[i].release_fd;
@@ -944,6 +964,26 @@ int sc_layer_vortek_pool_take(int slot, int w, int h, struct vkp_image **img, in
     return idx;
 }
 
+void sc_layer_vortek_pool_reserve(int slot, int n) {
+    struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
+    if (!l) return;
+    if (n > POOL_MAX) n = POOL_MAX;
+    if (n < SC_VORTEK_POOL) n = SC_VORTEK_POOL;
+    pthread_mutex_lock(&g_lock);
+    const int was = l->pool_n;
+    int freed = 0;
+    if (was && n != was) {
+        l->pool_n = n;
+        freed = pool_free_above(l);
+    } else if (!was && n > SC_VORTEK_POOL) {
+        l->pool_n = n;
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (was && n != was)
+        droiddeck_log("layer", "%s: pool of %d buffers (was %d)%s", l->name, n, was,
+                      freed ? "; the buffers beyond it freed" : n < was ? "; the buffers beyond it go once released" : "");
+}
+
 AHardwareBuffer *sc_layer_vortek_pool_ahb(int slot, int idx) {
     struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
     return l && idx >= 0 && idx < POOL_MAX ? l->slots[idx].ahb : NULL;
@@ -992,6 +1032,8 @@ int sc_layer_vortek_pool_trim(int slot) {
         s->release_fd = -1;
         freed++;
     }
+    /* empty: the next take starts at SC_VORTEK_POOL again */
+    if (!left) l->pool_n = 0;
     pthread_mutex_unlock(&g_lock);
     if (freed) {
         droiddeck_log("layer", "%s: %d upscaling buffer%s freed (no upscaled frame for a while)%s", l->name, freed,
@@ -1004,7 +1046,7 @@ int sc_layer_vortek_pool_trim(int slot) {
 int sc_layer_present_vortek_pooled(int slot, int z, int idx, int acquire_fd, const int r[8],
                                    struct ASurfaceTransaction *batch) {
     struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
-    if (!l || idx < 0 || idx >= l->pool_n || !l->slots[idx].ahb || ensure_sc(l) != 0) goto unavailable;
+    if (!l || idx < 0 || idx >= POOL_MAX || !l->slots[idx].ahb || ensure_sc(l) != 0) goto unavailable;
     if (z < 0) z = l->z;
     int restack = l->z != z;
     struct complete_ctx *ctx = calloc(1, sizeof(*ctx));

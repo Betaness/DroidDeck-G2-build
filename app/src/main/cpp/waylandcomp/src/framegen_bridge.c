@@ -286,6 +286,8 @@ int vkp_framegen_zerofg_armed(void) {
     return atomic_load(&g_armed) && atomic_load(&g_kind) == VKP_FG_ENGINE_ZEROFG;
 }
 
+int vkp_framegen_multiplier(void) { return atomic_load(&g_mult); }
+
 float vkp_framegen_refresh_hz(void) {
     pthread_mutex_lock(&g_lock);
     const float hz = g_refresh_hz;

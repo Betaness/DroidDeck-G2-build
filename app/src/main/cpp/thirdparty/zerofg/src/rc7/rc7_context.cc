@@ -1,12 +1,15 @@
 // Zero (Mode::kZero, RC7), the lean layered form of the laboratory's `rc7m` (testbed/src/core/rc7_gpu.cc on the algorithm repository): the pair is explained as surfaces, a front, a screen and what only one picture
 // has, on top of the RC5 picture. Everything is recorded into the host's command buffer; nothing stops and nothing is read back. Which surfaces there are changes slowly: the search runs in the background, a few steps
-// per pair along with the layers' passes, on the GPU. How each one moves changes every pair: this pair's flow brings them up to its motion. Wide passes with short loops. Phase 0.5 only.
+// per pair along with the layers' passes, on the GPU. How each one moves changes every pair: this pair's flow brings them up to its motion. Wide passes with short loops. Any phase in (0, 1): off the middle the
+// block marks and the render take their phase forms (MFG), and another phase of the pair just recorded records only those (ComposePhase).
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -35,6 +38,7 @@
 #include "rc7_quarter.h"
 #include "rc7_hud.h"
 #include "rc7_hudrule.h"
+#include "rc7_gain.h"
 #include "rc7_hudgs.h"
 #include "rc7_jump.h"
 #include "rc7_mix.h"
@@ -42,6 +46,7 @@
 #include "rc7_out.h"
 #include "rc7_raw.h"
 #include "rc7_render.h"
+#include "rc7_render_phase.h"
 #include "rc7_scell.h"
 #include "rc7_secho.h"
 #include "rc7_sdone.h"
@@ -61,6 +66,7 @@
 #include "rc7_tfit.h"
 #include "rc7_tguide.h"
 #include "rc7_tile.h"
+#include "rc7_tile_phase.h"
 #include "rc7_trust.h"
 
 namespace zerofg {
@@ -70,7 +76,7 @@ namespace {
 constexpr int kFineRounds = 1, kFrontRoundsBend = 1, kFrontRoundsSample = 2, kPeels = 3, kPatch = 3, kFloorGate = 30;
 constexpr uint32_t kFlowLevel = 1;   // the dense flow runs on half-size Reals, solved down to a quarter of the picture. Its picture is full size: what falls back to it must not turn soft from one pair to the next, and a flow from full-size Reals brings the shards on repeating bars back through the surfaces
 constexpr uint32_t kFieldSide = 64;  // the long side of the cell field
-constexpr int kPlans = 18;
+constexpr int kPlans = 19;  // P_COUNT of rc7_common.glsl
 constexpr VkDeviceSize kRefitOffset = 15376, kFollowOffset = 16528, kCutOffset = 16840;  // in the search's buffer: r_H, t_H, s_cut
 // When the base takes over, per cent of what a wrong match costs: soon in the background, where surfaces do not fit many depths and the two samples double up; late near the front, whose cutout is better from the layers.
 constexpr int kBaseBar = 80, kBaseBarFront = 80;
@@ -79,11 +85,50 @@ constexpr int kBaseBar = 80, kBaseBarFront = 80;
 #endif
 constexpr bool kBaseFullSize = ZFG_RC7_BASE_FULL != 0;  // the base's picture at the Reals' size, its flow still from the half-size ones: sharper where it is used, about a millisecond more on the Adreno at 3x
 constexpr int kCutCorrelation = 300;  // per mille: under this co-located correlation of the softened pictures the pair is a cut and shows B whole
+// 8-bit luma (owner 2026-11-19: a wipe interpolates): with a tenth of the sampled points lit in both pictures, a pair is a cut only if those do
+// not correlate either. A circle wipe broke the whole picture's correlation and showed B whole (Rayman: -2.49 dB on its transition).
+constexpr int kCutLit = 40;
+// Thousandths (2026-11-19, the false cuts): a cut also needs the lowest median search cost at least this. Fast Arkham motion broke the
+// correlation (0.06-0.10), real cuts leave every cost at the top (0.24). Lab laycutcost=160: cuts3 -0.33 -> -0.20 dB, synthetic cuts identical.
+constexpr int kCutCost = 160;
+// Ten-thousandths (the owner 2026-11-19): under this lowest median search cost the pair is calm and is the base's whole (rc7_mix.comp,
+// cfg3.y = 2). On calm pairs the base beat Zero on nearly every pair (a sub-pixel film, HUD text fading in on a still scene). Lab layeasy=50:
+// Arkham 2 -0.79 -> -0.08 dB per pair, Arkham 1 -0.45 -> -0.30, God of War II -0.36 -> -0.30, Katamari 2 +0.17 -> +0.13; hard pairs unchanged.
+constexpr int kEasy = 50;
+// Slimming round 13 (lab layskip, 2026-11-19): a pair the gates give to the base whole (kEasy) or call a cut runs none of the passes after
+// the gates but the mix: they are recorded indirect, with the groups the gates leave in SkipBuf (zero on such a pair). The picture of that
+// pair is the same (the mix writes the base or B whole either way). Vega, lab: the calm pairs 6.13 -> 3.37 ms (Arkham 2, 69 of 136 pairs),
+// 11.47 -> 4.67 (Katamari 2), quality within 0.001 dB (only the front's last field, a candidate of the next pair, differs after one).
+#ifndef ZFG_SKIP
+#define ZFG_SKIP 1
+#endif
+constexpr bool kSkip = ZFG_SKIP != 0;
 constexpr int kHudMemory = 0;  // percent of each pair in the screen's memory: what was the screen lately and still repeats in place stays the screen
+// The screen by cells (review 12.4, R_OPTS bit 19): strokes and exact repeats teach a memory per cell (P_HUDMEM), and a remembered cell gives
+// the screen only its pixels that are the same in A and B; what moves in it stays the layers'. 0 is the screen of 1.1.
+#ifndef ZFG_HUD_CELLS
+#define ZFG_HUD_CELLS 1
+#endif
+constexpr int kHudCells = ZFG_HUD_CELLS;
+// The light between the Reals (review finding 2): B's gain to A's exposure for the decisions, measured per pair (rc7_gain.comp). 0 is the
+// decisions of 1.1.
+#ifndef ZFG_LIGHT_GAIN
+#define ZFG_LIGHT_GAIN 1
+#endif
+constexpr int kLightGain = ZFG_LIGHT_GAIN;
+// The camera stopped (R_OPTS bit 21, rc7_srefit.comp mode 3; lab laystale=2, JUDGE_DESIGN_2026-11 §8): when a still picture holds most of
+// the pair's cells, the fallback surface holds still instead of carrying the last search's motion until the background search ends.
+// Arkham 1 -1.35 -> -0.49 dB against the base, Arkham 2 -1.65 -> -0.91, Katamari and the suites unchanged. 0 is the surfaces of 1.1.
+#ifndef ZFG_STOP_STILL
+#define ZFG_STOP_STILL 1
+#endif
+constexpr int kStopStill = ZFG_STOP_STILL;
+// counter_: the screen's two counts, two spare, the gain (4 .. 7), the 64 blocks' sums (8 + 6 k ..).
+constexpr VkDeviceSize kCounterBytes = (8 + 64 * 6) * 4;
 constexpr int kHoleReach = 96;  // pixels: a point with matte around it in all four directions within this goes back to the matte
 constexpr int kUnfoldBar = 70;  // hundredths of a pixel per pixel: a point where most around stretches more than this leaves the front's matte
 constexpr uint32_t kHalfFrom = 800;  // from this wide the decisions read a quarter-size copy of the Reals: their far-apart samples stay in the cache, and only the render walks the whole picture
-constexpr int P_DIST1 = 3, P_MASK = 4, P_TMP = 5, P_FCOST0 = 8, P_HUD = 11;
+constexpr int P_DIST1 = 3, P_MASK = 4, P_TMP = 5, P_FCOST0 = 8, P_HUD = 11, P_HUDMEM = 18;
 // Exact reuse and output delivery, qualified against the dense-disagreement reference.
 constexpr int kFuseOutput = 8, kReusePrepared = 16, kReusePyramid = 256, kReuseStats = 512;
 constexpr int kReuseOpts = kFuseOutput | kReusePrepared | kReusePyramid | kReuseStats;
@@ -135,6 +180,7 @@ struct Params {
   int32_t cfg3[4];
   int32_t order[4], order2[4];
   float H[18][4], Hi[18][4], Mid[18][4];
+  float gainB[4];  // rc7_common.glsl u.gainB: 1 here, rc7_gain.comp's answer copied over it on the GPU
 };
 
 struct Push {
@@ -147,7 +193,9 @@ struct Push {
 enum Pipe : uint32_t {
   kCrop, kHalf, kHalf1, kQuarter, kQuarter1, kFList, kSoft, kSoft1, kStats, kStats1, kHud, kHudRule, kCost, kCost1, kCost2, kCost3, kSeed, kJump, kJump1, kRaw, kBlockPass, kBlockPass1, kStand, kStand1, kGhost, kMorph, kFront, kFront1, kFSmooth, kFSmooth1, kUnfold, kUnfold1, kHole, kCons, kExtend, kAlpha,
   kRender, kRenderOne, kRenderOne5 = kRenderOne + 5, kTrust, kMix, kFine, kFine1, kGuide, kGuide1, kTile,
-  kSCell, kSStart, kSList, kSHyp, kSFit, kSRefit, kSInl, kSEcho, kSDone, kSOrder, kSGate, kTBlock, kTFit, kTGuide, kOut, kStatsSharp, kHudGs, kPipeCount
+  kSCell, kSStart, kSList, kSHyp, kSFit, kSRefit, kSInl, kSEcho, kSDone, kSOrder, kSGate, kTBlock, kTFit, kTGuide, kOut, kStatsSharp, kHudGs, kGain,
+  // MFG: the phase forms of the passes that depend on the phase (R_OPTS bit 16), made on the first record off the middle.
+  kTilePh, kRenderPh, kRenderOnePh, kRenderOnePh5 = kRenderOnePh + 5, kPipeCount
 };
 
 class Rc7Context final : public AlgorithmContext {
@@ -186,6 +234,16 @@ class Rc7Context final : public AlgorithmContext {
     block_ = std::max(8u, 32u / step_);
     gw_ = Groups(lw_, block_);
     gh_ = Groups(lh_, block_);
+    // kSkip: the sizes of the layers' dispatches after the gates (the lattice, the fine step's coarse grid, the mattes' blocks, the picture's
+    // blocks of 16), as Run records them.
+    const uint32_t sizes[kSkipSizes][2] = {{Groups(lw_, 8), Groups(lh_, 8)},
+                                           {Groups(std::max(1u, lw_ / 4), 8), Groups(std::max(1u, lh_ / 4), 8)},
+                                           {Groups(gw_, 4), Groups(gh_, 4)},
+                                           {Groups(Groups(width_, 16), 8), Groups(Groups(height_, 16), 8)}};
+    for (uint32_t c = 0; c < kSkipSizes; ++c) {
+      skip_sizes_[c][0] = std::max(1u, sizes[c][0]);
+      skip_sizes_[c][1] = std::max(1u, sizes[c][1]);
+    }
     uint32_t run_w = width, run_h = height;
     TiledExtent(width, height, &run_w, &run_h);
     const VkExtent2D field = FieldExtent(run_w, run_h);
@@ -214,15 +272,17 @@ class Rc7Context final : public AlgorithmContext {
 
   Status Interpolate(VkCommandBuffer cmd, const Image& previous, const Image& current, float phase, const Image& output) override {
     // A failed record must not advertise a newly prepared Real to the next call.
-    const bool prep_was_valid = prep_valid_;
-    prep_valid_ = prep_reuse_ = false;
+    const bool prep_was_valid = prep_valid_, record_was_ok = record_ok_;
+    prep_valid_ = prep_reuse_ = record_ok_ = false;
     if (!initialized_ || cmd == VK_NULL_HANDLE || output.image == VK_NULL_HANDLE || output.view == VK_NULL_HANDLE || output.width != width_ || output.height != height_ || output.format != output_format_ ||
         output.layout == VK_IMAGE_LAYOUT_UNDEFINED || output.image == previous.image || output.image == current.image || !std::isfinite(phase) || previous.image == VK_NULL_HANDLE ||
         previous.view == VK_NULL_HANDLE || current.image == VK_NULL_HANDLE || current.view == VK_NULL_HANDLE || current.width != previous.width || current.height != previous.height ||
         previous.format != input_format_ || current.format != input_format_ || (previous.usage & VK_IMAGE_USAGE_SAMPLED_BIT) == 0 || (current.usage & VK_IMAGE_USAGE_SAMPLED_BIT) == 0 ||
         previous.layout == VK_IMAGE_LAYOUT_UNDEFINED || current.layout == VK_IMAGE_LAYOUT_UNDEFINED)
       return Status::kInvalidArgument;
-    if (std::abs(phase - 0.5f) > 0.0001f) return Status::kUnsupported;
+    if (!(phase > 0.0f && phase < 1.0f)) return Status::kUnsupported;
+    phase_ = phase;
+    if (Phased() && !EnsurePhasePipelines()) return Status::kVulkanError;
     const ActiveRect rect = ResolveRect(previous), current_rect = ResolveRect(current);
     if (rect.width != width_ || rect.height != height_ || current_rect.x != rect.x || current_rect.y != rect.y || current_rect.width != rect.width || current_rect.height != rect.height ||
         rect.x > previous.width || rect.y > previous.height || rect.width > previous.width - rect.x || rect.height > previous.height - rect.y)
@@ -239,14 +299,22 @@ class Rc7Context final : public AlgorithmContext {
     const bool write_direct = direct_output_ && (output.usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
     if (!write_direct && (output.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) == 0) return Status::kInvalidArgument;
 
-    // Two physical banks, logical A/B chosen for this record. Only a Real's
-    // nonzero sequence and its geometry identify retained data, never a recycled VkImage.
-    prep_reuse_ = (kReuseOpts & kReusePrepared) != 0 && prep_was_valid && previous.sequence != 0 && current.sequence != 0 &&
-                  previous.sequence == prep_identity_.sequence && previous.width == prep_identity_.width && previous.height == prep_identity_.height &&
-                  previous.format == prep_identity_.format && rect.x == prep_identity_.rect.x && rect.y == prep_identity_.rect.y &&
-                  rect.width == prep_identity_.rect.width && rect.height == prep_identity_.rect.height;
-    prep_a_ = prep_reuse_ ? prep_b_ : 0u;
-    prep_b_ = 1u - prep_a_;
+    // MFG: another phase of the pair just recorded (Interpolator::Interpolate checked the sequences and the geometry). Its prepared Reals,
+    // base flow, surfaces and layers stand; only the phase's picture is recorded (ComposePhase).
+    const bool repeat = pair_repeat_ && record_was_ok && have_surfaces_;
+    if (!repeat) {
+      // Two physical banks, logical A/B chosen for this record. Only a Real's
+      // nonzero sequence and its geometry identify retained data, never a recycled VkImage.
+      prep_reuse_ = (kReuseOpts & kReusePrepared) != 0 && prep_was_valid && previous.sequence != 0 && current.sequence != 0 &&
+                    previous.sequence == prep_identity_.sequence && previous.width == prep_identity_.width && previous.height == prep_identity_.height &&
+                    previous.format == prep_identity_.format && rect.x == prep_identity_.rect.x && rect.y == prep_identity_.rect.y &&
+                    rect.width == prep_identity_.rect.width && rect.height == prep_identity_.rect.height;
+      prep_a_ = prep_reuse_ ? prep_b_ : 0u;
+      prep_b_ = 1u - prep_a_;
+      // A pair whose A is known and is not the B of the last record does not continue it: the base flow starts from nothing (zerofg.h,
+      // Image::sequence). The half Reals the flow gets carry sequence 0 on such a pair, so it cannot tell by itself.
+      if (previous.sequence != 0 && last_sequence_ != 0 && previous.sequence != last_sequence_) dense_->ForgetStart();
+    }
 
     cmd_ = cmd;
     // The record before may still be running: this one takes the next copy of the sets it writes.
@@ -259,7 +327,7 @@ class Rc7Context final : public AlgorithmContext {
     VkImageView view_a = previous.view, view_b = current.view;
     VkImageLayout layout_a = previous.layout, layout_b = current.layout;
     if (crop) {
-      RecordCrop(previous, current, rect);
+      if (!repeat) RecordCrop(previous, current, rect);
       view_a = tight_[0].view();
       view_b = tight_[1].view();
       layout_a = layout_b = VK_IMAGE_LAYOUT_GENERAL;
@@ -292,7 +360,9 @@ class Rc7Context final : public AlgorithmContext {
     }
 
     // The half-size Reals, then the base on them: the RC5 picture and its flow, into this context's own image.
-    if (prep_reuse_) {
+    if (repeat) {
+      // The pair's half Reals stand.
+    } else if (prep_reuse_) {
       // A stays GENERAL with the exact former B contents. Only the other bank
       // is overwritten, after the inter-pair execution/memory dependency above.
       for (const OwnedImage* image : {&half_[prep_b_], &quarter_[prep_b_], &soft_[prep_b_]})
@@ -301,13 +371,15 @@ class Rc7Context final : public AlgorithmContext {
       for (const OwnedImage* image : {&half_[0], &half_[1], &quarter_[0], &quarter_[1], &soft_[0], &soft_[1]})
         ImageBarrier(image->image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, kCompute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     }
-    if (!prep_reuse_) Run(kHalf, Groups(width_ / 2, 8), Groups(height_ / 2, 8), 0);
-    Run(kHalf1, Groups(width_ / 2, 8), Groups(height_ / 2, 8), 1);
-    if (decide_half) {
-      if (!prep_reuse_) Run(kQuarter, Groups(width_ / 4, 8), Groups(height_ / 4, 8), 0);
-      Run(kQuarter1, Groups(width_ / 4, 8), Groups(height_ / 4, 8), 1);
+    if (!repeat) {
+      if (!prep_reuse_) Run(kHalf, Groups(width_ / 2, 8), Groups(height_ / 2, 8), 0);
+      Run(kHalf1, Groups(width_ / 2, 8), Groups(height_ / 2, 8), 1);
+      if (decide_half) {
+        if (!prep_reuse_) Run(kQuarter, Groups(width_ / 4, 8), Groups(height_ / 4, 8), 0);
+        Run(kQuarter1, Groups(width_ / 4, 8), Groups(height_ / 4, 8), 1);
+      }
+      Barrier();
     }
-    Barrier();
     ImageBarrier(base_.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, kCompute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     Image half_images[2];
     for (uint32_t s = 0; s < 2; ++s) {
@@ -342,12 +414,27 @@ class Rc7Context final : public AlgorithmContext {
       base.width = width_ / 2;
       base.height = height_ / 2;
     }
+    // The base at this record's phase; on a repeat, only its picture (the flow is the pair's).
+    dense_->SetPicturePhase(phase_, repeat);
     const Status picture = kBaseFullSize ? dense_->RecordPictureFrom(cmd, half_images[0], half_images[1], reals[0], reals[1], base)
                                          : dense_->RecordPicture(cmd, half_images[0], half_images[1], base);
     if (picture != Status::kSuccess) return picture;
 
-    dispatch_.cmd_fill_buffer(cmd, counter_.buffer(), 0, VK_WHOLE_SIZE, 0);
-    WriteParams();
+    // The parameters are written whole from here and the surfaces' fits are copied into them on the GPU: a repeat keeps the pair's.
+    if (!repeat) {
+      dispatch_.cmd_fill_buffer(cmd, counter_.buffer(), 0, VK_WHOLE_SIZE, 0);
+      WriteParams();
+      if (kSkip) {
+        // Every size of dispatch the layers' passes after the gates use, in full; the gates copy them (or zero groups) for this pair.
+        uint32_t full[8][4] = {};
+        for (uint32_t c = 0; c < kSkipSizes; ++c) {
+          full[c][0] = skip_sizes_[c][0];
+          full[c][1] = skip_sizes_[c][1];
+          full[c][2] = 1;
+        }
+        cmd_update_buffer_(cmd, skip_.buffer(), 0, sizeof(full), full);
+      }
+    }
     if (!arrays_ready_) {
       // Arrays of images that stay in the general layout; the bends start at zero (the still surface never gets one).
       for (const OwnedImage* image : {&guide_, &bend_}) {
@@ -372,6 +459,14 @@ class Rc7Context final : public AlgorithmContext {
     }
     MemoryBarrier(VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, kCompute, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT);
     MemoryBarrier(kCompute, VK_ACCESS_2_SHADER_WRITE_BIT, kCompute, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+    if (kLightGain && !repeat) {
+      // The light between the Reals, before anything reads B through it: the 64 blocks' sums, the gain, into the parameters. Per pair: a
+      // repeat keeps the pair's parameters.
+      Run(kGain, 64, 1, 0);
+      Barrier();
+      Run(kGain, 1, 1, 1);
+      CopyToParams(16, offsetof(Params, gainB), 16, counter_.buffer());
+    }
 
     // The fused mix writes the target itself. The ordinary path prepares it later.
     VkImage target = write_direct ? output.image : fallback_.image();
@@ -382,12 +477,24 @@ class Rc7Context final : public AlgorithmContext {
         ImageBarrier(target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, kCompute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
       }
     };
-    Surfaces();
-    if ((kReuseOpts & kFuseOutput) != 0) prepare_target();
-    Layers();
-    in_layers_ = false;
-    Barrier();
-    have_surfaces_ = true;
+    base_only_ = (create_info_.zero_options & kZeroQuarterBase) != 0 && std::abs(phase_ - 0.5f) > 0.2f;
+    if (repeat) {
+      if ((kReuseOpts & kFuseOutput) != 0) prepare_target();
+      if (base_only_) {
+        Whole(kMix, 1);
+        Barrier();
+      } else {
+        ComposePhase();
+      }
+    } else {
+      Surfaces();
+      if ((kReuseOpts & kFuseOutput) != 0) prepare_target();
+      Layers();
+      in_layers_ = false;
+      Barrier();
+      have_surfaces_ = true;
+    }
+    skip_now_ = false;
 
     // The picture leaves.
     if ((kReuseOpts & kFuseOutput) == 0) {
@@ -413,8 +520,12 @@ class Rc7Context final : public AlgorithmContext {
       prep_identity_ = {current.sequence, current.width, current.height, current.format, current_rect};
       prep_valid_ = true;
     }
+    if (!repeat) last_sequence_ = current.sequence;
+    record_ok_ = true;
     return Status::kSuccess;
   }
+
+  void SetPairRepeat(bool repeat) override { pair_repeat_ = repeat; }
 
  private:
   bool HasOptimalFeatures(VkFormat format, VkFormatFeatureFlags features) const {
@@ -467,11 +578,12 @@ class Rc7Context final : public AlgorithmContext {
         {&cells_, VkDeviceSize(fw_) * fh_ * 16, storage},
         {&out_, n * 4, storage},
         {&disagree_, n * 4, storage},
-        {&counter_, 16, storage | dst},
+        {&counter_, kCounterBytes, storage | dst | VK_BUFFER_USAGE_TRANSFER_SRC_BIT},  // the gain is copied from it into the parameters
         {&blocks_, VkDeviceSize(gw_) * gh_ * 2 * 16, storage},
         {&tiles_, VkDeviceSize(Groups(width_, 16)) * Groups(height_, 16) * 2 * 4, storage},
         {&thumb_, 256 + 24 * 16 + 4480 * (16 + 16) + 2 * 4 * VkDeviceSize(width_ / 8 + 2) * (height_ / 8 + 2), storage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT},
         {&dummy_, 256, storage},
+        {&skip_, 256, storage | dst | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT},
     };
     for (const auto& b : buffers) {
       status = b.buffer->Create(vulkan_, dispatch_, b.size, b.usage);
@@ -496,8 +608,13 @@ class Rc7Context final : public AlgorithmContext {
 
   // One layout for every pass, bindings as in shaders/rc7/rc7_common.glsl, 33 the output. Two sets, which differ in the pictures only: the decisions may read the half-size ones.
   Status CreatePipelines() {
+    {
+      VkPhysicalDeviceProperties properties{};
+      dispatch_.get_physical_device_properties(vulkan_.physical_device, &properties);
+      render_once_ = OnceWalkPays(properties.deviceName);
+    }
     const VkDescriptorType kS = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kI = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kB = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    std::vector<VkDescriptorType> types(39, kB);
+    std::vector<VkDescriptorType> types(40, kB);  // 39: SkipBuf (kSkip)
     types[0] = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     types[9] = types[11] = types[12] = types[13] = types[14] = types[22] = types[23] = types[30] = types[31] = types[38] = kS;
     types[15] = types[16] = types[28] = types[29] = types[33] = types[34] = types[35] = types[36] = types[37] = kI;
@@ -523,7 +640,7 @@ class Rc7Context final : public AlgorithmContext {
     if (dispatch_.create_pipeline_layout(vulkan_.device, &pl, vulkan_.allocator, &layout_) != VK_SUCCESS) return Status::kVulkanError;
     // One copy of the sets per frame context: a record writes the Reals and the output into its own copy, while the record before may still be running.
     const uint32_t copies = std::max(1u, create_info_.frame_context_count);
-    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * copies}, {kS, 20 * copies}, {kI, 18 * copies}, {kB, 38 * copies}};
+    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * copies}, {kS, 20 * copies}, {kI, 18 * copies}, {kB, 40 * copies}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 2 * copies;
     dpi.poolSizeCount = 4;
@@ -583,7 +700,7 @@ class Rc7Context final : public AlgorithmContext {
 #define RC7_ONE(K) {kRenderOne + K, zerofg_rc7_render_spv, sizeof(zerofg_rc7_render_spv), 0, 0, K}
     // What the passes know when they are built: blocks, behind, two passes, the screen's hole, guided mattes, the cubic filter, the front always first, the groups from a list, the costs and the statistics over a checkerboard of the
     // patch, the guided window at its radius' step. KIND of the guided mattes: the softened copy is smaller than the Reals.
-    const int render_opts = 1 | 2 | 4 | 8 | 16 | (cubic_sampler_ ? 32 : 0) | 64 | 256 | 512 | 1024 | 2048 | 4096 | 8192;
+    const int render_opts = RenderOpts();
     const Spec specs[] = {{kCrop, zerofg_rc3_crop_spv, sizeof(zerofg_rc3_crop_spv), 0, 0, -1}, RC7_SIDES(kHalf, half, 0), RC7_SIDES(kQuarter, quarter, 0), RC7_SPEC(kFList, flist), RC7_SIDES(kSoft, soft, 0), RC7_SIDES(kStats, stats, 0), RC7_SPEC(kHud, hud), RC7_SPEC(kHudRule, hudrule),
                           RC7_COST(kCost, 0, 0), RC7_COST(kCost1, 1, 0), RC7_COST(kCost2, 0, 1), RC7_COST(kCost3, 1, 1),
                           RC7_SPEC(kSeed, seed), RC7_SIDES(kJump, jump, 0), RC7_SPEC(kRaw, raw), RC7_SIDES(kBlockPass, block, 0), RC7_SIDES(kStand, stand, 0), RC7_SPEC(kGhost, ghost),
@@ -592,33 +709,71 @@ class Rc7Context final : public AlgorithmContext {
                           RC7_SPEC(kTrust, trust), RC7_SPEC(kMix, mix), RC7_SIDES(kFine, fine, 0), RC7_SIDES(kGuide, guide, 1), RC7_SPEC(kTile, tile), RC7_SPEC(kSCell, scell), RC7_SPEC(kSStart, sstart),
                           RC7_SPEC(kSList, slist), RC7_SPEC(kSHyp, shyp), RC7_SPEC(kSFit, sfit), RC7_SPEC(kSRefit, srefit), RC7_SPEC(kSInl, sinl), RC7_SPEC(kSEcho, secho),
                           RC7_SPEC(kSDone, sdone), RC7_SPEC(kSOrder, sorder), RC7_SPEC(kSGate, sgate), RC7_SPEC(kTBlock, tblock), RC7_SPEC(kTFit, tfit), RC7_SPEC(kTGuide, tguide), RC7_SPEC(kOut, out),
-                          {kStatsSharp, zerofg_rc7_stats_spv, sizeof(zerofg_rc7_stats_spv), 0, 1, -1}, RC7_SPEC(kHudGs, hudgs)};
+                          {kStatsSharp, zerofg_rc7_stats_spv, sizeof(zerofg_rc7_stats_spv), 0, 1, -1}, RC7_SPEC(kHudGs, hudgs), RC7_SPEC(kGain, gain)};
 #undef RC7_ONE
 #undef RC7_COST
 #undef RC7_SIDES
 #undef RC7_SPEC
     for (const Spec& s : specs) {
       if (s.pipe == kStatsSharp && (kReuseOpts & kReuseStats) == 0) continue;
-      const int spec_values[7] = {s.side, s.kind, s.surface, kFrontRoundsBend, kFrontRoundsSample, render_opts, kReuseOpts};
-      const VkSpecializationMapEntry spec_entries[7] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}, {5, 20, 4}, {6, 24, 4}};
-      const VkSpecializationInfo spec_info{7, spec_entries, sizeof(spec_values), spec_values};
-      VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-      smi.codeSize = s.bytes;
-      smi.pCode = s.code;
-      VkShaderModule module = VK_NULL_HANDLE;
-      if (dispatch_.create_shader_module(vulkan_.device, &smi, vulkan_.allocator, &module) != VK_SUCCESS) return Status::kVulkanError;
-      VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-      cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-      cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-      cpi.stage.module = module;
-      cpi.stage.pName = "main";
-      cpi.stage.pSpecializationInfo = &spec_info;
-      cpi.layout = s.pipe == kCrop ? crop_layout_ : layout_;
-      const VkResult result = dispatch_.create_compute_pipelines(vulkan_.device, VK_NULL_HANDLE, 1, &cpi, vulkan_.allocator, &pipelines_[s.pipe]);
-      dispatch_.destroy_shader_module(vulkan_.device, module, vulkan_.allocator);
-      if (result != VK_SUCCESS) return Status::kVulkanError;
+      if (!MakePipeline(s.pipe, s.code, s.bytes, s.side, s.kind, s.surface, render_opts)) return Status::kVulkanError;
     }
     return Status::kSuccess;
+  }
+
+  bool MakePipeline(uint32_t pipe, const uint32_t* code, size_t bytes, int side, int kind, int surface, int opts) {
+    const int spec_values[7] = {side, kind, surface, kFrontRoundsBend, kFrontRoundsSample, opts, kReuseOpts};
+    const VkSpecializationMapEntry spec_entries[7] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}, {5, 20, 4}, {6, 24, 4}};
+    const VkSpecializationInfo spec_info{7, spec_entries, sizeof(spec_values), spec_values};
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = bytes;
+    smi.pCode = code;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (dispatch_.create_shader_module(vulkan_.device, &smi, vulkan_.allocator, &module) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = module;
+    cpi.stage.pName = "main";
+    cpi.stage.pSpecializationInfo = &spec_info;
+    cpi.layout = pipe == kCrop ? crop_layout_ : layout_;
+    const VkResult result = dispatch_.create_compute_pipelines(vulkan_.device, VK_NULL_HANDLE, 1, &cpi, vulkan_.allocator, &pipelines_[pipe]);
+    dispatch_.destroy_shader_module(vulkan_.device, module, vulkan_.allocator);
+    return result == VK_SUCCESS;
+  }
+
+  // What the passes know when they are built: blocks, behind, two passes, the screen's hole, guided mattes, the cubic filter, the front
+  // always first, the groups from a list, the costs and the statistics over a checkerboard of the patch, the guided window at its radius' step.
+  // Zero light (CreateInfo::zero_options): one background surface, one render pass, no guided filter. Otherwise the two passes run as one
+  // walk (bit 24), the same picture, only on an Adreno 8xx: the walk holds two surfaces in registers, which the 840 has room for (16 waves
+  // either way, render -7 to -12 %) and the Adreno 650 has not (10 -> 8 waves per core, render +48 %, the pair +15 to +22 %; round 13).
+  // Bit 26 (kRenderMatte, round 13): the mattes read before the fine step (render -5 % on the 650, level on the 840, the same quality).
+  bool Light() const { return (create_info_.zero_options & kZeroLight) != 0; }
+  int RenderOpts() const {
+    const bool light = Light();
+    return 1 | 2 | (light ? 0 : 4) | 8 | (light ? 0 : 16) | (cubic_sampler_ ? 32 : 0) | 64 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | (kHudCells ? 524288 : 0) | (kStopStill ? 2097152 : 0) |
+           (light || !render_once_ ? 0 : 16777216) | 67108864 | 134217728;  // 134217728: kHudBlock (rc7_hud.comp, round 13)
+  }
+  // Round 13: the render's one walk only where it was measured to pay, an Adreno 8xx (the name's number, 800 and up).
+  static bool OnceWalkPays(const char* name) {
+    const char* at = std::strstr(name, "Adreno");
+    if (at == nullptr) return false;
+    while (*at != '\0' && (*at < '0' || *at > '9')) ++at;
+    return std::atoi(at) >= 800;
+  }
+  bool Phased() const { return std::abs(phase_ - 0.5f) > 0.0001f; }
+  uint32_t TilePipe() const { return Phased() ? uint32_t(kTilePh) : uint32_t(kTile); }
+
+  // The phase forms of the block marks and the render (MFG; their own SPIR-V, compiled with ZFG_PHASE): made on the first record off the
+  // middle, so a session that stays at x2 builds nothing new.
+  bool EnsurePhasePipelines() {
+    if (pipelines_[kTilePh] != VK_NULL_HANDLE) return true;
+    const int opts = RenderOpts();
+    bool ok = MakePipeline(kRenderPh, zerofg_rc7_render_phase_spv, sizeof(zerofg_rc7_render_phase_spv), 0, 0, -1, opts);
+    for (int k = 0; ok && k < 6; ++k) ok = MakePipeline(kRenderOnePh + uint32_t(k), zerofg_rc7_render_phase_spv, sizeof(zerofg_rc7_render_phase_spv), 0, 0, k, opts);
+    // The tile pass last: it is the mark that the set is complete.
+    ok = ok && MakePipeline(kTilePh, zerofg_rc7_tile_phase_spv, sizeof(zerofg_rc7_tile_phase_spv), 0, 0, -1, opts);
+    return ok;
   }
 
   template <typename F>
@@ -664,7 +819,7 @@ class Rc7Context final : public AlgorithmContext {
     } buffers[] = {{1, cost_.buffer()},  {2, label_.buffer()},  {3, plan_.buffer()},    {4, stat_.buffer()},     {5, front_.buffer()},  {6, palpha_.buffer()},
                    {7, cells_.buffer()}, {8, out_.buffer()},    {10, disagree_.buffer()}, {17, dense_->flow_buffer()}, {18, counter_.buffer()}, {19, blocks_.buffer()},
                    {20, dummy_.buffer()}, {21, dummy_.buffer()}, {24, tiles_.buffer()}, {25, search_.buffer()},
-                   {26, thumb_.buffer()}, {27, flist_.buffer()}, {32, snap_.buffer()}};
+                   {26, thumb_.buffer()}, {27, flist_.buffer()}, {32, snap_.buffer()}, {39, skip_.buffer()}};
     for (const auto& b : buffers) BindBuffer(b.binding, b.buffer);
     const VkImageLayout general = VK_IMAGE_LAYOUT_GENERAL;
     BindSampled(9, base_.view(), general);
@@ -722,7 +877,9 @@ class Rc7Context final : public AlgorithmContext {
     if (is_long && (!wide_next || (in_layers_ && long_done_))) return;
     if (is_long) long_done_ = true;
     const size_t step = step_next_++;
+    in_step_ = true;  // kSkip: the search's own dispatches always run
     steps_[step].run();
+    in_step_ = false;
     step_indirect_ = steps_[step].indirect;
     step_now_us_ = steps_[step].us;
     if (step_next_ >= steps_.size()) search_fresh_ = true;
@@ -765,7 +922,8 @@ class Rc7Context final : public AlgorithmContext {
     dispatch_.cmd_pipeline_barrier_2(cmd_, &dependency);
   }
 
-  void Bind(uint32_t pipe, const Push& push) {
+  void Bind(uint32_t pipe, Push push) {
+    if (pipe >= kTilePh) push.p[0] = phase_;  // the phase forms read the phase in pc.p.x
     dispatch_.cmd_bind_pipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[pipe]);
     const bool decides = pipe == kSoft || pipe == kSoft1 || pipe == kStats || pipe == kStats1 || pipe == kStatsSharp || pipe == kHud || (pipe >= kCost && pipe <= kCost3) || pipe == kBlockPass || pipe == kBlockPass1 || pipe == kStand || pipe == kStand1 ||
                          pipe == kFront || pipe == kFront1 || pipe == kFSmooth || pipe == kFSmooth1;
@@ -782,7 +940,20 @@ class Rc7Context final : public AlgorithmContext {
     push.b[0] = b0;
     push.b[1] = b1;
     Bind(pipe, push);
-    dispatch_.cmd_dispatch(cmd_, std::max(1u, gx), std::max(1u, gy), 1);
+    gx = std::max(1u, gx);
+    gy = std::max(1u, gy);
+    // kSkip: after the gates, a layers' pass takes its groups from what the gates left for its size (SkipBuf: all of them, or none on a pair
+    // that is the base's whole or a cut). Never the mix, the two one-group passes that write the lists' dispatch arguments (from counts that
+    // start at zero each pair, so on a skipped pair they write zero groups), or a step of the background search.
+    const bool writes_args = (pipe == kFList && a0 == 1) || ((pipe == kTile || pipe == kTilePh) && a0 == 4);
+    if (kSkip && skip_now_ && !in_step_ && pipe != kMix && !writes_args) {
+      for (uint32_t c = 0; c < kSkipSizes; ++c)
+        if (skip_sizes_[c][0] == gx && skip_sizes_[c][1] == gy) {
+          cmd_dispatch_indirect_(cmd_, skip_.buffer(), 128 + VkDeviceSize(c) * 16);
+          return;
+        }
+    }
+    dispatch_.cmd_dispatch(cmd_, gx, gy, 1);
   }
 
   void Indirect(uint32_t pipe, VkDeviceSize offset, int a0) {
@@ -828,14 +999,15 @@ class Rc7Context final : public AlgorithmContext {
     p.judge0[2] = kBaseBarFront * 0.01f;
     std::copy(th4, th4 + 4, p.th4);
     std::copy(judge1, judge1 + 4, p.judge1);
+    std::fill(p.gainB, p.gainB + 4, 1.0f);
     cmd_update_buffer_(cmd_, params_.buffer(), 0, sizeof(Params), &p);
   }
 
-  void CopyToParams(VkDeviceSize from, VkDeviceSize to, VkDeviceSize bytes) {
+  void CopyToParams(VkDeviceSize from, VkDeviceSize to, VkDeviceSize bytes, VkBuffer source = VK_NULL_HANDLE) {
     MemoryBarrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
                   VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
     VkBufferCopy region{from, to, bytes};
-    dispatch_.cmd_copy_buffer(cmd_, search_.buffer(), params_.buffer(), 1, &region);
+    dispatch_.cmd_copy_buffer(cmd_, source != VK_NULL_HANDLE ? source : search_.buffer(), params_.buffer(), 1, &region);
     MemoryBarrier(VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_UNIFORM_READ_BIT);
   }
 
@@ -900,6 +1072,11 @@ class Rc7Context final : public AlgorithmContext {
     Run(kSRefit, cx, cy, 0);
     Barrier();
     Run(kSRefit, 1, 1, 1);
+    if (kStopStill) {
+      // The camera stopped: the fallback holds still when a still picture holds most cells (one lane, rc7_srefit.comp mode 3).
+      Barrier();
+      Run(kSRefit, 1, 1, 3);
+    }
     CopyToParams(kRefitOffset, offsetof(Params, H), 54 * 16);
     CopyInSearch(kRefitOffset, kFollowOffset);
     if (start) BuildSearch();
@@ -916,7 +1093,7 @@ class Rc7Context final : public AlgorithmContext {
     const uint32_t cx = Groups(fw_, 8), cy = Groups(fh_, 8);
     const uint32_t echo_step = std::max(8u, width_ / 80), ex = Groups(width_ / echo_step, 8), ey = Groups(height_ / echo_step, 8);
     AddStep([=, this] { Run(kSStart, 1, 1); });
-    for (int fit = 0; fit < kPeels; ++fit) {
+    for (int fit = 0; fit < (Light() ? 1 : kPeels); ++fit) {
       AddStep([=, this] { Run(kSList, 1, 1, 0); });
       AddStep([=, this] { Run(kSList, 4, 1, 1); });
       AddStep([=, this] {
@@ -1001,6 +1178,8 @@ class Rc7Context final : public AlgorithmContext {
     if (!hud_memory_) {
       const VkDeviceSize points = VkDeviceSize(lw_) * lh_;
       dispatch_.cmd_fill_buffer(cmd_, plan_.buffer(), VkDeviceSize(P_HUD * 2 + 1) * points * 4, points * 4, 0);
+      // The cells' memory (kHudCells) starts empty too.
+      dispatch_.cmd_fill_buffer(cmd_, plan_.buffer(), VkDeviceSize(P_HUDMEM * 2) * points * 4, points * 4, 0);
       MemoryBarrier(VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
       hud_memory_ = true;
     }
@@ -1009,22 +1188,31 @@ class Rc7Context final : public AlgorithmContext {
     // cursor drawn with the character), the guess catches that. It packs into the steps already there: it goes along with the guess (it
     // reads only the host's code image) on the memory's side, and the rule adds it after its own decision; no step or barrier of its own.
     static_assert(kHudMemory == 0, "the host's screen is written on the screen's memory side: with the memory on it needs a plan of its own");
-    Lat(kHud);
+    // With the screen by cells, pc.a.x says which lattice point in four reads its cell's own pixels this pair.
+#ifndef ZFG_HUD_LOOK
+#define ZFG_HUD_LOOK 1
+#endif
+    Lat(kHud, kHudCells ? (ZFG_HUD_LOOK ? int(hud_turn_++ & 15u) : 99) : 0);  // ZFG_HUD_LOOK=0 (cost probe): no lattice point reads its cell
     if (screen_now_) Lat(kHudGs);
     Lat(kSeed, 0, 1);
     Lat(kSeed, 1, 1);
     Barrier();
     Lat(kHudRule, screen_now_ ? 1 : 0);
     Run(kSGate, Groups(std::max(1u, lw_ / 2), 8), Groups(std::max(1u, lh_ / 2), 8), 1);
-    Run(kSGate, Groups(std::max(1u, lw_ / 4), 8), Groups(std::max(1u, lh_ / 4), 8), 3);
+    Run(kSGate, Groups(std::max(1u, lw_ / 4), 8), Groups(std::max(1u, lh_ / 4), 8), 3, kCutLit);
     Barrier();
+    // The gates' one-lane walk before the wide morph: dispatches with no barrier between them overlap on the 840 only when the narrow
+    // one is recorded first (lab round 11-12, bit-identical). Neither reads what the other writes.
+    Run(kSGate, 1, 1, 2, kCutLit, kCutCost, kEasy, kFloorGate, kCutCorrelation);
     Lat(kMorph, 0, P_HUD, P_TMP, 2, 0);
-    Run(kSGate, 1, 1, 2, 0, 0, 0, kFloorGate, kCutCorrelation);
     CopyToParams(896, offsetof(Params, gate), 16);
     CopyToParams(kCutOffset, offsetof(Params, cfg3) + 4, 4);
+    if (kSkip) step_indirect_ = true;  // the gates wrote the later passes' groups (SkipBuf): the next barrier covers the indirect reads
     Barrier();
     Lat(kMorph, 0, P_TMP, P_HUD, 2, 1);
     Barrier();
+    // kSkip: from here on, a pair the gates gave to the base whole (or a cut) runs none of the passes but the mix.
+    skip_now_ = kSkip;
     // The labels: seeds, then jumps, every point reading the round before; the last one also fixes what is left.
     Lat(kSeed, 0);
     Lat(kSeed, 1);
@@ -1130,28 +1318,45 @@ class Rc7Context final : public AlgorithmContext {
       Lat(kExtend, 0, flip, jump);
       Lat(kExtend, 1, flip, jump);
       if (jump == 6) {
-        Lat(kGuide, 0);
-        Lat(kGuide1, 1);
+        if (!Light()) {
+          Lat(kGuide, 0);
+          Lat(kGuide1, 1);
+        }
         Run(kTile, tx, ty, 0);
       }
       Barrier();
       flip = 1 - flip;
     }
-    // Which layers exist in each block of the picture, each group of the picture into the list of its class, and the picture.
-    Lat(kTile, 1, 0);
-    Lat(kTile, 1, 1);
+    if (base_only_) BaseOut();
+    else ComposeTail(tx, ty);
+  }
+
+  // kZeroQuarterBase, a phase away from the middle: the base's picture alone. The barriers the tail would have carry the search's steps.
+  void BaseOut() {
     Barrier();
-    Run(kTile, tx, ty, 2);
     Barrier();
-    Run(kTile, Groups(Groups(width_, 8), 8), Groups(Groups(height_, 8), 8), 3);
+    Barrier(true);
+    Whole(kMix, 1);
     Barrier();
-    Run(kTile, 1, 1, 4);
+  }
+
+  // Which layers exist in each block of the picture, each group of the picture into the list of its class, and the picture: what depends
+  // on the phase (the block marks and the render; the judge and the mix only follow them). The blocks were cleared before.
+  void ComposeTail(uint32_t tx, uint32_t ty) {
+    const uint32_t tile = TilePipe();
+    Lat(tile, 1, 0);
+    Lat(tile, 1, 1);
+    Barrier();
+    Run(tile, tx, ty, 2);
+    Barrier();
+    Run(tile, 1, 1, 4);
     step_indirect_ = true;
     Barrier(true);
     // By class: the few long groups first, because the command processor starts a dispatch only when the one before has all its waves out; no barrier between them, they write different pixels.
+    const uint32_t render = Phased() ? uint32_t(kRenderPh) : uint32_t(kRender), render_one = Phased() ? uint32_t(kRenderOnePh) : uint32_t(kRenderOne);
     for (int c = 6; c >= 0; --c) {
       Push push;
-      Bind(c == 6 ? uint32_t(kRender) : uint32_t(kRenderOne) + uint32_t(c), push);
+      Bind(c == 6 ? render : render_one + uint32_t(c), push);
       cmd_dispatch_indirect_(cmd_, flist_.buffer(), 48 + VkDeviceSize(c) * 16);
     }
     Barrier();
@@ -1161,12 +1366,30 @@ class Rc7Context final : public AlgorithmContext {
     Barrier();
   }
 
+  // MFG: another phase of the pair just recorded. Its surfaces, mattes, front and screen stand; the blocks' marks, the classes' lists
+  // (their counts, flist_ offset 160, not the front's list at 32), the picture, the judge and the mix are recorded again. The background
+  // search rides the pair: in_layers_ stays false, so no step of it runs here.
+  void ComposePhase() {
+    if (kSkip) {
+      // The pair's gates (an earlier record) left the groups this repeat's passes read indirectly: a repeat of a skipped pair is its mix.
+      IndirectBarrier();
+      skip_now_ = true;
+    }
+    dispatch_.cmd_fill_buffer(cmd_, flist_.buffer(), 160, 28, 0);
+    MemoryBarrier(VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    const uint32_t tx = Groups(Groups(width_, 16), 8), ty = Groups(Groups(height_, 16), 8);
+    Run(kTile, tx, ty, 0);
+    Barrier();
+    ComposeTail(tx, ty);
+  }
+
   void DestroyWorking() {
     initialized_ = false;
     steps_.clear();
     step_next_ = 0;
     have_surfaces_ = search_fresh_ = in_layers_ = step_indirect_ = arrays_ready_ = have_field_ = false;
-    prep_valid_ = prep_reuse_ = false;
+    prep_valid_ = prep_reuse_ = record_ok_ = false;
+    last_sequence_ = 0;
     prep_a_ = 0;
     prep_b_ = 1;
     prep_identity_ = {};
@@ -1189,7 +1412,7 @@ class Rc7Context final : public AlgorithmContext {
     decide_sets_.clear();
     crop_sets_.clear();
     for (OwnedImage* image : {&soft_[0], &soft_[1], &half_[0], &half_[1], &quarter_[0], &quarter_[1], &base_, &fallback_, &tight_[0], &tight_[1], &guide_, &bend_}) image->Destroy(vulkan_, dispatch_);
-    for (OwnedBuffer* buffer : {&params_, &search_, &cost_, &label_, &plan_, &stat_, &front_, &palpha_, &cells_, &out_, &disagree_, &counter_, &blocks_, &tiles_, &thumb_, &flist_, &snap_, &dummy_}) buffer->Destroy(vulkan_, dispatch_);
+    for (OwnedBuffer* buffer : {&params_, &search_, &cost_, &label_, &plan_, &stat_, &front_, &palpha_, &cells_, &out_, &disagree_, &counter_, &blocks_, &tiles_, &thumb_, &flist_, &snap_, &dummy_, &skip_}) buffer->Destroy(vulkan_, dispatch_);
     if (sampler_ != VK_NULL_HANDLE) dispatch_.destroy_sampler(vulkan_.device, sampler_, vulkan_.allocator);
     if (cubic_sampler_ != VK_NULL_HANDLE) dispatch_.destroy_sampler(vulkan_.device, cubic_sampler_, vulkan_.allocator);
     sampler_ = cubic_sampler_ = VK_NULL_HANDLE;
@@ -1212,9 +1435,16 @@ class Rc7Context final : public AlgorithmContext {
   std::unique_ptr<DenseFlowSource> dense_;
   OwnedImage soft_[2], half_[2], quarter_[2], base_, fallback_, tight_[2], guide_, bend_;
   bool hud_memory_ = false;  // the screen's memory is cleared once per size
+  uint32_t hud_turn_ = 0;    // kHudCells: which lattice point in sixteen reads its cell's own pixels this pair
   Image screen_truth_{};     // SetScreenTruth: the host's screen, codes as in shaders/rc7/rc7_hudgs.comp
   bool screen_now_ = false;  // this record adds it to the guess
-  OwnedBuffer params_, search_, cost_, label_, plan_, stat_, front_, palpha_, cells_, out_, disagree_, counter_, blocks_, tiles_, thumb_, flist_, snap_, dummy_;
+  OwnedBuffer params_, search_, cost_, label_, plan_, stat_, front_, palpha_, cells_, out_, disagree_, counter_, blocks_, tiles_, thumb_, flist_, snap_, dummy_, skip_;
+  // kSkip: while set, Run records a layers' pass from the gates' groups (SkipBuf, offset 128 + 16 per size); in_step_ marks a step of the
+  // background search, which always runs.
+  static constexpr uint32_t kSkipSizes = 4;
+  uint32_t skip_sizes_[kSkipSizes][2] = {};
+  bool skip_now_ = false, in_step_ = false;
+  bool render_once_ = false;  // round 13: the render's one walk (bit 24) on an Adreno 8xx only (OnceWalkPays)
   VkSampler sampler_ = VK_NULL_HANDLE, cubic_sampler_ = VK_NULL_HANDLE;
   struct Step {
     std::function<void()> run;
@@ -1225,6 +1455,10 @@ class Rc7Context final : public AlgorithmContext {
   size_t step_next_ = 0;
   double step_now_us_ = 0.0;
   bool in_layers_ = false, have_surfaces_ = false, step_indirect_ = false, long_done_ = false, search_fresh_ = false, arrays_ready_ = false, have_field_ = false;
+  // MFG: the record's phase; the next record is another phase of the last pair (SetPairRepeat); the last record succeeded; its B's sequence.
+  float phase_ = 0.5f;
+  bool pair_repeat_ = false, record_ok_ = false, base_only_ = false;
+  uint64_t last_sequence_ = 0;
   VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE, crop_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout layout_ = VK_NULL_HANDLE, crop_layout_ = VK_NULL_HANDLE;
   VkDescriptorPool pool_ = VK_NULL_HANDLE, crop_pool_ = VK_NULL_HANDLE;
