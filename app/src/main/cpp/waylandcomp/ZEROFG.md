@@ -26,7 +26,8 @@ LSFG / DD-FG changes.
    others keep their targets. The pool is sized for the multiplier asked for: 3 (x2, as before), 6 (x3) or 9
    (x4) buffers, allocated as needed; a smaller size (the menu, or ZeroFG turned off, which gives the upscaler
    back its 3) frees the buffers beyond it once they are neither shown nor in use and their release fence has
-   signalled; the rest go when ZeroFG stops using the layer. The job waits for B's acquire fence, for A's when no
+   signalled, and ZeroFG's imports of them go once no job writes them (`pool_size`); the rest go when ZeroFG
+   stops using the layer. The job waits for B's acquire fence, for A's when no
    earlier job waited for it, and for the pool buffers' display release fences. Timestamp queries before the
    job's calls, after its first and after its last give the GPU time of the first call (the pair recorded
    whole) and of each further one (only the picture at another phase).

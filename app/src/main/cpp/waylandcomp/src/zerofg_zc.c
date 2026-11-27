@@ -1090,6 +1090,16 @@ static void out_retire(struct zout *o) {
     if (!in_flight(o->last_serial)) zimg_destroy(&o->im);
 }
 
+/* The layer's pool sized for n buffers: the imports of the buffers beyond it go too (once no job writes them), so
+ * that a smaller pool frees their memory while ZeroFG keeps running. */
+static void pool_size(int slot, int n) {
+    sc_layer_vortek_pool_reserve(slot, n);
+    for (int i = 0; i < ZOUT_MAX; i++) {
+        struct zout *o = &Z.out[i];
+        if (o->im.img && o->slot == slot && o->idx >= n) out_retire(o);
+    }
+}
+
 /* Finished jobs, and the imports nothing uses any more. Never waits. */
 static void reap(void) {
     if (!Z.dev_owned) return;
@@ -1562,7 +1572,7 @@ static void deactivate(const char *why) {
     vote_clear();
     /* the pools ZeroFG grew go back to the upscaler's size */
     for (int i = 0; i < SC_VORTEK_LAYERS; i++)
-        if (Z.slot_ns[i]) sc_layer_vortek_pool_reserve(i, SC_VORTEK_POOL);
+        if (Z.slot_ns[i]) pool_size(i, SC_VORTEK_POOL);
     atomic_store(&g_rate_real, 0.0f);
     atomic_store(&g_rate_shown, 0.0f);
     if (why) ZLOG("off: %s (%llu frames generated)", why, S.total_gen);
@@ -2093,7 +2103,7 @@ static int present(const struct vku_frame *f, int acquire_fd, void *token) {
     int idx[ZGEN], rel[ZGEN], got = 0;
     struct zout *o[ZGEN] = {NULL};
     if (why < 0) {
-        sc_layer_vortek_pool_reserve(f->slot, zfg_pool_size(pool_mult()));
+        pool_size(f->slot, zfg_pool_size(pool_mult()));
         for (int k = 0; k < shown; k++) {
             struct vkp_image *unused = NULL;
             rel[got] = -1;
