@@ -109,7 +109,8 @@ installed) becomes one job allowed to run in the session (`AutoComponents.queueI
 list (local appmanifest, appinfo.vdf, the kept PICS answer; one small anonymous lookup only for an
 app nothing knows), its automatic picks written to `wincomponents.json` (the runtime's copy too) and
 only its missing components downloaded, at low priority. It waits while a game runs in the session
-(Steam's reaper `SteamLaunch AppId=`, or Proton's `waitforexitandrun`). All other work stays
+(Steam's reaper `SteamLaunch AppId=`, or Proton's `waitforexitandrun`; not an install script,
+which Steam starts as `SteamLaunch AppId=<id> Install=1 -- <tool> run .../iscriptevaluator.exe`). All other work stays
 paused. While its components download, the app lists them per game in the runtime's
 `~/.config/droiddeck/wincomponents-pending.json`; `droiddeck-wincomponents` at launch waits up to
 10 s for those (no wait when nothing is pending), then applies what is there: log

@@ -1829,6 +1829,24 @@ case $mode in
       rm -f "$compat_pending"
       : > "$compat_restarted"
       compat_restarts=0
+      # content_log.txt since the client started: an app, workshop or shader update committing or running
+      # an install script (until another state, or Stopping), or an uninstall. Downloads resume after a restart.
+      steam_content_busy() {
+        local log=$steam_root/logs/content_log.txt
+        [ -f "$log" ] || return 1
+        tail -c 4194304 "$log" 2>/dev/null | tr -d '\r' | awk '
+          /Client version:/ { split("", u); split("", r); next }
+          match($0, /AppID [0-9]+ [A-Za-z]+ update changed : /) {
+            split(substr($0, RSTART, RLENGTH), f, " "); s = substr($0, RSTART + RLENGTH)
+            if (s ~ /Running Update/ && s !~ /Stopping/ && s ~ /Committing|Running Script/) u[f[3] " " f[2]] = 1; else delete u[f[3] " " f[2]]
+            next
+          }
+          match($0, /AppID [0-9]+ state changed : /) {
+            split(substr($0, RSTART, RLENGTH), f, " "); s = substr($0, RSTART + RLENGTH)
+            if (s ~ /Uninstalling/) r[f[2]] = 1; else delete r[f[2]]
+          }
+          END { for (k in u) exit 0; for (k in r) exit 0; exit 1 }'
+      }
       compat_settled() {
         local app m flags r card=/mnt/droiddeck-sd added=(/mnt/droiddeck-lib/*)
         [ "$steam_x64" = 1 ] && { card=/mnt/droiddeck-sd/x86-64; added=(/mnt/droiddeck-lib/*/x86-64); }
@@ -1842,7 +1860,7 @@ case $mode in
           flags=$(sed -n 's/^[[:space:]]*"StateFlags"[[:space:]]*"\([0-9]*\)".*/\1/p' "$m" | head -n 1)
           [ "$flags" = 4 ] || return 1
         done < "$compat_pending"
-        ! pgrep -f 'reaper SteamLaunch' >/dev/null 2>&1
+        ! pgrep -f 'reaper SteamLaunch' >/dev/null 2>&1 && ! steam_content_busy
       }
       while :; do
         if [ -n "$requests" ]; then
