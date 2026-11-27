@@ -54,14 +54,17 @@ void sc_layer_tx_apply(struct ASurfaceTransaction *batch);
 void sc_layer_tx_discard(struct ASurfaceTransaction *tx);
 /* [mali-g2] Even frame pacing (upstream #2743): sc_layer_tx_apply for a batch that carries the main game
  * window's new frame, which reached the compositor at arrival_ns (CLOCK_MONOTONIC); ready_fd (taken; -1:
- * none) is a duplicate of its acquire fence. While pacing is on, frames at least 1.5 refreshes apart are
- * held for a refresh on their cadence (the frame timeline from sc_layer_frame_timeline) and every refresh
+ * none) is a duplicate of its acquire fence. While pacing is on, frames that keep to a cadence of a whole
+ * number (at least 2) of refreshes are held for a refresh on it (the frame timeline from sc_layer_frame_timeline) and every refresh
  * in between is presented. sc_layer_cadence_log writes the 10 s "pacing" line. */
 int sc_layer_present_cadence_on(void);
 void sc_layer_set_present_cadence(int on);
 void sc_layer_frame_timeline(int64_t present_ns, int64_t deadline_ns, int64_t period_ns);
 void sc_layer_tx_apply_frame(struct ASurfaceTransaction *batch, int64_t arrival_ns, int ready_fd);
 void sc_layer_cadence_log(void);
+/* A frame of the main game window that pacing could not plan while the toggle is on (compositor thread). */
+enum { SC_CADENCE_FILTER = 0, SC_CADENCE_ZEROFG = 1 };
+void sc_layer_cadence_note_unpaced(int why);
 int sc_layer_present_vortek(int slot, int z, AHardwareBuffer *ahb, int buf_w, int buf_h, int acquire_fd, void *token,
                             int x, int y, int w, int h, int scene_w, int scene_h, struct ASurfaceTransaction *batch);
 /* [mali-g2] Places Vortek layer `slot`, showing a buf_w x buf_h buffer of the game's own (not a pool

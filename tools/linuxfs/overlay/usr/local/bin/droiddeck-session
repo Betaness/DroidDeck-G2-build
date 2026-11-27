@@ -1218,6 +1218,14 @@ case $mode in
           esac
           return 1
         }
+        # [mali-g2] Said once: where the app may not read PSI (SELinux on HyperOS), the stall share stays 0
+        # and only MemAvailable decides how much to trim.
+        bl_memory_psi_note() {
+          [ -z "${_bl_psi_said:-}" ] && [ -n "${_bl_sample_at:-}" ] || return 0
+          _bl_psi_said=1
+          [ "${_bl_sample_stall:-0}" -ge 0 ] ||
+            step "memory: the kernel's memory pressure (PSI) is not readable here, so trims follow MemAvailable alone"
+        }
         bl_memory_tick() {
           if [ $((SECONDS - _bl_scan_at)) -ge 5 ]; then
             _bl_scan_at=$SECONDS
@@ -1233,6 +1241,7 @@ case $mode in
             fi
           fi
           bl_memory_read
+          bl_memory_psi_note
           [ ! -e /tmp/.bl-zram.hold ] || return 0
           bl_memory_relieve
           bl_memory_note

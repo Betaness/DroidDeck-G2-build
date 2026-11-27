@@ -74,6 +74,15 @@ class MemoryPressureTest(unittest.TestCase):
                 'NOW=3; bl_memory_read; echo $_bl_psi\n')
         self.assertEqual(['0', '200', '0'], self.run_policy(body))
 
+    def test_unreadable_pressure_is_said_once(self):
+        unreadable = self.sample() + f'rm {self.root}/pressure\n'
+        body = ('step() { echo "$*"; }\nbl_memory_psi_note\n' + unreadable +
+                'bl_memory_read; bl_memory_psi_note; NOW=1; bl_memory_read; bl_memory_psi_note; echo $_bl_psi\n')
+        self.assertEqual(["memory: the kernel's memory pressure (PSI) is not readable here, so trims follow MemAvailable alone", '0'],
+                         self.run_policy(body, 'bl_memory_psi_note'))
+        readable = 'step() { echo "$*"; }\n' + self.sample(stall=1000) + 'bl_memory_read; bl_memory_psi_note; echo done\n'
+        self.assertEqual(['done'], self.run_policy(readable, 'bl_memory_psi_note'))
+
     def test_room_counts_zram_only_and_keeps_a_reserve(self):
         body = (self.sample(zram=(6144, 1024)) + 'bl_memory_read; echo $((_bl_swap_room / 1024))\n' +
                 self.sample(zram=(6144, 5632)) + 'bl_memory_read; echo $((_bl_swap_room / 1024))\n' +

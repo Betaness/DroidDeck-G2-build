@@ -6,8 +6,10 @@
 #define PRESENT_CADENCE_WAITS 128
 #define PRESENT_CADENCE_SPARE_FRAMES 128
 #define PRESENT_CADENCE_RATE_FRAMES 8
-#define PRESENT_CADENCE_ENTER_VSYNCS 12
-#define PRESENT_CADENCE_EXIT_VSYNCS 10
+/* [mali-g2] Pacing starts after PRESENT_CADENCE_RATE_FRAMES gaps of one whole number (at least 2) of
+ * refreshes, and ends once more than PRESENT_CADENCE_ODD_GAPS of the last ones differ from it or their
+ * sum is two refreshes off it. */
+#define PRESENT_CADENCE_ODD_GAPS 2
 #define PRESENT_CADENCE_MAX_GAP_VSYNCS 8
 #define PRESENT_CADENCE_MARGIN_NS 1000000LL
 #define PRESENT_CADENCE_APPLY_NS 1000000LL
@@ -23,6 +25,7 @@ struct present_cadence {
     unsigned gaps[PRESENT_CADENCE_RATE_FRAMES];
     unsigned n_gaps, next_gap;
     int pacing;
+    unsigned cadence;
     int cadence_ok;
     unsigned spare_frames;
     unsigned interval;

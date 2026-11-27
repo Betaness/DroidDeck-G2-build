@@ -432,6 +432,8 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
     const int up = zfg == ZFG_SHOWN ? VKU_SHOWN : zfg == ZFG_TAKEN ? VKU_TAKEN : vku_present(&vf, acquire_fd, batch(), &why);
     int r = 0;
     const int paced = up == VKU_DIRECT && vf.main_window && sc_layer_present_cadence_on();
+    if (up != VKU_DIRECT && vf.main_window && sc_layer_present_cadence_on())
+        sc_layer_cadence_note_unpaced(zfg != ZFG_DIRECT ? SC_CADENCE_ZEROFG : SC_CADENCE_FILTER);
     const int ready_fd = paced && acquire_fd >= 0 ? fcntl(acquire_fd, F_DUPFD_CLOEXEC, 0) : -1;
     if (up == VKU_DIRECT)
         r = sc_layer_present_vortek(slot, z, c->ahb[m->index], (int)c->w, (int)c->h, acquire_fd,

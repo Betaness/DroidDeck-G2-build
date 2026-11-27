@@ -1,5 +1,6 @@
 package com.droiddeck.launcher.core
 
+import android.content.Context
 import android.os.Process
 import android.util.Log
 import java.io.BufferedWriter
@@ -108,7 +109,30 @@ object SessionLogCapture {
         }
     }
 
-    fun dumpMemoryPressure(target: File) {
+    /** Upstream #2758: lmkd's lines and kill records, and system_server's kills, which an app cannot read itself. */
+    internal const val LMKD_COMMAND = "logcat -d -b main,events -v threadtime -s lowmemorykiller:D killinfo:I am_kill:I" +
+        " | grep -v -E 'pgskip|zoneinfo_parse|polling check|thrashing:' | tail -n 160"
+
+    /** The counters of /proc/vmstat that show reclaim and swapping (readable where PSI is not). */
+    internal fun vmstatLines(text: String): String = text.lineSequence()
+        .filter { line -> VMSTAT_PREFIXES.any { line.startsWith(it) } }
+        .joinToString("") { it + "\n" }
+        .ifEmpty { "unavailable\n" }
+
+    private val VMSTAT_PREFIXES = listOf(
+        "pswpin ", "pswpout ", "pgmajfault ", "pgscan_", "pgsteal_", "allocstall_", "workingset_refault",
+        "compact_stall ", "oom_kill ",
+    )
+
+    internal fun lowMemoryKiller(paired: Boolean, read: () -> String): String = when {
+        !paired -> "(not captured: no Wireless debugging pairing is saved in DroidDeck)\n"
+        else -> runCatching { read() }.fold(
+            { it.ifBlank { "(no lmkd or kill lines in the log)\n" } },
+            { "(not captured: ${it.message})\n" },
+        )
+    }
+
+    fun dumpMemoryPressure(target: File, context: Context? = null) {
         var temporary: File? = null
         try {
             val staged = File.createTempFile(target.name, ".part", target.parentFile).also { temporary = it }
@@ -131,9 +155,13 @@ object SessionLogCapture {
             }
             val body = synchronized(lines) { lines.toString() }
             val status = exitStatus.get()
-            val pressure = runCatching { File("/proc/pressure/memory").readText() }.getOrDefault("unavailable\n")
+            val pressure = runCatching { File("/proc/pressure/memory").readText() }.getOrDefault(
+                "unavailable (this app may not read it; the session's memory watcher then goes by MemAvailable alone)\n")
             val meminfo = runCatching { File("/proc/meminfo").readText() }.getOrDefault("unavailable\n")
+            val vmstat = runCatching { vmstatLines(File("/proc/vmstat").readText()) }.getOrDefault("unavailable\n")
             val gpu = runCatching { File("/sys/class/kgsl/kgsl/page_alloc").readText() }.getOrDefault("unavailable\n")
+            val killer = if (context == null) "(not captured: read only when the next start finishes a session that was killed)\n" else
+                lowMemoryKiller(WirelessAdbFix.hasSavedPairing(context)) { WirelessAdbFix.shell(context, LMKD_COMMAND) }
             staged.writeText(
                 "Android memory events:\n" +
                     when {
@@ -145,7 +173,9 @@ object SessionLogCapture {
                         body.isNotEmpty() -> body
                         else -> "(no readable events were returned)\n"
                     } +
-                    "\n/proc/pressure/memory:\n$pressure\n/proc/meminfo:\n$meminfo\n/sys/class/kgsl/kgsl/page_alloc:\n$gpu"
+                    "\n/proc/pressure/memory:\n$pressure\n/proc/meminfo:\n$meminfo\n/proc/vmstat (reclaim and swap):\n$vmstat" +
+                    "\n/sys/class/kgsl/kgsl/page_alloc:\n$gpu" +
+                    "\nAndroid's low memory killer (lmkd) and system kills, read over Wireless debugging:\n$killer"
             )
             Files.move(
                 staged.toPath(), target.toPath(),

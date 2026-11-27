@@ -91,6 +91,59 @@ static struct run simulate_run(int paced, int zero_copy, int64_t period, const c
     return r;
 }
 
+/* A stream at a steady rate that need not be a whole number of refreshes (a game's own limiter, or no
+ * limit): frame i arrives at i * interval, with jitter, and every hiccup_every-th frame hiccup later.
+ * off counts shown gaps other than the interval rounded to refreshes. */
+static struct run simulate_stream(int paced, int zero_copy, int64_t period, int64_t interval, int64_t wait_max,
+                                  int64_t jitter, int hiccup_every, int64_t hiccup, int frames, int warmup) {
+    const int64_t grid = 1000 * MS + 3 * MS, lead = 7 * MS, k = (interval + period / 2) / period;
+    struct present_cadence c;
+    present_cadence_reset(&c);
+    struct run r = {0};
+    int64_t *arrival = calloc((size_t)frames, sizeof(int64_t));
+    int64_t *apply = calloc((size_t)frames, sizeof(int64_t));
+    int64_t *done = calloc((size_t)frames, sizeof(int64_t));
+    int64_t prev_ref = 0, prev_done = 0;
+    g_seed = 777;
+    for (int i = 0; i < frames; i++) {
+        arrival[i] = 1000 * MS + 1234567 + (int64_t)(i + 1) * interval + rand_ns(2 * jitter) - jitter +
+                     (hiccup_every && i % hiccup_every == hiccup_every - 1 ? hiccup : 0);
+        done[i] = arrival[i] + rand_ns(wait_max);
+        const int64_t applied = zero_copy ? arrival[i] : done[i];
+        apply[i] = applied;
+        if (paced) {
+            const int64_t target = present_cadence_plan(&c, arrival[i], grid, period, lead);
+            if (target && target - lead - PRESENT_CADENCE_APPLY_NS > applied)
+                apply[i] = target - lead - PRESENT_CADENCE_APPLY_NS;
+            for (int j = i - 1; !target && j >= 0 && apply[j] > applied; j--) apply[j] = applied;
+            if (zero_copy) {
+                if (prev_ref) present_cadence_note_wait(&c, prev_done - prev_ref);
+                prev_ref = c.planned_ref_ns;
+                prev_done = done[i];
+            }
+            if (present_cadence_applied(&c, applied) && i >= warmup) r.late++;
+            if (target && i >= warmup) r.paced++;
+        }
+    }
+    int64_t shown_prev = 0;
+    for (int i = 0; i < frames; i++) {
+        int64_t v = at_or_after((apply[i] > done[i] ? apply[i] : done[i]) + lead, grid, period);
+        if (i && v <= shown_prev) v = shown_prev + period;
+        if (i >= warmup) {
+            if ((v - shown_prev + period / 2) / period != k) r.off++;
+            r.frames++;
+            const int64_t latency = v - arrival[i];
+            r.latency_sum += latency;
+            if (latency > r.latency_max) r.latency_max = latency;
+        }
+        shown_prev = v;
+    }
+    free(arrival);
+    free(apply);
+    free(done);
+    return r;
+}
+
 static struct run simulate_path(int paced, int zero_copy, int64_t period, const char *gaps, int64_t wait_max,
                                 int64_t jitter, int frames, int warmup) {
     return simulate_run(paced, zero_copy, period, gaps, wait_max, jitter, frames, warmup, 0);
@@ -175,10 +228,77 @@ static void test_fast_streams_stay_unpaced(void) {
     expect(mostly.paced == 0, "mostly full rate", mostly);
 }
 
-static void test_mixed_cadence(void) {
-    struct run before = simulate(0, P120, "12", 10 * MS, 1 * MS, 2000, 300);
-    struct run after = simulate(1, P120, "12", 10 * MS, 1 * MS, 2000, 300);
-    expect(after.off * 100 <= after.frames && after.off < before.off, "1 and 2 refreshes", after);
+/* [mali-g2] A stream whose frames do not come a whole number of refreshes apart cannot be shown evenly;
+ * holding its frames only adds latency, so it is not paced. */
+static void test_mixed_cadences_stay_unpaced(void) {
+    const char *cadences[] = {"12", "23", "122", "1222"};
+    for (unsigned i = 0; i < 4; i++) {
+        struct run before = simulate(0, P120, cadences[i], 10 * MS, 1 * MS, 2000, 300);
+        struct run after = simulate(1, P120, cadences[i], 10 * MS, 1 * MS, 2000, 300);
+        expect(after.paced == 0 && after.off == before.off, cadences[i], after);
+    }
+}
+
+static int64_t avg_latency(struct run r) { return r.frames ? r.latency_sum / r.frames : 0; }
+
+/* [mali-g2] Uncapped games at rates between whole refreshes (Duckov 85-87 fps at 144 Hz, 65 fps at
+ * 120 Hz, 28 fps while the panel is held at 60 Hz), zero-copy with up to 10 ms of GPU work after
+ * arrival: the planner used to hold them and their latency climbed to its 100 ms limit. */
+static void test_free_running_streams_keep_their_latency(void) {
+    const struct { int64_t period; double fps; } cases[] = {
+        {P144, 85}, {P144, 87}, {P144, 80}, {P144, 95}, {P120, 65}, {P120, 75}, {16666667LL, 28}, {16666667LL, 45},
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const int64_t interval = (int64_t)(1e9 / cases[i].fps), p = cases[i].period;
+        struct run before = simulate_stream(0, 1, p, interval, 10 * MS, 1 * MS, 0, 0, 6000, 600);
+        struct run after = simulate_stream(1, 1, p, interval, 10 * MS, 1 * MS, 0, 0, 6000, 600);
+        if (avg_latency(after) > avg_latency(before) + p || after.latency_max > before.latency_max + 2 * p) {
+            fprintf(stderr, "%.0f fps at %.0f Hz: ", cases[i].fps, 1e9 / p);
+            report("paced", after);
+            report("unpaced", before);
+            exit(1);
+        }
+    }
+}
+
+/* [mali-g2] Uncapped rates just off a whole number of refreshes (73-77 fps at 144 Hz, 61-62 fps at
+ * 120 Hz) look like a steady cadence but drift against it: their latency stays bounded. */
+static void test_near_whole_rates_stay_bounded(void) {
+    const struct { int64_t period; double fps; } cases[] = {
+        {P144, 73}, {P144, 75}, {P144, 77}, {P144, 70}, {P144, 49}, {P120, 61}, {P120, 62}, {P120, 58},
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const int64_t interval = (int64_t)(1e9 / cases[i].fps), p = cases[i].period;
+        struct run before = simulate_stream(0, 1, p, interval, 10 * MS, 1 * MS, 0, 0, 6000, 600);
+        struct run after = simulate_stream(1, 1, p, interval, 10 * MS, 1 * MS, 0, 0, 6000, 600);
+        if (avg_latency(after) > avg_latency(before) + 5 * p / 2 || after.latency_max > before.latency_max + 3 * p) {
+            fprintf(stderr, "%.0f fps at %.0f Hz: ", cases[i].fps, 1e9 / p);
+            report("paced", after);
+            report("unpaced", before);
+            exit(1);
+        }
+    }
+}
+
+/* [mali-g2] Games held to a whole number of refreshes by their own limiter (not locked to vsync): the
+ * cadence is kept, and a frame that comes 10 ms late every 100 frames does not ratchet the latency up. */
+static void test_capped_streams_keep_their_cadence(void) {
+    const struct { int64_t period; double fps; int hiccups; } cases[] = {
+        {P144, 72, 0}, {P144, 48, 0}, {P120, 60, 0}, {P120, 40, 0}, {P144, 72, 100}, {P120, 60, 100}, {P144, 48, 60},
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const int64_t interval = (int64_t)(1e9 / cases[i].fps), p = cases[i].period;
+        const int64_t hiccup = cases[i].hiccups ? 10 * MS : 0;
+        struct run before = simulate_stream(0, 1, p, interval, 10 * MS, 1 * MS, cases[i].hiccups, hiccup, 6000, 600);
+        struct run after = simulate_stream(1, 1, p, interval, 10 * MS, 1 * MS, cases[i].hiccups, hiccup, 6000, 600);
+        const unsigned allowed = cases[i].hiccups ? after.frames / 16 : after.frames / 100;
+        if (after.off > allowed || after.off * 4 > before.off || avg_latency(after) > avg_latency(before) + 3 * p) {
+            fprintf(stderr, "%.0f fps at %.0f Hz, a hiccup every %d frames: ", cases[i].fps, 1e9 / p, cases[i].hiccups);
+            report("paced", after);
+            report("unpaced", before);
+            exit(1);
+        }
+    }
 }
 
 static void test_full_rate_ends_the_hold(void) {
@@ -299,7 +419,10 @@ int main(int argc, char **argv) {
     test_cadences_at_144_hz();
     test_light_load_adds_no_refresh();
     test_fast_streams_stay_unpaced();
-    test_mixed_cadence();
+    test_mixed_cadences_stay_unpaced();
+    test_free_running_streams_keep_their_latency();
+    test_near_whole_rates_stay_bounded();
+    test_capped_streams_keep_their_cadence();
     test_full_rate_ends_the_hold();
     test_latency_comes_back_after_load_drops();
     test_pause_and_missing_timeline_start_over();

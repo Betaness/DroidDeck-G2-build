@@ -72,6 +72,7 @@ static struct {
     const void *(*getNativeHandle)(const AHardwareBuffer *);
     void (*setDesiredHdrHeadroom)(ASurfaceTransaction *, ASurfaceControl *, float);
     void (*setDesiredPresentTime)(ASurfaceTransaction *, int64_t);
+    int64_t (*latchTime)(ASurfaceTransactionStats *);
     int state;
 } api;
 
@@ -107,6 +108,7 @@ static int load_api(void) {
     SYM(reparent, "ASurfaceTransaction_reparent");
     SYM(setOnComplete, "ASurfaceTransaction_setOnComplete");
     SYM(prevReleaseFence, "ASurfaceTransactionStats_getPreviousReleaseFenceFd");
+    SYM(latchTime, "ASurfaceTransactionStats_getLatchTime");
     SYM(setFrameRate, "ASurfaceTransaction_setFrameRate");
     SYM(setFrameRateStrategy, "ASurfaceTransaction_setFrameRateWithChangeStrategy");
     SYM(setBufferDataSpace, "ASurfaceTransaction_setBufferDataSpace");
@@ -311,7 +313,7 @@ static AHardwareBuffer *make_blank(AHardwareBuffer **out) {
 static AHardwareBuffer *blank_buffer(void) { return make_blank(&g_blank); }
 
 /* [mali-g2] Even frame pacing (upstream #2743, adapted to the Vortek zero-copy layers): while it is on
- * and the main game window's frames come at least 1.5 refreshes apart, each of them is held for a
+ * and the main game window's frames keep to a cadence of a whole number of refreshes, each is held for a
  * refresh on the stream's cadence and applied by the presenter thread "dd-present" PRESENT_CADENCE_APPLY_NS
  * before SurfaceFlinger's deadline for it. On every refresh in between the presenter swaps the buffer
  * of a transparent 16x16 layer under the game, so every refresh is presented and SurfaceFlinger cannot
@@ -1068,17 +1070,60 @@ void sc_layer_tx_apply(struct ASurfaceTransaction *batch) {
 }
 
 static atomic_int g_cadence_on;
+/* Set when the toggle goes off; the compositor thread, which owns the planner, forgets the stream. */
+static atomic_int g_cadence_forget;
 static struct present_cadence g_cadence;
 static struct present_cadence_stats g_cadence_stats;
 static int g_ready_fd = -1;
-static int64_t g_ready_ref_ns;
+static int64_t g_ready_ref_ns, g_ready_deadline_ns;
 static int g_cadence_said = -1;
+static const char *g_cadence_why;
+static unsigned g_cadence_filtered, g_cadence_zerofg;
+
+/* What SurfaceFlinger did with the main game window's frames while the toggle is on, from their
+ * transactions' latch times (each is shown at the refresh after its latch). SurfaceFlinger latches at
+ * the deadline of a refresh, so a held frame latched more than half a refresh after the deadline of its
+ * planned refresh missed it. */
+#define SHOWN_GAPS 5
+static pthread_mutex_t g_shown_lock = PTHREAD_MUTEX_INITIALIZER;
+static int64_t g_shown_last_ns;
+static unsigned g_shown[SHOWN_GAPS], g_shown_unknown, g_shown_late;
+
+struct frame_ctx {
+    int64_t deadline_ns, period_ns;
+};
+
+static void on_frame_complete(void *context, ASurfaceTransactionStats *stats) {
+    struct frame_ctx *f = context;
+    const int64_t latch = stats && api.latchTime ? api.latchTime(stats) : -1;
+    pthread_mutex_lock(&g_shown_lock);
+    if (latch <= 0 || f->period_ns <= 0) {
+        g_shown_unknown++;
+    } else {
+        if (g_shown_last_ns && latch >= g_shown_last_ns) {
+            const int64_t gap = (latch - g_shown_last_ns + f->period_ns / 2) / f->period_ns;
+            if (gap <= PRESENT_CADENCE_MAX_GAP_VSYNCS) g_shown[gap < SHOWN_GAPS - 1 ? gap : SHOWN_GAPS - 1]++;
+        }
+        g_shown_last_ns = latch;
+        if (f->deadline_ns && latch > f->deadline_ns + f->period_ns / 2) g_shown_late++;
+    }
+    pthread_mutex_unlock(&g_shown_lock);
+    free(f);
+}
 
 static void cadence_forget(void) {
     present_cadence_reset(&g_cadence);
     if (g_ready_fd >= 0) close(g_ready_fd);
     g_ready_fd = -1;
-    g_ready_ref_ns = 0;
+    g_ready_ref_ns = g_ready_deadline_ns = 0;
+    g_cadence_said = -1;
+    pthread_mutex_lock(&g_shown_lock);
+    g_shown_last_ns = 0;
+    pthread_mutex_unlock(&g_shown_lock);
+}
+
+static void cadence_forget_if_off(void) {
+    if (atomic_exchange(&g_cadence_forget, 0)) cadence_forget();
 }
 
 int sc_layer_present_cadence_on(void) { return atomic_load(&g_cadence_on); }
@@ -1086,11 +1131,17 @@ int sc_layer_present_cadence_on(void) { return atomic_load(&g_cadence_on); }
 void sc_layer_set_present_cadence(int on) {
     atomic_store(&g_cadence_on, on ? 1 : 0);
     if (on) return;
+    atomic_store(&g_cadence_forget, 1);
     pthread_mutex_lock(&g_pacer_lock);
     pacer_flush_locked();
     g_pacer_fill_until_ns = 0;
     if (g_pacer_ok) pthread_cond_signal(&g_pacer_cond);
     pthread_mutex_unlock(&g_pacer_lock);
+}
+
+void sc_layer_cadence_note_unpaced(int why) {
+    if (why == SC_CADENCE_ZEROFG) g_cadence_zerofg++;
+    else g_cadence_filtered++;
 }
 
 void sc_layer_frame_timeline(int64_t present_ns, int64_t deadline_ns, int64_t period_ns) {
@@ -1113,17 +1164,20 @@ static int64_t fence_signal_ns(int fd) {
 
 /* A zero-copy frame is committed before the game's GPU work on it is done, and SurfaceFlinger takes
  * it only once its fence has signalled: the planner learns that wait from the fence's signal time,
- * read when the next frame arrives. */
-static void zero_copy_ready(int64_t ref_ns, int fd) {
+ * read when the next frame arrives. A held frame whose fence signalled after the deadline of its
+ * refresh was ready too late for it. */
+static void zero_copy_ready(int64_t ref_ns, int fd, int64_t deadline_ns) {
     if (g_ready_fd >= 0) {
         int64_t done = fence_signal_ns(g_ready_fd);
         if (!done) done = now_ns();
         if (g_ready_ref_ns && done - g_ready_ref_ns < PRESENT_CADENCE_MAX_AHEAD_NS)
             present_cadence_note_wait(&g_cadence, done - g_ready_ref_ns);
+        if (g_ready_deadline_ns && done > g_ready_deadline_ns) g_cadence_stats.late++;
         close(g_ready_fd);
     }
     g_ready_fd = ref_ns ? fd : -1;
     g_ready_ref_ns = ref_ns;
+    g_ready_deadline_ns = ref_ns ? deadline_ns : 0;
     if (!ref_ns && fd >= 0) close(fd);
 }
 
@@ -1132,6 +1186,7 @@ void sc_layer_tx_apply_frame(struct ASurfaceTransaction *batch, int64_t arrival_
         if (ready_fd >= 0) close(ready_fd);
         return;
     }
+    cadence_forget_if_off();
     if (!atomic_load(&g_cadence_on)) {
         if (ready_fd >= 0) close(ready_fd);
         cadence_forget();
@@ -1141,14 +1196,22 @@ void sc_layer_tx_apply_frame(struct ASurfaceTransaction *batch, int64_t arrival_
     int64_t grid = 0, lead = 0, period = 0;
     if (!present_cadence_timeline(arrival_ns, &grid, &lead, &period)) grid = lead = period = 0;
     const int64_t target = present_cadence_plan(&g_cadence, arrival_ns, grid, period, lead);
-    zero_copy_ready(g_cadence.planned_ref_ns, ready_fd);
-    if (present_cadence_applied(&g_cadence, now_ns())) g_cadence_stats.late++;
+    zero_copy_ready(g_cadence.planned_ref_ns, ready_fd, target ? target - lead : 0);
+    present_cadence_applied(&g_cadence, now_ns());
     if (g_cadence.pacing != g_cadence_said) {
         if (g_cadence_said >= 0 || g_cadence.pacing)
             droiddeck_log("layer", g_cadence.pacing ? "even frame pacing: game frames held to a %u-refresh cadence"
-                                                    : "even frame pacing: game frames come too often (last gap %u refreshes), shown at once",
-                          g_cadence.interval);
+                                                    : "even frame pacing: game frames left a whole-refresh cadence (last gap %u refreshes), shown at once",
+                          g_cadence.pacing ? g_cadence.cadence : g_cadence.interval);
         g_cadence_said = g_cadence.pacing;
+    }
+    if (api.latchTime) {
+        struct frame_ctx *f = calloc(1, sizeof(*f));
+        if (f) {
+            f->deadline_ns = target ? target - lead : 0;
+            f->period_ns = period;
+            api.setOnComplete(batch, f, on_frame_complete);
+        }
     }
     if (!target) pacer_flush();
     if (!pacer_submit(batch, target)) {
@@ -1157,12 +1220,22 @@ void sc_layer_tx_apply_frame(struct ASurfaceTransaction *batch, int64_t arrival_
     }
     const int64_t latency = target - arrival_ns;
     g_cadence_stats.paced++;
-    g_cadence_stats.interval = g_cadence.interval;
+    g_cadence_stats.interval = g_cadence.cadence;
     g_cadence_stats.latency_ns += latency;
     if (latency > g_cadence_stats.latency_max_ns) g_cadence_stats.latency_max_ns = latency;
 }
 
+/* With the toggle on, why no frame of the main game window reached the planner. */
+static const char *cadence_waits(const struct present_cadence_stats *st) {
+    if (st->paced || st->unpaced) return NULL;
+    if (g_cadence_zerofg) return "ZeroFG shows the game's frames";
+    if (g_cadence_filtered) return "the game's frames go through the scaling filter";
+    return "no frame of the game's main window came on a zero-copy layer (it is drawn through the copy path, "
+           "is not drawing, or is not the main window)";
+}
+
 void sc_layer_cadence_log(void) {
+    cadence_forget_if_off();
     struct present_cadence_stats st = g_cadence_stats;
     memset(&g_cadence_stats, 0, sizeof(g_cadence_stats));
     st.fillers = atomic_exchange(&g_pacer_fillers, 0u);
@@ -1170,13 +1243,29 @@ void sc_layer_cadence_log(void) {
     st.woke_late = atomic_exchange(&g_pacer_woke_late, 0u);
     st.skipped = atomic_exchange(&g_pacer_skipped, 0u);
     st.lead_ns = atomic_load(&g_pacer_lead_ns);
-    if (!atomic_load(&g_cadence_on) && !st.paced && !st.fillers) return;
+    unsigned shown[SHOWN_GAPS], unknown, shown_late;
+    pthread_mutex_lock(&g_shown_lock);
+    memcpy(shown, g_shown, sizeof(shown));
+    unknown = g_shown_unknown;
+    shown_late = g_shown_late;
+    memset(g_shown, 0, sizeof(g_shown));
+    g_shown_unknown = g_shown_late = 0;
+    pthread_mutex_unlock(&g_shown_lock);
+    const int on = atomic_load(&g_cadence_on);
+    const char *why = on ? cadence_waits(&st) : NULL;
+    if (why && why != g_cadence_why) droiddeck_log("pacing", "even frame pacing waits: %s", why);
+    g_cadence_why = why;
+    g_cadence_filtered = g_cadence_zerofg = 0;
+    if (!on && !st.paced && !st.fillers) return;
     if (!st.paced && !st.unpaced && !st.fillers) return;
     droiddeck_log("pacing", "even frame pacing last 10 s: %u frames held to a %u-refresh cadence, %u shown at once, "
-                  "%u ready too late | arrival to screen %.1f/%.1f ms | %u filler refreshes, %u refreshes left empty, "
+                  "%u ready after their refresh's deadline | arrival to screen %.1f/%.1f ms planned | shown "
+                  "%u/%u/%u/%u/%u refreshes after the frame before (0/1/2/3/4+), %u held frames latched after "
+                  "their refresh's deadline, %u without a latch time | %u filler refreshes, %u refreshes left empty, "
                   "%u frames past their refresh, %u late presenter wake-ups | deadline lead %.1f ms",
                   st.paced, st.interval, st.unpaced, st.late,
                   st.paced ? (double)st.latency_ns / 1e6 / st.paced : 0.0, (double)st.latency_max_ns / 1e6,
+                  shown[0], shown[1], shown[2], shown[3], shown[4], shown_late, unknown,
                   st.fillers, st.skipped, st.overdue, st.woke_late, (double)st.lead_ns / 1e6);
 }
 

@@ -63,18 +63,29 @@ static int64_t max_wait(const struct present_cadence *c) {
 
 static void leave_pacing(struct present_cadence *c) {
     c->pacing = 0;
+    c->cadence = 0;
     c->cadence_ok = 0;
     c->spare_frames = 0;
     c->n_gaps = c->next_gap = 0;
 }
 
-static unsigned note_gap(struct present_cadence *c, int64_t k) {
-    c->gaps[c->next_gap] = (unsigned)k;
+static void note_gap(struct present_cadence *c, unsigned k) {
+    c->gaps[c->next_gap] = k;
     c->next_gap = (c->next_gap + 1) % PRESENT_CADENCE_RATE_FRAMES;
     if (c->n_gaps < PRESENT_CADENCE_RATE_FRAMES) c->n_gaps++;
-    unsigned sum = 0;
-    for (unsigned i = 0; i < c->n_gaps; i++) sum += c->gaps[i];
-    return sum;
+}
+
+/* Whether the gaps in the window keep to a cadence of k refreshes: all of them for a new cadence; for
+ * one already held, at most PRESENT_CADENCE_ODD_GAPS others whose sum stays within a refresh of k
+ * each (a late frame and the early one after it), not a stream that drifts against it. */
+static int keeps_cadence(const struct present_cadence *c, unsigned k, unsigned odd_allowed) {
+    unsigned odd = 0;
+    int64_t drift = 0;
+    for (unsigned i = 0; i < c->n_gaps; i++) {
+        odd += c->gaps[i] != k;
+        drift += (int64_t)c->gaps[i] - (int64_t)k;
+    }
+    return odd <= odd_allowed && llabs(drift) <= 1;
 }
 
 int64_t present_cadence_plan(struct present_cadence *c, int64_t arrival_ns, int64_t grid_ns,
@@ -96,12 +107,15 @@ int64_t present_cadence_plan(struct present_cadence *c, int64_t arrival_ns, int6
     } else {
         k = (d + period_ns / 2) / period_ns;
         c->arrival_ref_ns += k * period_ns + (d - k * period_ns) / 8;
-        const unsigned sum = note_gap(c, k);
-        if (!c->pacing && c->n_gaps == PRESENT_CADENCE_RATE_FRAMES && sum >= PRESENT_CADENCE_ENTER_VSYNCS) {
+        note_gap(c, (unsigned)k);
+        /* [mali-g2] Only a steady whole-refresh cadence: frames between whole refreshes cannot be shown
+         * evenly, and holding them only adds latency. */
+        if (!c->pacing && c->n_gaps == PRESENT_CADENCE_RATE_FRAMES && k >= 2 && keeps_cadence(c, (unsigned)k, 0)) {
             c->pacing = 1;
+            c->cadence = (unsigned)k;
             c->cadence_ok = 0;
             c->spare_frames = 0;
-        } else if (c->pacing && sum < PRESENT_CADENCE_EXIT_VSYNCS) {
+        } else if (c->pacing && !keeps_cadence(c, c->cadence, PRESENT_CADENCE_ODD_GAPS)) {
             leave_pacing(c);
         }
         c->interval = (unsigned)k;
@@ -124,7 +138,8 @@ int64_t present_cadence_plan(struct present_cadence *c, int64_t arrival_ns, int6
             c->spare_frames = 0;
             target = first;
         } else if (step >= 2 && locked - period_ns >= first) {
-            if (++c->spare_frames >= PRESENT_CADENCE_SPARE_FRAMES) {
+            /* [mali-g2] Two spare refreshes: the stream runs faster than its cadence, give one back now. */
+            if (locked - 2 * period_ns >= first || ++c->spare_frames >= PRESENT_CADENCE_SPARE_FRAMES) {
                 c->spare_frames = 0;
                 target = locked - period_ns;
             } else {

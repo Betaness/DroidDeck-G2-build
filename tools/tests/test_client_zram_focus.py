@@ -102,7 +102,8 @@ run() { for NOW in $(seq "$1" "$2"); do bl_memory_tick; done; }
 
     def tick(self, body):
         functions = '\n'.join(function_source(name) for name in (
-            'bl_memory_need', 'bl_memory_relieve', 'bl_memory_note', 'bl_client_readback', 'bl_memory_tick'))
+            'bl_memory_need', 'bl_memory_relieve', 'bl_memory_note', 'bl_client_readback', 'bl_memory_psi_note',
+            'bl_memory_tick'))
         with tempfile.TemporaryDirectory() as tmp:
             script = (functions + self.TICK + body).replace('/tmp/.bl-zram', tmp + '/ctl')
             result = run_bash(('NOW=0\nset -u\n' + STATE + script).replace('SECONDS', 'NOW'))

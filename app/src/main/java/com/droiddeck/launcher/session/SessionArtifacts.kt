@@ -684,7 +684,7 @@ object SessionArtifacts {
                 }
                 val memoryLog = File(dir, "memory-pressure.log")
                 if (newest && !memoryLog.exists()) {
-                    SessionLogCapture.dumpMemoryPressure(memoryLog)
+                    SessionLogCapture.dumpMemoryPressure(memoryLog, context)
                 }
                 if (stopWhenSessionStarts && SessionState.running) {
                     record.failed = true
