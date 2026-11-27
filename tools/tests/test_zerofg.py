@@ -93,5 +93,38 @@ class ZeroFgVendoredTest(unittest.TestCase):
                 self.assertTrue(header.stem in sources or base in sources or any(s.startswith(base) for s in sources),
                                 header.name)
 
+def stats_format():
+    """The format string of zerofg_zc.c's stats line (its adjacent literals joined, escapes as written)."""
+    source = (WAYLANDCOMP / "src/zerofg_zc.c").read_text(encoding="utf-8")
+    pos = source.index('ZLOG("stats ') + len("ZLOG(")
+    literal = re.compile(r'\s*"((?:[^"\\]|\\.)*)"')
+    parts = []
+    while (m := literal.match(source, pos)):
+        parts.append(m.group(1))
+        pos = m.end()
+    return "".join(parts)
+
+
+class ZeroFgStatsLineTest(unittest.TestCase):
+    CONVERSION = re.compile(r"%[-#+ 0]*\d*(?:\.\d+)?(?:ll|l|z|h)?[diouxXfFeEgGsc%]")
+    # the widest values the fields take: counts over 5 s, sizes up to 16384, ms and fps below 10000, names
+    WIDTH = {"d": 5, "i": 5, "u": 6, "f": 8, "s": 7}
+
+    def test_fits_the_log_buffer(self):
+        fmt = stats_format()
+        conversions = self.CONVERSION.findall(fmt)
+        self.assertGreater(len(conversions), 40)
+        widest = len(self.CONVERSION.sub("", fmt)) + sum(self.WIDTH.get(c[-1], 8) for c in conversions)
+        compositor = (WAYLANDCOMP / "src/compositor.c").read_text(encoding="utf-8")
+        body = compositor[compositor.index("void droiddeck_log(const char *tag, const char *fmt, ...) {"):]
+        size = int(re.search(r"char msg\[(\d+)\];", body).group(1))
+        self.assertLess(widest, size, f"the stats line takes up to {widest} bytes, droiddeck_log keeps {size - 1}")
+
+    def test_documented_fields(self):
+        doc = (WAYLANDCOMP / "ZEROFG.md").read_text(encoding="utf-8")
+        block = re.search(r"`stats 5\.0s ([^`]*)`", doc).group(1)
+        self.assertEqual(re.findall(r"(\w+)=", stats_format()), re.findall(r"(\w+)=", block))
+
+
 if __name__ == "__main__":
     unittest.main()

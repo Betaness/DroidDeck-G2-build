@@ -370,10 +370,12 @@ struct tx {
 struct sim {
     /* input */
     int64_t refresh, sf_latch, phase, margin, latch, gen_ns, gen_more, render_ns, jitter;
+    int render_slow_every;  /* every this many frames B takes render_slow_ns to render (0: never) */
+    int64_t render_slow_ns;
     float peak, running;  /* running: the panel's rate as zerofg_zc.c sees it (0: 1e9 / refresh) */
     int dpt;
     int mult;           /* the multiplier asked for (0: x2) */
-    double gpu_ms;      /* GPU time per generated frame zfg_mult_update is given (0: unknown) */
+    double gpu_first, gpu_phase; /* GPU time of a pair's first and of each further call zfg_mult_update is given */
     int64_t (*period_of)(int n);
     int restart_at;     /* forget the previous frame at this frame (a hidden window, a new swapchain) */
     int64_t (*map_at)(int64_t t); /* the mapping in force at t (0: none given, all 0) */
@@ -382,6 +384,8 @@ struct sim {
     int s_map_at_arrival; /* place generated frames with the mapping of their real frame's arrival (not done) */
     /* output */
     int frames, s_made, s_shown, b_shown, b_lost_after_warmup, s_early, s_missed, s_late, forced, first_fast;
+    int s_early_ph;     /* generated frames left out at the start of a pair that keeps later ones (early) */
+    int bare_after_warmup; /* pairs from frame 20 on whose B was shown without any of their generated frames */
     int64_t b_after_max; /* longest from arrival to B's target after the warm-up */
     int s_hold[SIM_FRAMES][SIM_GEN], b_hold[SIM_FRAMES], fast[SIM_FRAMES], n_of[SIM_FRAMES];
     int64_t arrival[SIM_FRAMES];
@@ -412,9 +416,9 @@ static void push(struct sim *m, int64_t applied, int64_t ready, int64_t desired,
 
 /* The pairs waiting, as zerofg_zc.c's pend_run handles them. */
 struct spair {
-    int frame, ns, next;
-    int64_t push, at, s_ready, b_ready, b_apply, b_desired;
-    int64_t s_apply[SIM_GEN], s_last[SIM_GEN], s_desired[SIM_GEN];
+    int frame, ns, next, first; /* generated frame k is phase first + k */
+    int64_t push, at, s_ready, b_ready;
+    struct zfg_pair_times t;
 };
 struct squeue {
     struct spair p[SIM_PEND];
@@ -434,21 +438,22 @@ static int sq_step(struct sim *m, struct squeue *q, int64_t until) {
     if (p->at < q->cursor) p->at = q->cursor;
     while (p->next < p->ns) {
         const int k = p->next;
-        const int64_t at = p->at;
+        const int64_t at = p->at, apply = p->t.s_apply[k], last = p->t.s_last[k];
+        /* the first moment pend_run looks at it with the generation complete and its apply time come */
         int64_t x;
-        if (p->s_ready <= (at > p->s_apply[k] ? at : p->s_apply[k])) x = at >= p->s_apply[k] ? at : p->s_apply[k] + DISPATCH;
+        if (p->s_ready <= (at > apply ? at : apply)) x = at >= apply ? at : apply + DISPATCH;
         else x = p->s_ready + DISPATCH; /* its completion */
-        const int shown = x < p->s_last[k];
-        if (!shown) x = at > p->s_last[k] ? at : p->s_last[k] + DISPATCH;
+        const int act = zfg_s_action(p->s_ready <= x, x, apply, last, 0);
+        if (act != ZFG_S_SHOW) x = at > last ? at : last + DISPATCH; /* the timer at s_last */
         if (x > until) return 0;
-        if (shown) push(m, x, p->s_ready, m->dpt ? p->s_desired[k] : 0, k, p->frame);
+        if (act == ZFG_S_SHOW) push(m, x, p->s_ready, m->dpt ? p->t.s_desired[k] : 0, p->first + k, p->frame);
         else m->s_missed++;
         p->next++;
         p->at = x;
     }
-    const int64_t y = p->at >= p->b_apply ? p->at : p->b_apply + DISPATCH;
+    const int64_t y = p->at >= p->t.b_apply ? p->at : p->t.b_apply + DISPATCH;
     if (y > until) return 0;
-    push(m, y, p->b_ready, m->dpt ? p->b_desired : 0, T_B, p->frame);
+    push(m, y, p->b_ready, m->dpt ? p->t.b_desired : 0, T_B, p->frame);
     q->cursor = y;
     sq_pop(q);
     return 1;
@@ -459,10 +464,11 @@ static void sq_force(struct sim *m, struct squeue *q, int64_t now) {
     struct spair *p = &q->p[0];
     for (; p->next < p->ns; p->next++) {
         const int k = p->next;
-        if (p->s_ready <= now && now < p->s_last[k]) push(m, now, p->s_ready, m->dpt ? p->s_desired[k] : 0, k, p->frame);
+        if (zfg_s_action(p->s_ready <= now, now, p->t.s_apply[k], p->t.s_last[k], 1) == ZFG_S_SHOW)
+            push(m, now, p->s_ready, m->dpt ? p->t.s_desired[k] : 0, p->first + k, p->frame);
         else m->s_missed++;
     }
-    push(m, now, p->b_ready, m->dpt ? p->b_desired : 0, T_B, p->frame);
+    push(m, now, p->b_ready, m->dpt ? p->t.b_desired : 0, T_B, p->frame);
     q->cursor = now;
     sq_pop(q);
     m->forced++;
@@ -475,6 +481,8 @@ static void sim_run(struct sim *m) {
     struct zfg_mult mult;
     zfg_mult_reset(&mult);
     int64_t last = 0, prev_b = 0, lead = 0, arrival = 1000 * MS;
+    struct zfg_ready ready_hist;
+    zfg_ready_reset(&ready_hist);
     int have_prev = 0;
     const float running = m->running > 0.0f ? m->running : (float)(1e9 / (double)m->refresh);
     int64_t arrivals[SIM_FRAMES + 1];
@@ -498,6 +506,7 @@ static void sim_run(struct sim *m) {
         /* note_ready: completions the event loop saw before this frame */
         while (jobs_seen < jobs && job_done[jobs_seen] <= now) {
             lead = zfg_lead_update(lead, job_done[jobs_seen] - job_arrival[jobs_seen]);
+            zfg_ready_add(&ready_hist, job_done[jobs_seen] - job_arrival[jobs_seen]);
             jobs_seen++;
         }
         int running_jobs = 0, running_calls = 0;
@@ -511,10 +520,14 @@ static void sim_run(struct sim *m) {
         last = now;
         if (iv > 0 && !zfg_is_gap(iv, zfg_period_get(&per))) zfg_period_add(&per, iv);
         const int64_t period = zfg_period_get(&per);
-        const int64_t b_ready = now + (m->render_ns > 0 ? m->render_ns : MS);
+        const int64_t render = m->render_slow_every && n % m->render_slow_every == 5 ? m->render_slow_ns : m->render_ns;
+        const int64_t b_ready = now + (render > 0 ? render : MS);
         enum { GEN, DIRECT, NO_S } why = GEN;
         zfg_fast_update(&fast, now, period, running, m->peak);
-        const int nm = zfg_mult_update(&mult, now, m->mult ? m->mult : 2, period, running, m->peak, m->gpu_ms);
+        const struct zfg_mult_in min = {.want = m->mult ? m->mult : 2, .period = period, .refresh_hz = running,
+                                        .peak_hz = m->peak, .gpu_first_ms = m->gpu_first, .gpu_phase_ms = m->gpu_phase,
+                                        .ready_ns = zfg_ready_get(&ready_hist)};
+        const int nm = zfg_mult_update(&mult, now, &min);
         m->n_of[n] = nm;
         if (n >= 20 && nm < m->mult_lo) m->mult_lo = nm;
         if (n >= 20 && nm > m->mult_hi) m->mult_hi = nm;
@@ -529,14 +542,15 @@ static void sim_run(struct sim *m) {
         } else if (t.no_s) {
             why = NO_S;
             m->s_early++;
-        } else if (running_jobs >= SIM_JOBS || !zfg_calls_fit(running_calls, nm)) {
+        } else if (running_jobs >= SIM_JOBS || !zfg_calls_fit(running_calls, zfg_slots_shown(&t))) {
             why = NO_S;
             m->s_late++;
         }
+        if (why == GEN && n >= 20) m->s_early_ph += t.first;
         if (why != DIRECT && prev_b) {
             int64_t before = prev_b;
             const int64_t gap = zfg_spacing(period, nm, 0);
-            for (int k = 0; why == GEN && k < nm - 1; k++) {
+            for (int k = t.first; why == GEN && k < nm - 1; k++) {
                 const int64_t s = zfg_slot_s(&t, k);
                 if (s < before + m->refresh) m->order_bad++;
                 if (s < before + gap) m->spacing_bad++;
@@ -556,23 +570,18 @@ static void sim_run(struct sim *m) {
         memset(p, 0, sizeof(*p));
         p->frame = n;
         p->push = p->at = now;
-        p->ns = why == GEN ? nm - 1 : 0;
+        if (why != GEN) {
+            t.no_s = 1;
+            t.first = t.n - 1;
+        }
+        zfg_pair_times(&t, m->refresh, m->latch, m->margin, &p->t);
+        p->ns = p->t.ns;
+        p->first = t.first;
         p->b_ready = b_ready;
-        p->b_desired = zfg_desired(t.b, m->refresh);
-        p->b_apply = zfg_apply_at(p->b_desired, m->latch, m->margin);
         if (p->ns) {
             int64_t ready = now + m->gen_ns + (p->ns - 1) * m->gen_more + rnd(m->gen_ns / 5);
             if (ready < b_ready) ready = b_ready;
             p->s_ready = ready;
-            for (int k = 0; k < p->ns; k++) {
-                p->s_desired[k] = zfg_desired(zfg_slot_s(&t, k), m->refresh);
-                p->s_apply[k] = zfg_apply_at(p->s_desired[k], m->latch, m->margin);
-            }
-            for (int k = 0; k < p->ns; k++) {
-                const int64_t next = k + 1 < p->ns ? p->s_apply[k + 1] : p->b_apply;
-                p->s_last[k] = next + m->margin - m->refresh;
-                if (p->s_last[k] < p->s_apply[k] + MS) p->s_last[k] = p->s_apply[k] + MS;
-            }
             job_done[jobs] = ready + DISPATCH;
             job_calls[jobs] = p->ns;
             job_arrival[jobs++] = now;
@@ -626,10 +635,15 @@ static void sim_run(struct sim *m) {
         }
     }
     for (int n = 0; n < SIM_FRAMES; n++) {
+        int any = 0;
         for (int k = 0; k < SIM_GEN; k++)
-            if (m->s_hold[n][k]) m->s_shown++;
+            if (m->s_hold[n][k]) {
+                m->s_shown++;
+                any = 1;
+            }
         if (m->b_hold[n]) m->b_shown++;
         else if (n >= 20) m->b_lost_after_warmup++;
+        if (n >= 20 && n < SIM_FRAMES - 2 && m->b_hold[n] && !any) m->bare_after_warmup++;
     }
 }
 
@@ -847,7 +861,7 @@ static void schedule_n_spaces_the_outputs(void) {
     const int64_t r120 = 8333333, r144 = 6944444, p = 33333333, lead = 20 * MS;
     CHECK(zfg_spacing(p, 3, r120) == (int64_t)(p / 3.0 * ZFG_SPACING), "x3 at 30 fps on 120 Hz: 80 %% of 11.1 ms");
     CHECK(zfg_spacing(p, 4, r144) == r144, "x4 at 30 fps on 144 Hz: a refresh (more than 80 %% of 8.3 ms)");
-    CHECK(zfg_spacing(p, 2, r120) == (int64_t)(p / 2.0 * ZFG_SPACING), "x2 at 30 fps: 80 %% of half a period");
+    CHECK(zfg_spacing(p, 2, r120) == r120 && zfg_spacing(p, 2, r144) == r144, "x2: a refresh, as before x3 and x4");
     CHECK(zfg_spacing(p, 9, r120) == zfg_spacing(p, ZFG_MULT_MAX, r120), "above x4: x4");
     for (int n = 2; n <= ZFG_MULT_MAX; n++) {
         const int64_t q = p / n;
@@ -868,12 +882,19 @@ static void schedule_n_spaces_the_outputs(void) {
             prev_b = t.b;
         }
     }
-    /* no room for the first generated frame up to lead + slack: no generated frames, b (n - 1) / n of a period
-     * after arrival + lead */
+    /* no room for the first generated frame up to lead + slack (the frame came 2 ms early against the rhythm):
+     * the first is left out, the others and b a step earlier than the rhythm */
     const struct zfg_slots c = zfg_schedule_n(30 * MS, 52 * MS, p, lead, r120, r120, 4);
-    CHECK(c.no_s && zfg_slot_s(&c, 0) == 0, "x4 without room: none");
-    CHECK(c.b == 30 * MS + lead + 3 * (p / 4), "x4 without room: b three quarters of a period after arrival + lead, "
-          "got %lld", (long long)c.b);
+    CHECK(!c.no_s && c.first == 1 && zfg_slots_shown(&c) == 2 && zfg_slot_s(&c, 0) == 0, "x4, 2 ms early: the first "
+          "left out (first %d, shown %d)", c.first, zfg_slots_shown(&c));
+    CHECK(zfg_slot_s(&c, 1) == 52 * MS + p / 4 && zfg_slot_s(&c, 2) == 52 * MS + 2 * (p / 4) &&
+          c.b == 52 * MS + 3 * (p / 4), "x4, 2 ms early: phases 2/4 and 3/4 a step apart after the previous b, b a "
+          "step after them, got %lld", (long long)(c.b - 52 * MS));
+    /* no room for any: no generated frames, b at least the spacing after the previous b */
+    const struct zfg_slots c2 = zfg_schedule_n(30 * MS, 70 * MS, p, lead, r120, r120, 4);
+    CHECK(c2.no_s && zfg_slots_shown(&c2) == 0 && zfg_slot_s(&c2, 2) == 0, "x4 without room: none");
+    CHECK(c2.b == 70 * MS + r120, "x4 without room: b a refresh after the previous b, got %lld",
+          (long long)(c2.b - 70 * MS));
     /* x3 at 50 fps on 120 Hz: a third of a period after the previous b is less than a refresh, the first is pushed
      * to a refresh after it, the others follow a refresh apart */
     const struct zfg_slots d = zfg_schedule_n(30 * MS, 44 * MS, 20 * MS, lead, 2 * r120, r120, 3);
@@ -914,22 +935,34 @@ static void votes_n(void) {
           (long long)(moved / MS));
 }
 
+#define P30 33333333LL
+#define P40 25000000LL
+
 static void contexts_and_pool(void) {
     CHECK(ZFG_CONTEXTS >= ZFG_MULT_MAX + 1 && ZFG_CONTEXTS <= 8, "frame contexts: N + 1 for x4, ZeroFG's limit 8");
-    CHECK(zfg_calls_fit(0, 4) && zfg_calls_fit(3, 4) && zfg_calls_fit(5, 4), "x4: up to 8 calls in flight");
-    CHECK(!zfg_calls_fit(6, 4), "x4: a third pair waits");
-    CHECK(zfg_calls_fit(2, 2) && zfg_calls_fit(7, 2) && !zfg_calls_fit(8, 2), "x2");
+    CHECK(zfg_calls_fit(0, 3) && zfg_calls_fit(3, 3) && zfg_calls_fit(5, 3), "x4: up to 8 calls in flight");
+    CHECK(!zfg_calls_fit(6, 3), "x4: a third pair waits");
+    CHECK(zfg_calls_fit(6, 2), "x4 with its first generated frame left out: two calls fit");
+    CHECK(zfg_calls_fit(2, 1) && zfg_calls_fit(7, 1) && !zfg_calls_fit(8, 1), "x2");
+    CHECK(zfg_flight_pairs(0, P30) == 0 && zfg_flight_pairs(50 * MS, 0) == 0, "flight: unknown");
+    CHECK(zfg_flight_pairs(20 * MS, P30) == 1 && zfg_flight_pairs(50 * MS, P30) == 2 &&
+          zfg_flight_pairs(70 * MS, P30) == 3, "flight: pairs in flight");
     CHECK(zfg_pool_size(2) == 3, "x2: the pool of before");
     CHECK(zfg_pool_size(3) == 6 && zfg_pool_size(4) == 9 && zfg_pool_size(4) == ZFG_POOL_MAX, "x3, x4: three pairs");
 }
 
-#define P30 33333333LL
-#define P40 25000000LL
+/* zfg_mult_update with a pair's GPU time given per generated frame (first call and each further one the same), no
+ * flight time and no engine limit. */
+static int mu(struct zfg_mult *m, int64_t t, int want, int64_t period, float refresh, float peak, double gpu) {
+    const struct zfg_mult_in in = {.want = want, .period = period, .refresh_hz = refresh, .peak_hz = peak,
+                                   .gpu_first_ms = gpu, .gpu_phase_ms = gpu};
+    return zfg_mult_update(m, t, &in);
+}
 
 static int mult_at(struct zfg_mult *m, int64_t *t, int64_t until, int want, int64_t period, float refresh, float peak,
                    double gpu) {
     int n = 0;
-    for (; *t < until; *t += period) n = zfg_mult_update(m, *t, want, period, refresh, peak, gpu);
+    for (; *t < until; *t += period) n = mu(m, *t, want, period, refresh, peak, gpu);
     return n;
 }
 
@@ -937,65 +970,65 @@ static void multiplier_downgrades(void) {
     struct zfg_mult m;
     int64_t t = 1000 * MS;
     zfg_mult_reset(&m);
-    CHECK(zfg_mult_update(&m, t, 4, P30, 120.0f, 144.0f, 2.0) == 4 && m.why == ZFG_CAP_NONE && m.vote_n == 4,
+    CHECK(mu(&m, t, 4, P30, 120.0f, 144.0f, 2.0) == 4 && m.why == ZFG_CAP_NONE && m.vote_n == 4,
           "x4 at 30 fps on 120 (peak 144): x4");
-    CHECK(zfg_mult_update(&m, t, 4, 0, 120.0f, 144.0f, 2.0) == 4, "period unknown: as it was");
+    CHECK(mu(&m, t, 4, 0, 120.0f, 144.0f, 2.0) == 4, "period unknown: as it was");
     /* the peak: at once */
     zfg_mult_reset(&m);
-    CHECK(zfg_mult_update(&m, t, 4, P40, 144.0f, 144.0f, 0) == 3 && m.why == ZFG_CAP_PEAK && m.vote_n == 3,
+    CHECK(mu(&m, t, 4, P40, 144.0f, 144.0f, 0) == 3 && m.why == ZFG_CAP_PEAK && m.vote_n == 3,
           "x4 at 40 fps, peak 144: x3 (160 above 144)");
     zfg_mult_reset(&m);
-    CHECK(zfg_mult_update(&m, t, 4, 16666666, 120.0f, 120.0f, 0) == 2 && m.why == ZFG_CAP_PEAK,
+    CHECK(mu(&m, t, 4, 16666666, 120.0f, 120.0f, 0) == 2 && m.why == ZFG_CAP_PEAK,
           "x4 at 60 fps, peak 120: x2");
     CHECK(!strcmp(zfg_cap_name(ZFG_CAP_PEAK), "peak") && !strcmp(zfg_cap_name(ZFG_CAP_GPU), "gpu") &&
           !strcmp(zfg_cap_name(ZFG_CAP_REFRESH), "refresh") && !strcmp(zfg_cap_name(ZFG_CAP_NONE), "none"), "names");
     /* within 5 % kept, back up within 3 % */
     zfg_mult_reset(&m);
-    CHECK(zfg_mult_update(&m, t, 4, (int64_t)(1e9 / 37.7), 144.0f, 144.0f, 0) == 4, "x4 at 37.7 fps (150.8): kept");
-    CHECK(zfg_mult_update(&m, t + 30 * MS, 4, (int64_t)(1e9 / 38.2), 144.0f, 144.0f, 0) == 3, "38.2 fps (152.8): x3");
+    CHECK(mu(&m, t, 4, (int64_t)(1e9 / 37.7), 144.0f, 144.0f, 0) == 4, "x4 at 37.7 fps (150.8): kept");
+    CHECK(mu(&m, t + 30 * MS, 4, (int64_t)(1e9 / 38.2), 144.0f, 144.0f, 0) == 3, "38.2 fps (152.8): x3");
     t = 1100 * MS;
     CHECK(mult_at(&m, &t, 5000 * MS, 4, (int64_t)(1e9 / 37.7), 144.0f, 144.0f, 0) == 3, "back at 37.7 fps: x3 stays");
     const int64_t t0 = t;
     int64_t up = 0;
     for (; t < t0 + 4000 * MS && !up; t += 27777777)
-        if (zfg_mult_update(&m, t, 4, 27777777, 144.0f, 144.0f, 0) == 4) up = t - t0;
+        if (mu(&m, t, 4, 27777777, 144.0f, 144.0f, 0) == 4) up = t - t0;
     CHECK(up >= ZFG_MULT_RAISE_NS && up <= ZFG_MULT_RAISE_NS + 50 * MS, "36 fps: x4 again %lld ms later",
           (long long)(up / MS));
     /* the GPU: x4 at 30 fps with 7 ms a generated frame is 21 ms of 33; x3 14 ms fits half the period */
     zfg_mult_reset(&m);
     t = 1000 * MS;
-    CHECK(zfg_mult_update(&m, t, 4, P30, 120.0f, 144.0f, 7.0) == 3 && m.why == ZFG_CAP_GPU && m.vote_n == 3,
+    CHECK(mu(&m, t, 4, P30, 120.0f, 144.0f, 7.0) == 3 && m.why == ZFG_CAP_GPU && m.vote_n == 3,
           "x4, 7 ms a generated frame: x3");
-    CHECK(zfg_mult_update(&m, t + P30, 4, P30, 120.0f, 144.0f, 9.0) == 2 && m.why == ZFG_CAP_GPU, "9 ms: x2");
+    CHECK(mu(&m, t + P30, 4, P30, 120.0f, 144.0f, 9.0) == 2 && m.why == ZFG_CAP_GPU, "9 ms: x2");
     t += 2 * P30;
     const int64_t fit_from = t;
     up = 0;
     for (; t < fit_from + 15000 * MS && !up; t += P30)
-        if (zfg_mult_update(&m, t, 4, P30, 120.0f, 144.0f, 3.0) == 4) up = t - fit_from;
+        if (mu(&m, t, 4, P30, 120.0f, 144.0f, 3.0) == 4) up = t - fit_from;
     CHECK(up >= ZFG_GPU_BLOCK_NS - P30 && up <= ZFG_GPU_BLOCK_NS + ZFG_MULT_RAISE_NS + 100 * MS,
           "3 ms after the GPU cap: x4 again %lld ms later (not tried for %lld s)", (long long)(up / MS),
           (long long)(ZFG_GPU_BLOCK_NS / 1000000000LL));
     /* the running rate below the peak (a power cap): the vote asks for x3's rate at once, x3 goes after the grace */
     zfg_mult_reset(&m);
     t = 1000 * MS;
-    CHECK(zfg_mult_update(&m, t, 3, P30, 60.0f, 144.0f, 0) == 3 && m.vote_n == 3, "x3 on a 60 Hz panel: x3 at first");
+    CHECK(mu(&m, t, 3, P30, 60.0f, 144.0f, 0) == 3 && m.vote_n == 3, "x3 on a 60 Hz panel: x3 at first");
     const int64_t t1 = t;
     int64_t down = 0;
     for (t += P30; t < t1 + 4000 * MS && !down; t += P30)
-        if (zfg_mult_update(&m, t, 3, P30, 60.0f, 144.0f, 0) == 2) down = t - t1;
+        if (mu(&m, t, 3, P30, 60.0f, 144.0f, 0) == 2) down = t - t1;
     CHECK(down >= ZFG_FAST_GRACE_NS && down <= ZFG_FAST_GRACE_NS + 50 * MS && m.why == ZFG_CAP_REFRESH,
           "x3 on a panel held at 60: x2 after %lld ms (%s)", (long long)(down / MS), zfg_cap_name(m.why));
     CHECK(m.vote_n == 3, "the vote still for x3, so the panel can come up");
     const int64_t t2 = t;
     up = 0;
     for (; t < t2 + 4000 * MS && !up; t += P30)
-        if (zfg_mult_update(&m, t, 3, P30, 90.0f, 144.0f, 0) == 3) up = t - t2;
+        if (mu(&m, t, 3, P30, 90.0f, 144.0f, 0) == 3) up = t - t2;
     CHECK(up >= ZFG_MULT_RAISE_NS && up <= ZFG_MULT_RAISE_NS + 50 * MS, "the panel at 90: x3 again %lld ms later",
           (long long)(up / MS));
     /* the menu: a new multiplier at once */
-    CHECK(zfg_mult_update(&m, t, 2, P30, 90.0f, 144.0f, 0) == 2 && m.why == ZFG_CAP_NONE, "x2 asked for: x2");
-    CHECK(zfg_mult_update(&m, t + P30, 4, P30, 120.0f, 144.0f, 0) == 4, "x4 asked for: x4 at once");
-    CHECK(zfg_mult_update(&m, t + 2 * P30, 9, P30, 120.0f, 144.0f, 0) == 4, "above x4: x4");
+    CHECK(mu(&m, t, 2, P30, 90.0f, 144.0f, 0) == 2 && m.why == ZFG_CAP_NONE, "x2 asked for: x2");
+    CHECK(mu(&m, t + P30, 4, P30, 120.0f, 144.0f, 0) == 4, "x4 asked for: x4 at once");
+    CHECK(mu(&m, t + 2 * P30, 9, P30, 120.0f, 144.0f, 0) == 4, "above x4: x4");
 }
 
 /* The pairs from frame 20 on whose n outputs were each held `holds` refreshes (0: any of 1 .. 2), and B shown. */
@@ -1064,7 +1097,7 @@ static void sim_xn_downgrades(void) {
     m = calloc(1, sizeof(*m));
     sim_init(m, 8333333, 6 * MS, 1 * MS);
     m->mult = 4;
-    m->gpu_ms = 7.0;
+    m->gpu_first = m->gpu_phase = 7.0;
     m->peak = 144.0f;
     g_p1 = 33333333;
     sim_run(m);
@@ -1092,6 +1125,295 @@ static void sim_xn_panel_below_the_peak(void) {
     double s, b;
     hold_means(m, grace + 10, SIM_FRAMES - 2, &s, &b);
     CHECK(s > 0.9 && b > 0.9, "then x2 on 60: S held %.2f, B held %.2f refreshes", s, b);
+    free(m);
+}
+
+/* g2-060's zfg_schedule, before x3 and x4. */
+static struct zfg_slots old_x2_schedule(int64_t arrival, int64_t prev_b, int64_t period, int64_t lead, int64_t slack,
+                                        int64_t refresh) {
+    const int64_t half = period > 0 ? period / 2 : 0;
+    const int64_t gap = refresh > 0 ? refresh : 0;
+    const int64_t step = half > gap ? half : gap;
+    const int64_t lo = arrival + (lead > 0 ? lead : 0), hi = lo + (slack > 0 ? slack : 0);
+    int64_t s = prev_b ? prev_b + half : lo;
+    if (s < lo) s = lo;
+    if (s > hi) s = hi;
+    struct zfg_slots r = {s, s + step, 0, 2, 0, 0};
+    if (prev_b && s < prev_b + gap) {
+        if (prev_b + gap <= hi) {
+            r.s = prev_b + gap;
+            r.b = r.s + step;
+        } else {
+            r.no_s = 1;
+            r.s = 0;
+            r.b = lo + half > prev_b + gap ? lo + half : prev_b + gap;
+            if (r.b > hi + step) r.b = lo + half;
+        }
+    }
+    return r;
+}
+
+/* x2 places its outputs as it did before x3 and x4 (one refresh between outputs at least): for any arrival
+ * against the previous b, at 20 .. 62 fps on 60 .. 144 Hz. */
+static void schedule_x2_as_before(void) {
+    const int64_t refreshes[] = {16666666, 11111111, 8333333, 6944444, 0};
+    const int64_t periods[] = {50 * MS, 33333333, 32258064, 25 * MS, 16666666};
+    int bad = 0, cases = 0;
+    for (unsigned r = 0; r < sizeof(refreshes) / sizeof(refreshes[0]); r++)
+        for (unsigned q = 0; q < sizeof(periods) / sizeof(periods[0]); q++)
+            for (int64_t lead = 10 * MS; lead <= 60 * MS; lead += 25 * MS)
+                for (int64_t off = -40 * MS; off <= 60 * MS; off += MS / 2) {
+                    const int64_t p = periods[q], arrival = 1000 * MS, prev_b = off ? arrival + off : 0;
+                    const int64_t slack = zfg_slack(p, refreshes[r]);
+                    const struct zfg_slots a = zfg_schedule(arrival, prev_b, p, lead, slack, refreshes[r]);
+                    const struct zfg_slots b = old_x2_schedule(arrival, prev_b, p, lead, slack, refreshes[r]);
+                    cases++;
+                    if (a.no_s != b.no_s || a.b != b.b || (!a.no_s && zfg_slot_s(&a, 0) != b.s)) {
+                        if (!bad) fprintf(stderr, "x2: period %lld refresh %lld lead %lld prev_b %+lld: s %lld/%lld "
+                                                  "b %lld/%lld\n", (long long)p, (long long)refreshes[r],
+                                          (long long)lead, (long long)off, (long long)zfg_slot_s(&a, 0),
+                                          (long long)b.s, (long long)a.b, (long long)b.b);
+                        bad++;
+                    }
+                }
+    CHECK(!bad, "x2: %d of %d schedules differ from g2-060's", bad, cases);
+}
+
+static void slots_drop_first(void) {
+    const int64_t p = 33333333, r = 8333333;
+    struct zfg_slots t = zfg_schedule_n(0, 0, p, 20 * MS, r, r, 4);
+    const int64_t s1 = zfg_slot_s(&t, 1), s2 = zfg_slot_s(&t, 2), b = t.b;
+    CHECK(zfg_slots_shown(&t) == 3, "x4: three");
+    zfg_slots_drop_first(&t, 1);
+    CHECK(zfg_slots_shown(&t) == 2 && t.first == 1 && zfg_slot_s(&t, 0) == 0 && zfg_slot_s(&t, 1) == s1 &&
+          zfg_slot_s(&t, 2) == s2 && t.b == b, "one fewer buffer: the first left out, the others where they were");
+    zfg_slots_drop_first(&t, 2);
+    CHECK(t.no_s && zfg_slots_shown(&t) == 0 && t.b == b, "none left: B alone, where it was");
+    CHECK(zfg_slot_s(&t, 3) == 0, "past the last phase: none");
+}
+
+/* The output times pend_push gives a pair, and what pend_run does with each generated frame. */
+static void pair_times_and_actions(void) {
+    const int64_t r = 8333333, latch = r, margin = 2 * MS, p = 33333333;
+    struct zfg_slots t = zfg_schedule_n(0, 0, p, 20 * MS, r, r, 3);
+    struct zfg_pair_times pt;
+    zfg_pair_times(&t, r, latch, margin, &pt);
+    CHECK(pt.ns == 2, "x3: two generated frames");
+    for (int k = 0; k < 2; k++) {
+        CHECK(pt.s_desired[k] == zfg_slot_s(&t, k) - r / 2 && pt.s_apply[k] == pt.s_desired[k] - latch - margin,
+              "x3: frame %d's desired present and apply times", k);
+        const int64_t next = k ? pt.b_apply : pt.s_apply[1];
+        CHECK(pt.s_last[k] == next + margin - r, "x3: frame %d goes until a refresh before the next output's commit", k);
+    }
+    CHECK(pt.b_desired == t.b - r / 2 && pt.b_apply == pt.b_desired - latch - margin, "x3: B's times");
+    /* outputs a refresh apart: the last moment is never before the apply time + 1 ms */
+    struct zfg_slots u = zfg_schedule_n(0, 0, 25 * MS, 20 * MS, r, r, 3);
+    zfg_pair_times(&u, r, latch, margin, &pt);
+    CHECK(pt.s_last[0] >= pt.s_apply[0] + MS, "a refresh apart: at least 1 ms after the apply time");
+    zfg_slots_drop_first(&t, 1);
+    zfg_pair_times(&t, r, latch, margin, &pt);
+    CHECK(pt.ns == 1 && pt.s_desired[0] == zfg_slot_s(&t, 1) - r / 2, "the first left out: the second's times");
+    CHECK(zfg_s_action(1, 10, 10, 20, 0) == ZFG_S_SHOW && zfg_s_action(1, 9, 10, 20, 0) == ZFG_S_WAIT &&
+          zfg_s_action(0, 15, 10, 20, 0) == ZFG_S_WAIT && zfg_s_action(0, 20, 10, 20, 0) == ZFG_S_DROP &&
+          zfg_s_action(1, 20, 10, 20, 0) == ZFG_S_DROP, "ready at its apply time: shown; late: left out");
+    CHECK(zfg_s_action(1, 5, 10, 20, 1) == ZFG_S_SHOW && zfg_s_action(0, 5, 10, 20, 1) == ZFG_S_DROP,
+          "forced: shown if complete, else left out");
+}
+
+/* A multiplier lowered for the GPU time comes back once the GPU time is back: ZeroFG 1.2 records the pair whole
+ * once (F) and only the picture at every further phase (p), so x3 costs F + p and x4 F + 2 p. */
+static int mg(struct zfg_mult *m, int64_t t, int want, double first, double phase) {
+    const struct zfg_mult_in in = {.want = want, .period = P30, .refresh_hz = 120.0f, .peak_hz = 144.0f,
+                                   .gpu_first_ms = first, .gpu_phase_ms = phase};
+    return zfg_mult_update(m, t, &in);
+}
+
+static void multiplier_gpu_model(void) {
+    CHECK(zfg_pair_gpu_ms(2, 9.0, 2.0) == 9.0 && zfg_pair_gpu_ms(3, 9.0, 2.0) == 11.0 &&
+          zfg_pair_gpu_ms(4, 9.0, 2.0) == 13.0 && zfg_pair_gpu_ms(4, 9.0, 0) == 9.0, "pair GPU time: F + (N - 2) p");
+    /* 30 fps, F 9 ms, p 2 ms: x4 13 ms of the 16.7 ms budget */
+    struct zfg_mult m;
+    zfg_mult_reset(&m);
+    int64_t t = 1000 * MS;
+    CHECK(mg(&m, t, 4, 9.0, 2.0) == 4 && m.why == ZFG_CAP_NONE, "x4: F 9 ms, p 2 ms fits");
+    /* a 3 s spike (F 14, p 4): x2 */
+    int n = 0;
+    const int64_t spike = t;
+    for (; t < spike + 3000 * MS; t += P30) n = mg(&m, t, 4, 14.0, 4.0);
+    CHECK(n == 2 && m.why == ZFG_CAP_GPU, "the spike: x2 (got x%d, %s)", n, zfg_cap_name(m.why));
+    /* back to F 9; at x2 no further calls are measured, p stays at the spike's 4 ms until x3 runs again */
+    int64_t x3_at = 0, x4_at = 0;
+    double phase = 4.0;
+    for (; t < spike + 30000 * MS && !x4_at; t += P30) {
+        n = mg(&m, t, 4, 9.0, phase);
+        if (n >= 3 && !x3_at) x3_at = t - spike;
+        if (n == 3) phase = 2.0;
+        if (n == 4) x4_at = t - spike;
+    }
+    CHECK(x3_at && x3_at <= ZFG_GPU_BLOCK_NS + ZFG_MULT_RAISE_NS + 100 * MS, "after the spike: x3 %lld ms after it "
+          "began", (long long)(x3_at / MS));
+    CHECK(x4_at && x4_at <= x3_at + ZFG_MULT_RAISE_NS + 100 * MS, "then x4 %lld ms after it began",
+          (long long)(x4_at / MS));
+    /* x2 asked for, then x4 from the menu: x2's samples (F) alone do not hold x4 back */
+    zfg_mult_reset(&m);
+    t = 1000 * MS;
+    CHECK(mg(&m, t, 2, 9.0, 0) == 2, "x2");
+    CHECK(mg(&m, t + P30, 4, 9.0, 0) == 4 && m.why == ZFG_CAP_NONE, "x2 -> x4 from the menu, p not measured: x4");
+    CHECK(mg(&m, t + 2 * P30, 4, 9.0, 2.0) == 4, "p 2 ms measured: x4 stays");
+    CHECK(mg(&m, t + 3 * P30, 4, 9.0, 6.0) == 3 && m.why == ZFG_CAP_GPU, "p 6 ms (x4 21 ms): x3 (15 ms)");
+    /* F alone over the budget: x2 */
+    zfg_mult_reset(&m);
+    CHECK(mg(&m, t, 4, 17.0, 0) == 2 && m.why == ZFG_CAP_GPU, "F 17 ms: x2");
+}
+
+static int mf(struct zfg_mult *m, int64_t t, int want, int64_t ready) {
+    const struct zfg_mult_in in = {.want = want, .period = P30, .refresh_hz = 120.0f, .peak_hz = 144.0f,
+                                   .ready_ns = ready};
+    return zfg_mult_update(m, t, &in);
+}
+
+/* Generations done long after their real frame arrived keep several pairs in flight: x4's three calls a pair fit
+ * the 8 frame contexts for two pairs, x3's two for three (ZFG_JOBS). */
+static void multiplier_flight(void) {
+    struct zfg_mult m;
+    zfg_mult_reset(&m);
+    int64_t t = 1000 * MS;
+    CHECK(mf(&m, t, 4, 50 * MS) == 4 && m.why == ZFG_CAP_NONE, "x4, done 50 ms after arrival at 30 fps: two pairs");
+    CHECK(mf(&m, t + P30, 4, 70 * MS) == 3 && m.why == ZFG_CAP_LATE && m.vote_n == 3, "70 ms: three pairs, x3 (%s)",
+          zfg_cap_name(m.why));
+    t += 2 * P30;
+    const int64_t t0 = t;
+    int64_t up = 0;
+    for (; t < t0 + 4000 * MS && !up; t += P30)
+        if (mf(&m, t, 4, 50 * MS) == 4) up = t - t0;
+    CHECK(up >= ZFG_MULT_RAISE_NS && up <= ZFG_MULT_RAISE_NS + 50 * MS, "back to 50 ms: x4 %lld ms later",
+          (long long)(up / MS));
+    zfg_mult_reset(&m);
+    CHECK(mf(&m, t, 4, 60 * MS) == 4, "60 ms: x4 kept");
+    zfg_mult_reset(&m);
+    CHECK(mf(&m, t, 4, 59 * MS) == 4 && mf(&m, t + P30, 4, 62 * MS) == 4, "59 then 62 ms: x4 kept");
+    zfg_mult_reset(&m);
+    CHECK(mf(&m, t, 3, 90 * MS) == 3, "x3 at 90 ms: three pairs of two calls fit");
+    CHECK(mf(&m, t + P30, 3, 110 * MS) == 2 && m.why == ZFG_CAP_LATE, "110 ms: four pairs, more than the jobs: x2");
+    CHECK(mf(&m, t + 2 * P30, 3, 0) == 2, "unknown: as it was");
+    CHECK(!strcmp(zfg_cap_name(ZFG_CAP_LATE), "late") && !strcmp(zfg_cap_name(ZFG_CAP_ENGINE), "engine"), "names");
+}
+
+static void ready_median(void) {
+    struct zfg_ready r;
+    zfg_ready_reset(&r);
+    for (int i = 0; i < 7; i++) zfg_ready_add(&r, 50 * MS);
+    CHECK(zfg_ready_get(&r) == 0, "fewer than 8: unknown");
+    zfg_ready_add(&r, 0);
+    CHECK(zfg_ready_get(&r) == 0, "0 is no measurement");
+    zfg_ready_add(&r, 90 * MS);
+    CHECK(zfg_ready_get(&r) == 50 * MS, "one slow pair of 8: the median stays, got %lld", (long long)zfg_ready_get(&r));
+    for (int i = 0; i < ZFG_READY_HIST; i++) zfg_ready_add(&r, 70 * MS);
+    CHECK(zfg_ready_get(&r) == 70 * MS, "the last %d: 70 ms", ZFG_READY_HIST);
+}
+
+/* An engine whose phase forms failed records x2 only. */
+static void multiplier_engine_limit(void) {
+    struct zfg_mult m;
+    zfg_mult_reset(&m);
+    struct zfg_mult_in in = {.want = 4, .limit = 2, .period = P30, .refresh_hz = 120.0f, .peak_hz = 144.0f};
+    CHECK(zfg_mult_update(&m, 1000 * MS, &in) == 2 && m.why == ZFG_CAP_ENGINE && m.vote_n == 2, "limit 2: x2 (%s)",
+          zfg_cap_name(m.why));
+    in.limit = 3;
+    CHECK(zfg_mult_update(&m, 1000 * MS + P30, &in) == 2, "limit 3: x3 comes back only after the raise time");
+    int n = 0;
+    for (int64_t t = 1000 * MS + 2 * P30; t < 4000 * MS; t += P30) n = zfg_mult_update(&m, t, &in);
+    CHECK(n == 3 && m.why == ZFG_CAP_ENGINE, "limit 3: x3 (%s)", zfg_cap_name(m.why));
+    in.limit = 0;
+    in.period = 0;
+    zfg_mult_reset(&m);
+    CHECK(zfg_mult_update(&m, 1000 * MS, &in) == 4, "no limit: x4");
+    in.limit = 2;
+    CHECK(zfg_mult_update(&m, 1000 * MS + P30, &in) == 2 && m.why == ZFG_CAP_ENGINE, "period unknown, limit 2: x2");
+}
+
+/* x4 at 30 fps on 120 Hz and x3 on 90 Hz with uneven arrivals: one output a refresh, so a real frame that comes
+ * early against the rhythm has no room before it; only the first generated frame of such a pair is left out. */
+static void sim_xn_jitter(void) {
+    const struct { int mult; int64_t refresh; const char *what; } cases[] = {
+        {4, 8333333, "x4 on 120"}, {3, 11111111, "x3 on 90"}};
+    const int64_t jitters[] = {1 * MS, 3 * MS, 5 * MS};
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        for (unsigned j = 0; j < sizeof(jitters) / sizeof(jitters[0]); j++) {
+            struct sim *m = calloc(1, sizeof(*m));
+            sim_init(m, cases[i].refresh, 6 * MS, jitters[j]);
+            m->gen_more = 2 * MS;
+            m->mult = cases[i].mult;
+            m->peak = 144.0f;
+            g_p1 = 33333333;
+            sim_run(m);
+            const int want = (SIM_FRAMES - 20) * (cases[i].mult - 1);
+            CHECK(m->bare_after_warmup <= 2 && m->s_early <= 2, "%s, +-%lld ms: %d pairs shown without generated frames "
+                  "(%d early)", cases[i].what, (long long)(jitters[j] / MS), m->bare_after_warmup, m->s_early);
+            CHECK(m->b_lost_after_warmup == 0 && m->order_bad == 0, "%s, +-%lld ms: %d lost, %d too close",
+                  cases[i].what, (long long)(jitters[j] / MS), m->b_lost_after_warmup, m->order_bad);
+            CHECK(m->s_shown >= want * 95 / 100, "%s, +-%lld ms: %d of %d generated frames shown (%d left out as "
+                  "early)", cases[i].what, (long long)(jitters[j] / MS), m->s_shown, want, m->s_early_ph);
+            free(m);
+        }
+}
+
+/* x2 at 30 fps on 120 Hz with uneven arrivals: as many generated frames as before x3 and x4. */
+static void sim_x2_jitter(void) {
+    const int64_t jitters[] = {3 * MS, 5 * MS, 8 * MS};
+    for (unsigned j = 0; j < sizeof(jitters) / sizeof(jitters[0]); j++) {
+        struct sim *m = calloc(1, sizeof(*m));
+        sim_init(m, 8333333, 6 * MS, jitters[j]);
+        m->peak = 144.0f;
+        g_p1 = 33333333;
+        sim_run(m);
+        CHECK(m->s_early <= 4, "x2 on 120, +-%lld ms: %d pairs without S (early)", (long long)(jitters[j] / MS),
+              m->s_early);
+        CHECK(m->b_lost_after_warmup == 0, "x2 on 120, +-%lld ms: %d lost", (long long)(jitters[j] / MS),
+              m->b_lost_after_warmup);
+        free(m);
+    }
+}
+
+/* x4 at 30 fps where B is rendered 70 ms after it arrived: three pairs in flight need 9 frame contexts, so x3 runs
+ * (6 calls in three jobs) instead of every third pair being skipped as late. */
+static void sim_xn_slow_render(void) {
+    struct sim *m = calloc(1, sizeof(*m));
+    sim_init(m, 8333333, 6 * MS, 1 * MS);
+    m->gen_more = 2 * MS;
+    m->render_ns = 70 * MS;
+    m->mult = 4;
+    m->peak = 144.0f;
+    g_p1 = 33333333;
+    sim_run(m);
+    CHECK(m->mult_lo == 3 && m->mult_hi == 3, "x4, B rendered after 70 ms: x3, got %d .. %d", m->mult_lo, m->mult_hi);
+    /* late only until ZFG_READY_HIST / 2 generations are measured */
+    CHECK(m->s_late <= ZFG_READY_HIST / 2, "x4, B rendered after 70 ms: %d pairs late", m->s_late);
+    CHECK(m->s_shown >= (SIM_FRAMES - 20) * 2 * 97 / 100 && m->b_lost_after_warmup == 0,
+          "x4, B rendered after 70 ms: %d generated frames shown, %d lost", m->s_shown, m->b_lost_after_warmup);
+    free(m);
+    m = calloc(1, sizeof(*m));
+    sim_init(m, 8333333, 6 * MS, 1 * MS);
+    m->gen_more = 2 * MS;
+    m->render_ns = 50 * MS;
+    m->mult = 4;
+    m->peak = 144.0f;
+    sim_run(m);
+    CHECK(m->mult_lo == 4 && m->mult_hi == 4 && m->s_late <= 3, "x4, B rendered after 50 ms: x4 (%d .. %d), %d late",
+          m->mult_lo, m->mult_hi, m->s_late);
+    free(m);
+    /* every tenth B after 75 ms: x4 stays (the median), each slow one costs at most the pair after it */
+    m = calloc(1, sizeof(*m));
+    sim_init(m, 8333333, 6 * MS, 1 * MS);
+    m->gen_more = 2 * MS;
+    m->render_ns = 50 * MS;
+    m->render_slow_every = 10;
+    m->render_slow_ns = 75 * MS;
+    m->mult = 4;
+    m->peak = 144.0f;
+    sim_run(m);
+    CHECK(m->mult_lo == 4 && m->mult_hi == 4, "x4, every tenth B after 75 ms: x4, got %d .. %d", m->mult_lo, m->mult_hi);
+    CHECK(m->s_late <= SIM_FRAMES / 10 + 2, "x4, every tenth B after 75 ms: %d late", m->s_late);
     free(m);
 }
 
@@ -1209,6 +1531,16 @@ int main(void) {
     sim_xn_at_30();
     sim_xn_downgrades();
     sim_xn_panel_below_the_peak();
+    schedule_x2_as_before();
+    slots_drop_first();
+    pair_times_and_actions();
+    multiplier_gpu_model();
+    multiplier_flight();
+    multiplier_engine_limit();
+    ready_median();
+    sim_xn_jitter();
+    sim_x2_jitter();
+    sim_xn_slow_render();
     sim_game_fill_crop();
     if (failures) {
         fprintf(stderr, "%d failure%s\n", failures, failures == 1 ? "" : "s");
