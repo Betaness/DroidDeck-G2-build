@@ -30,6 +30,13 @@ for _ in range(int(sys.argv[2])):
 """
 
 
+def unavailable(reason):
+    # CI installs the tools (build.yml, python-tests), so there a missing one fails the test.
+    if os.environ.get("GITHUB_ACTIONS"):
+        raise AssertionError(reason)
+    raise unittest.SkipTest(reason)
+
+
 def source_env():
     values = {}
     for line in (PROOT_DIR / "source.env").read_text().splitlines():
@@ -108,9 +115,9 @@ def build(work, patches, proot_tar, talloc_tar):
 class ProotFchdirTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        for tool in ("gcc", "ld.lld", "make", "patch", "readelf", "python3"):
+        for tool in ("gcc", "ld.lld", "make", "patch", "readelf", "python3", "strace"):
             if shutil.which(tool) is None:
-                raise unittest.SkipTest(f"{tool} is not available")
+                unavailable(f"{tool} is not available")
         env = source_env()
         proot_tar = fetch(f"proot-{env['PROOT_COMMIT']}.tar.gz",
                           [f"https://github.com/termux/proot/archive/{env['PROOT_COMMIT']}.tar.gz"], env["PROOT_SHA256"])
@@ -124,7 +131,7 @@ class ProotFchdirTest(unittest.TestCase):
         cls.baseline = build(cls.work / "without", [p for p in patches if p.name != FCHDIR_PATCH], proot_tar, talloc_tar)
         probe = cls.run_guest(cls.proot, ["true"], check=False)
         if probe.returncode != 0:
-            raise unittest.SkipTest("proot cannot trace here: " + probe.stderr[-300:])
+            unavailable("proot cannot trace here: " + probe.stderr[-300:])
 
     @classmethod
     def tearDownClass(cls):
@@ -190,7 +197,6 @@ class ProotFchdirTest(unittest.TestCase):
         self.run_guest(proot, ["python3", "/route.py", path, str(rounds)], tree=tree, trace=trace)
         return sum(marker in line for line in trace.read_text().splitlines())
 
-    @unittest.skipIf(shutil.which("strace") is None, "strace is not available")
     def test_fchdir_takes_the_open_directory_instead_of_walking_it(self):
         # In the rootfs, in a binding whose parent is /, in one under a rootfs folder, and in one under glue.
         for path, marker in [("/opt/fchdir-root/a/b", "fchdir-root"),
