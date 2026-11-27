@@ -55,17 +55,20 @@ static unsigned long hits, misses;
 // A seccomp filter the guest installs itself (Firefox's content sandbox) can trap a trampoline
 // syscall that the host allows; proot answers those with ENOSYS. The call is then repeated
 // through libc, where the guest's own SIGSYS handler sees the guest path, and the process stops
-// using the fast path.
+// using the fast path. Filesystems return ENOSYS too (Android's FUSE daemon has no symlink or
+// link), so the call is asked again with invalid arguments: only a trap answers that with ENOSYS
+// as well. Otherwise just this call is repeated through libc and the fast path stays on. A close
+// still runs after a refusal, so descriptors opened for the refused call are not left open.
 static __thread int fp_refused;
 static int optional_syscall(long nr) {
   return nr == SYS_statx || nr == SYS_memfd_create || nr == SYS_faccessat2 || nr == SYS_close_range ||
          nr == SYS_openat2 || nr == SYS_renameat2;
 }
 static long sc(long nr, long a, long b, long c, long d, long e) {
-  if (fp_refused) return -ENOSYS;
+  if (fp_refused && nr != SYS_close) return -ENOSYS;
   long r = fp_sys(nr, a, b, c, d, e, 0);
   if (r == -ENOSYS && !optional_syscall(nr)) {
-    __atomic_store_n(&fp_on, 0, __ATOMIC_RELAXED);
+    if (fp_sys(nr, -1, -1, -1, -1, -1, 0) == -ENOSYS) __atomic_store_n(&fp_on, 0, __ATOMIC_RELAXED);
     fp_refused = 1;
   }
   return r;
@@ -76,6 +79,14 @@ static inline int refused(void) {
   return 1;
 }
 static inline int answered(long r) { return !refused() && r != FP_SLOW; }
+// For lookups whose failure only means "not known" (a socket's inode or flags, the miss log): a refusal they
+// meet is not left for the call they serve.
+static long sc_aside(long nr, long a, long b, long c, long d, long e) {
+  int was = fp_refused;
+  long r = sc(nr, a, b, c, d, e);
+  fp_refused = was;
+  return r;
+}
 static void fp_init(void);
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 static inline int fp_ready(void) {
@@ -99,9 +110,15 @@ static void stats(void) {
 static const char *miss_log;
 static long fp_open(int dirfd, const char *path, int flags, mode_t mode);
 
+static void note_miss(const char *call, int dirfd, const char *path);
 static void missed(const char *call, int dirfd, const char *path) {
   misses++;
   if (!miss_log) return;
+  int was = fp_refused;
+  note_miss(call, dirfd, path);
+  fp_refused = was;
+}
+static void note_miss(const char *call, int dirfd, const char *path) {
   char line[2 * PATH_MAX + 128], base[PATH_MAX] = "";
   if (path && path[0] != '/' && dirfd != AT_FDCWD) {
     char link[40];
@@ -1170,7 +1187,7 @@ char *realpath(const char *path, char *resolved) {
   struct res r;
   long rs = resolve_as(AT_FDCWD, path, 1, 1, &r);
   if (rs == 0 && !r.named) rs = FP_SLOW;
-  if (rs == FP_SLOW) { missed(__func__, AT_FDCWD, path); return real_realpath(path, resolved); }
+  if (refused() || rs == FP_SLOW) { missed(__func__, AT_FDCWD, path); return real_realpath(path, resolved); }
   hits++;
   if (rs == 1) rs = -ENOENT;
   if (rs < 0) { errno = (int)-rs; return NULL; }
@@ -1192,7 +1209,8 @@ char *canonicalize_file_name(const char *path) { return realpath(path, NULL); }
 char *getcwd(char *buf, size_t size) {
   REAL(getcwd, char *(*)(char *, size_t));
   char g[PATH_MAX];
-  if (!fp_ready() || own_cwd(g) == FP_SLOW || refused()) { missed(__func__, AT_FDCWD, "."); return real_getcwd(buf, size); }
+  long n = fp_ready() ? own_cwd(g) : FP_SLOW;
+  if (refused() || n == FP_SLOW) { missed(__func__, AT_FDCWD, "."); return real_getcwd(buf, size); }
   hits++;
   size_t need = strlen(g) + 1;
   if (buf && size == 0) { errno = EINVAL; return NULL; }
@@ -1570,7 +1588,7 @@ static const char *fd_name(const char *path) {
 
 static unsigned long socket_ino(int fd) {
   struct stat st;
-  return sc(SYS_newfstatat, fd, (long)"", (long)&st, AT_EMPTY_PATH, 0) == 0 ? (unsigned long)st.st_ino : 0;
+  return sc_aside(SYS_newfstatat, fd, (long)"", (long)&st, AT_EMPTY_PATH, 0) == 0 ? (unsigned long)st.st_ino : 0;
 }
 
 static void remember_long(int fd, int kind, const char *name, const char *guest) {
@@ -1648,7 +1666,7 @@ static long socket_address(const struct sockaddr *addr, socklen_t len, int follo
 }
 
 static int nonblocking(int fd) {
-  long fl = sc(SYS_fcntl, fd, F_GETFL, 0, 0, 0);
+  long fl = sc_aside(SYS_fcntl, fd, F_GETFL, 0, 0, 0);
   return fl >= 0 && (fl & O_NONBLOCK);
 }
 
@@ -1723,7 +1741,7 @@ static void inherit_long_name(int listener, int accepted) {
 static int pending(int fd) {
   struct pollfd p = { .fd = fd, .events = POLLIN };
   struct timespec now = { 0, 0 };
-  return sc(SYS_ppoll, (long)&p, 1, (long)&now, 0, 0) == 1 && (p.revents & POLLIN);
+  return sc_aside(SYS_ppoll, (long)&p, 1, (long)&now, 0, 0) == 1 && (p.revents & POLLIN);
 }
 
 static int accept_common(int fd, struct sockaddr *addr, socklen_t *len, int flags) {
@@ -1790,7 +1808,7 @@ int shm_unlink(const char *name) {
 DIR *opendir(const char *path) {
   REAL(opendir, DIR *(*)(const char *));
   long fd = fp_open(AT_FDCWD, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK, 0);
-  if (fd == FP_SLOW) { missed(__func__, AT_FDCWD, path); return real_opendir(path); }
+  if (refused() || fd == FP_SLOW) { missed(__func__, AT_FDCWD, path); return real_opendir(path); }
   hits++;
   if (fd < 0) { errno = (int)-fd; return NULL; }
   DIR *d = fdopendir((int)fd);
@@ -1809,7 +1827,7 @@ static FILE *fopen_common(const char *path, const char *m, FILE *(*real)(const c
   if (strchr(m, 'e')) flags |= O_CLOEXEC;
   if (strchr(m, 'x')) flags |= O_EXCL;
   long fd = fp_open(AT_FDCWD, path, flags, 0666);
-  if (fd == FP_SLOW) { missed(__func__, AT_FDCWD, path); return real(path, m); }
+  if (refused() || fd == FP_SLOW) { missed(__func__, AT_FDCWD, path); return real(path, m); }
   hits++;
   if (fd < 0) { errno = (int)-fd; return NULL; }
   FILE *f = fdopen((int)fd, m);
@@ -1841,7 +1859,7 @@ static int online_cpus(void) {
 int get_nprocs(void) {
   REAL(get_nprocs, int (*)(void));
   int n = fp_ready() ? online_cpus() : -1;
-  if (n > 0 && !refused()) { hits++; return n; }
+  if (!refused() && n > 0) { hits++; return n; }
   missed(__func__, AT_FDCWD, "(nprocs)");
   return real_get_nprocs();
 }
@@ -1999,7 +2017,8 @@ static int own_passwd(const char *name, uid_t uid, struct passwd *pw, char *buf,
 static int passwd_r(const char *name, uid_t uid, struct passwd *pw, char *buf, size_t buflen, struct passwd **result,
                     int (*real_name)(const char *, struct passwd *, char *, size_t, struct passwd **),
                     int (*real_uid)(uid_t, struct passwd *, char *, size_t, struct passwd **)) {
-  if (!own_passwd(name, uid, pw, buf, buflen)) {
+  int own = own_passwd(name, uid, pw, buf, buflen);
+  if (refused() || !own) {
     missed(name ? "getpwnam" : "getpwuid", AT_FDCWD, "(passwd)");
     return name ? real_name(name, pw, buf, buflen, result) : real_uid(uid, pw, buf, buflen, result);
   }
@@ -2027,7 +2046,7 @@ static struct passwd *passwd_static(const char *name, uid_t uid) {
   pthread_mutex_lock(&static_pw_lock);
   int own = own_passwd(name, uid, &static_pw, static_pw_buf, sizeof static_pw_buf);
   pthread_mutex_unlock(&static_pw_lock);
-  if (!own) return NULL;
+  if (refused() || !own) return NULL;
   hits++;
   errno = 0;
   return &static_pw;

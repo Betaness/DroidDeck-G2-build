@@ -424,7 +424,7 @@ object PlayJournal {
 
     private fun settings(ctx: Context?): Map<String, Any?> {
         val out = LinkedHashMap<String, Any?>()
-        for (k in listOf("gpuclock", "threads", "schedfeed", "joyose", "mibridge", "cooler", "colocation")) facts[k]?.let { out[k] = it }
+        for (k in listOf("gpuclock", "threads", "schedfeed", "joyose", "mibridge", "cooler", "thermalbreak", "colocation")) facts[k]?.let { out[k] = it }
         out["regulator"] = HyperOsGameMode.launchCheck.value.name
         out["joyoseWatch"] = HyperOsGameMode.joyoseWatch
         out["frameSchedOptOut"] = FrameSchedOptOut.outcome

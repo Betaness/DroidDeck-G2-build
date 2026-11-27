@@ -564,6 +564,7 @@ class SessionService : Service() {
         Log.i(TAG, journal.fact("mibridge", MiBridgeBoost.start(this)))
         Log.i(TAG, journal.fact("cooler", CoolerFloor.start(this)))
         Log.i(TAG, RefreshRateLift.sessionStarted(this))
+        ThermalBreakLimit.start(this) { journal.fact("thermalbreak", it) }
         Log.i(TAG, journal.fact("colocation", WineServerColocation.start(this)))
 
         val size = SessionState.outputSize

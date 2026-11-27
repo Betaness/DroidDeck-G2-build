@@ -71,7 +71,7 @@ class PadBridgeRoutingTest {
             InputDevice.KEYBOARD_TYPE_NONE, id = -1)
         assertTrue(virtual.isVirtual)
         assertFalse(PadBridge.isFromController(virtual))
-        for (uinputName in listOf("uinput-xiaomi", "uinput-fpc", "uinput_nav")) {
+        for (uinputName in listOf("uinput-xiaomi", "uinput-fpc", "uinput_nav", "ui-input-xiaomi", " UI-Input-Xiaomi ")) {
             val phantom = device(
                 InputDevice.SOURCE_GAMEPAD or InputDevice.SOURCE_JOYSTICK,
                 InputDevice.KEYBOARD_TYPE_NONE,
@@ -82,6 +82,15 @@ class PadBridgeRoutingTest {
             assertFalse(PadBridge.isControllerKeyEvent(key(phantom, KeyEvent.KEYCODE_BUTTON_A, KeyEvent.ACTION_DOWN)))
         }
         assertFalse(PadBridge.anyControllerConnected())
+    }
+
+    @Test fun onlyXiaomisOwnUinputDeviceIsIgnoredByItsExactName() {
+        assertTrue(PadBridge.isSystemVirtualInputName("ui-input-xiaomi"))
+        assertFalse(PadBridge.isSystemVirtualInputName("Xiaomi Wireless Gamepad"))
+        assertFalse(PadBridge.isSystemVirtualInputName("ui-input-xiaomi-pad"))
+        val pad = device(InputDevice.SOURCE_GAMEPAD or InputDevice.SOURCE_JOYSTICK, InputDevice.KEYBOARD_TYPE_NONE,
+            name = "Xiaomi Wireless Gamepad")
+        assertTrue(PadBridge.isFromController(pad))
     }
 
     @Test fun homeShortcutsIgnoreHomeFromSystemKeys() {
