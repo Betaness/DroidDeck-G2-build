@@ -954,15 +954,65 @@ static void votes_n(void) {
     }
     CHECK(moved >= ZFG_VOTE_HOLD_FAR_NS && moved <= ZFG_VOTE_HOLD_FAR_NS + 100 * MS, "x2 -> x4: 120 after %lld ms",
           (long long)(moved / MS));
-    /* x4 -> x3 (90 outputs, below 120): after the long hold */
-    const int64_t t1 = t;
+    /* x4 -> x3 (90 outputs on 120, 1.33 refreshes each): uneven, within about a second */
+    int64_t t1 = t;
     moved = 0;
     for (int n = 0; n < 400 && !moved; n++) {
         t += 33333333;
         if (zfg_vote_step_n(&v, t, 33333333, 3, 0, m, 7, 144.0f) == 90.0f) moved = t - t1;
     }
-    CHECK(moved >= ZFG_VOTE_HOLD_NS && moved <= ZFG_VOTE_HOLD_NS + 100 * MS, "x4 -> x3: 90 after %lld ms",
+    CHECK(moved >= ZFG_VOTE_HOLD_FAR_NS && moved <= ZFG_VOTE_HOLD_FAR_NS + 500 * MS, "x4 -> x3: 90 after %lld ms",
           (long long)(moved / MS));
+    /* x3 at 30 on 90 -> x2 at 30 (60 outputs, 1.5 refreshes each on 90): uneven, within about a second */
+    t1 = t;
+    moved = 0;
+    for (int n = 0; n < 400 && !moved; n++) {
+        t += 33333333;
+        if (zfg_vote_step_n(&v, t, 33333333, 2, 0, m, 7, 144.0f) == 60.0f) moved = t - t1;
+    }
+    CHECK(moved >= ZFG_VOTE_HOLD_FAR_NS && moved <= ZFG_VOTE_HOLD_FAR_NS + 500 * MS, "x3 -> x2 on 90: 60 after %lld ms",
+          (long long)(moved / MS));
+    /* x4 at 30 on 120 -> x2 (60 outputs, two refreshes each): even, 60 after the long hold */
+    zfg_vote_reset(&v);
+    for (int n = 0; n <= 20 * 30; n++, t += 33333333) zfg_vote_step_n(&v, t, 33333333, 4, 0, m, 7, 144.0f);
+    CHECK(v.hz == 120.0f, "x4 at 30 fps: 120");
+    t1 = t;
+    moved = 0;
+    for (int n = 0; n < 400 && !moved; n++) {
+        t += 33333333;
+        if (zfg_vote_step_n(&v, t, 33333333, 2, 0, m, 7, 144.0f) == 60.0f) moved = t - t1;
+    }
+    CHECK(moved >= ZFG_VOTE_HOLD_NS - 50 * MS && moved <= ZFG_VOTE_HOLD_NS + 500 * MS, "x4 -> x2: 60 after %lld ms",
+          (long long)(moved / MS));
+}
+
+/* zfg_vote_layer before each frame, as zerofg_zc.c runs it: the frames of one layer come to a vote; another
+ * layer's frames start over. */
+static void vote_layers(void) {
+    const float m[] = {30, 48, 50, 60, 90, 120, 144};
+    struct zfg_vote v;
+    zfg_vote_reset(&v);
+    int64_t t = 1000 * MS;
+    int first = 0;
+    for (int n = 1; n <= 100 && !first; n++) {
+        t += 33333333;
+        zfg_vote_layer(&v, 0);
+        if (zfg_vote_step_n(&v, t, 33333333, 3, 0, m, 7, 144.0f) > 0.0f) first = n;
+    }
+    CHECK(first == ZFG_PERIOD_HIST + ZFG_VOTE_FIRST && v.hz == 90.0f, "layer 0, x3 at 30 fps: %.0f after %d frames",
+          (double)v.hz, first);
+    for (int n = 0; n < 100; n++) {
+        t += 33333333;
+        zfg_vote_layer(&v, 0);
+        zfg_vote_step_n(&v, t, 33333333, 3, 0, m, 7, 144.0f);
+    }
+    CHECK(v.hz == 90.0f && v.layer == 1, "layer 0 goes on: %.0f", (double)v.hz);
+    t += 33333333;
+    zfg_vote_layer(&v, 2);
+    CHECK(zfg_vote_step_n(&v, t, 33333333, 3, 0, m, 7, 144.0f) == 0.0f && v.layer == 3, "layer 2: starts over");
+    zfg_vote_reset(&v);
+    zfg_vote_layer(&v, 0);
+    CHECK(v.layer == 1 && v.hz == 0.0f, "after a reset: layer 0 starts over");
 }
 
 #define P30 33333333LL
@@ -1280,6 +1330,7 @@ static void loop_run(const struct loop_case *c, struct loop_out *o) {
         const float before = vote;
         const int counted = secs >= c->count_from;
         if (!counted) o->vote_from = vote;
+        zfg_vote_layer(&v, 0);
         const float hz = zfg_vote_step_n(&v, t, period, mult.vote_n ? mult.vote_n : 2, fast.on || nm < mult.vote_n,
                                          c->modes, c->nm, c->peak);
         if (hz > 0.0f) vote = hz;
@@ -1382,19 +1433,31 @@ static void loop_near_band_edges(void) {
 /* A real change of rate still moves the vote and the panel, once. Far above the vote (x3 from 30 to 45 fps: 90 to 135
  * outputs) within about a second, the panel within the lift's 2 s after it; just out of the band (x3 at 34.5 fps, 103.5
  * outputs, 15 % above 90) after the long hold; further (35.5 fps, 18 % above) once the multiplier went down to x2 for
- * the running rate after its grace; below the band or where a lower rate fits again (x3 from 45 to 30: 144 shows every
- * output, unevenly, none lost) after the long hold. x2 (fast until the panel is up) and x4 likewise. */
+ * the running rate after its grace; below the vote with uneven refreshes (x3 from 45 to 30 on 144: 1.6 refreshes an
+ * output; x2 from 60 to 45 on 120: 1.33) within about a second; where a lower rate fits and the vote is still even (x2
+ * from 60 to 30 on 120: two refreshes an output) after the long hold, less the uneven stretch on the way. x2 (fast until the panel is up) and x4 likewise. */
 static void loop_steps(void) {
-    const float m[] = {60, 90, 120, 144};
-    const struct { int mult; double lo, hi; float from, to; double vote_min, vote_max, panel_max; } cases[] = {
-        {3, 30.0, 45.0, 90.0f, 144.0f, 0.5, 1.5, 4.5},   {3, 30.0, 34.5, 90.0f, 144.0f, 9.5, 15.0, 18.0},
-        {3, 30.0, 35.5, 90.0f, 144.0f, 2.0, 7.0, 10.0},   {3, 45.0, 30.0, 144.0f, 90.0f, 9.5, 15.0, 18.0},
-        {2, 30.0, 45.0, 60.0f, 90.0f, 0.5, 1.5, 4.5},    {2, 45.0, 30.0, 90.0f, 60.0f, 9.5, 11.0, 14.0},
-        {4, 30.0, 36.0, 120.0f, 144.0f, 1.0, 4.5, 7.5}};
+    const float m[] = {60, 90, 120, 144}, m7[] = {30, 48, 50, 60, 90, 120, 144};
+    const struct {
+        int mult;
+        double lo, hi;
+        float from, to;
+        double vote_min, vote_max, panel_max;
+        int all;
+    } cases[] = {
+        {3, 30.0, 45.0, 90.0f, 144.0f, 0.5, 1.5, 4.5, 0},  {3, 30.0, 34.5, 90.0f, 144.0f, 9.5, 15.0, 18.0, 0},
+        {3, 30.0, 35.5, 90.0f, 144.0f, 2.0, 7.0, 10.0, 0},  {3, 45.0, 30.0, 144.0f, 90.0f, 0.5, 2.5, 5.5, 0},
+        {2, 30.0, 45.0, 60.0f, 90.0f, 0.5, 1.5, 4.5, 0},   {2, 45.0, 30.0, 90.0f, 60.0f, 0.5, 2.5, 5.5, 0},
+        {4, 30.0, 36.0, 120.0f, 144.0f, 1.0, 4.5, 7.5, 0}, {2, 60.0, 45.0, 120.0f, 90.0f, 0.5, 2.5, 5.5, 1},
+        {3, 40.0, 30.0, 120.0f, 90.0f, 0.5, 2.5, 5.5, 1},  {3, 30.0, 20.0, 90.0f, 60.0f, 0.5, 2.5, 5.5, 1},
+        {2, 60.0, 24.0, 120.0f, 48.0f, 0.5, 2.5, 5.5, 1},  {4, 30.0, 22.5, 120.0f, 90.0f, 0.5, 2.5, 5.5, 1},
+        {2, 60.0, 30.0, 120.0f, 60.0f, 8.0, 11.5, 14.5, 1}};
     for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
         for (int spikes = 0; spikes < 2; spikes++) {
             const double step = 30.0;
-            struct loop_case c = {.mult = cases[i].mult, .modes = m, .nm = 4, .peak = 144.0f, .fps_at = fps_step,
+            const float *mm = cases[i].all ? m7 : m;
+            const int nm = cases[i].all ? 7 : 4;
+            struct loop_case c = {.mult = cases[i].mult, .modes = mm, .nm = nm, .peak = 144.0f, .fps_at = fps_step,
                                   .lo = cases[i].lo, .hi = cases[i].hi, .wander_s = step, .spikes = spikes,
                                   .count_from = step, .secs = 60.0};
             jit_state = 17u + 3u * i + (unsigned)spikes;
@@ -1402,13 +1465,13 @@ static void loop_steps(void) {
             loop_run(&c, &o);
             const double dv = o.vote_changed_at - step, dp = o.panel_changed_at - step;
             CHECK(o.vote_from == cases[i].from && o.last_vote == cases[i].to && o.vote_changes == 1 &&
-                  o.panel_changes == 1 && o.panel == mode_of(cases[i].to, m, 4, 144.0f),
-                  "x%d %.1f -> %.1f fps (spikes %d): the vote %.0f -> %.0f (%d changes), the panel %d (%d changes)",
-                  c.mult, c.lo, c.hi, spikes, (double)o.vote_from, (double)o.last_vote, o.vote_changes, o.panel,
+                  o.panel_changes == 1 && o.panel == mode_of(cases[i].to, mm, nm, 144.0f),
+                  "x%d %.1f -> %.1f fps, %d modes (spikes %d): the vote %.0f -> %.0f (%d changes), the panel %d (%d "
+                  "changes)", c.mult, c.lo, c.hi, nm, spikes, (double)o.vote_from, (double)o.last_vote, o.vote_changes, o.panel,
                   o.panel_changes);
             CHECK(dv >= cases[i].vote_min && dv <= cases[i].vote_max && dp > dv && dp <= cases[i].panel_max,
-                  "x%d %.1f -> %.1f fps (spikes %d): the vote moved %.1f s, the panel %.1f s after the step", c.mult,
-                  c.lo, c.hi, spikes, dv, dp);
+                  "x%d %.1f -> %.1f fps, %d modes (spikes %d): the vote moved %.1f s, the panel %.1f s after the step",
+                  c.mult, c.lo, c.hi, nm, spikes, dv, dp);
         }
 }
 
@@ -1810,6 +1873,7 @@ int main(void) {
     sim_panel_below_the_peak();
     schedule_n_spaces_the_outputs();
     votes_n();
+    vote_layers();
     contexts_and_pool();
     multiplier_downgrades();
     sim_xn_at_30();

@@ -125,10 +125,11 @@ frames: the menu items are greyed out with that reason, and picking ZeroFG says 
   rate fits within 3 % and the vote does not (or the lower rate is at most half of it). Another rate replaces it
   once it has been chosen for 10 s more than the vote was (time back in the band counts against it), so a rate at
   a band edge does not move the panel; ten times faster while N times the real rate is more than 20 % above the
-  vote, the multiplier in force is below the one the vote is for or x2 is `fast` (the running rate costs outputs),
+  vote or below it with an output's refreshes more than a quarter off a whole number (1.33 on 120 Hz at 90
+  outputs), the multiplier in force is below the one the vote is for or x2 is `fast` (the running rate costs outputs),
   the vote is above the peak, or the first vote is less than 10 s old and unchanged (`zfg_vote_step_n`). So a rate
   12 to 20 % above the panel's runs up to about 10 s with outputs left out before the panel comes up, and a lower
-  rate that fits again is taken 10 s late. It asks for seamless mode switches only. The peak rate is the requested
+  rate that fits while the vote is still even is taken 10 s late. It asks for seamless mode switches only. The peak rate is the requested
   mode, else the fastest mode of the panel's size, after the caps (`FrameGen.apply`). While ZeroFG is selected the
   session's own vote is that rate too, so the panel comes back up after ZeroFG's vote lowered it, and for 10 s
   after ZeroFG was turned off while the panel still runs below it; then the running rate, as without ZeroFG. While

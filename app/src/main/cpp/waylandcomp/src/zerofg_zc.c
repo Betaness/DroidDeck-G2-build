@@ -1653,7 +1653,7 @@ static void vote_update(int slot, int64_t period, float peak, int64_t now) {
     if (!Z.k_vote) return;
     float modes[16];
     const int n = modes_get(modes);
-    if (Z.vote_slot != slot) zfg_vote_reset(&Z.vs);
+    zfg_vote_layer(&Z.vs, slot);
     const int held = Z.fast.on || (Z.mult.n && Z.mult.n < Z.mult.vote_n);
     const float v = zfg_vote_step_n(&Z.vs, now, period, Z.mult.vote_n ? Z.mult.vote_n : 2, held, modes, n, peak);
     if (v <= 0.0f || (Z.vote_slot == slot && v == Z.vote)) return;
@@ -1973,7 +1973,7 @@ static int present(const struct vku_frame *f, int acquire_fd, void *token) {
     }
     if (!f->main_window) {
         if (Z.prev.valid && Z.prev.slot == f->slot) forget_prev();
-        if (Z.vote_slot == f->slot) vote_clear();
+        if (Z.vote_slot == f->slot || Z.vs.layer == f->slot + 1) vote_clear();
         return ZFG_DIRECT;
     }
     const char *filter = NULL;
@@ -2239,7 +2239,7 @@ void zfg_init(struct wl_event_loop *loop) {
 void zfg_layer_hidden(int slot) {
     if (PD.n && PD.slot == slot) pend_cancel(0);
     if (Z.prev.valid && Z.prev.slot == slot) forget_prev();
-    if (Z.vote_slot == slot) vote_clear();
+    if (Z.vote_slot == slot || Z.vs.layer == slot + 1) vote_clear();
 }
 
 void zfg_chain_gone(uint32_t chain) {

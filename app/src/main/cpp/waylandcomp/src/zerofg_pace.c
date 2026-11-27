@@ -220,6 +220,19 @@ float zfg_vote_pick(int64_t period, const float *modes, int n, float peak_hz, fl
 
 void zfg_vote_reset(struct zfg_vote *v) { memset(v, 0, sizeof(*v)); }
 
+void zfg_vote_layer(struct zfg_vote *v, int layer) {
+    if (v->layer == layer + 1) return;
+    zfg_vote_reset(v);
+    v->layer = layer + 1;
+}
+
+/* Outputs at `out` a second take more refreshes of `hz` each than one and are more than ZFG_VOTE_UNEVEN off a whole
+ * number of them. */
+static int vote_uneven(double hz, double out) {
+    const double r = hz / out;
+    return r > 1.0 && fabs(r - floor(r + 0.5)) > ZFG_VOTE_UNEVEN;
+}
+
 float zfg_vote_step_n(struct zfg_vote *v, int64_t now, int64_t period, int mult, int held, const float *modes,
                       int n, float peak_hz) {
     if (period > 0 && v->frames < ZFG_PERIOD_HIST + 8) v->frames++;
@@ -238,7 +251,8 @@ float zfg_vote_step_n(struct zfg_vote *v, int64_t now, int64_t period, int mult,
         return pick;
     }
     const double out = mult_of(mult) * 1e9 / (double)v->period;
-    if (held || now < v->young_until || out > (double)v->hz * (1.0 + ZFG_VOTE_FAR) || v->hz > peak_hz + 0.5f)
+    if (held || now < v->young_until || out > (double)v->hz * (1.0 + ZFG_VOTE_FAR) || vote_uneven(v->hz, out) ||
+        v->hz > peak_hz + 0.5f)
         dt *= ZFG_VOTE_HOLD_NS / ZFG_VOTE_HOLD_FAR_NS;
     if (pick == v->hz) {
         v->away = v->away > dt ? v->away - dt : 0;

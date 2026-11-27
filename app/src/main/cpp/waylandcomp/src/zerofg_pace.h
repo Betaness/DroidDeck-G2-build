@@ -143,7 +143,8 @@ float zfg_vote_pick(int64_t period, const float *modes, int n, float peak_hz, fl
  * such frames came. Then, while zfg_vote_pick_n (with `hz` as the previous vote) chooses another rate, the time
  * since the previous frame (at most ZFG_GAP_MIN_NS) adds to `away`; while it chooses the vote, that time comes off
  * again. Both count ZFG_VOTE_HOLD_NS / ZFG_VOTE_HOLD_FAR_NS times over while mult times the real rate is more than
- * ZFG_VOTE_FAR above the vote, the running rate holds the outputs down (`held`: the multiplier in force below the
+ * ZFG_VOTE_FAR above the vote, or below it with the refreshes of an output more than ZFG_VOTE_UNEVEN off a whole
+ * number (the vote is uneven), the running rate holds the outputs down (`held`: the multiplier in force below the
  * one the vote is for, or fast), the vote is above the peak, or the first vote is younger than ZFG_VOTE_HOLD_NS and
  * has not changed (it was taken on few frames). Once `away` reaches ZFG_VOTE_HOLD_NS, the choice replaces the vote:
  * about ZFG_VOTE_HOLD_NS outside the band that keeps it, ZFG_VOTE_HOLD_FAR_NS in those cases; a rate outside the
@@ -151,8 +152,10 @@ float zfg_vote_pick(int64_t period, const float *modes, int n, float peak_hz, fl
 #define ZFG_VOTE_HOLD_NS 10000000000LL
 #define ZFG_VOTE_HOLD_FAR_NS 1000000000LL
 #define ZFG_VOTE_FAR 0.2
+#define ZFG_VOTE_UNEVEN 0.25
 #define ZFG_VOTE_FIRST 8
 struct zfg_vote {
+    int layer;           /* the layer the frames are of, plus 1; 0: none */
     float hz;            /* the vote in force; 0: none */
     int frames;          /* with a period, up to ZFG_PERIOD_HIST + 8 */
     int64_t away;        /* towards a change, up to ZFG_VOTE_HOLD_NS */
@@ -161,6 +164,8 @@ struct zfg_vote {
     int64_t period;      /* smoothed; 0: none yet */
 };
 void zfg_vote_reset(struct zfg_vote *v);
+/* Before each frame of `layer` (0 or more): the vote starts over when the frames before were of another layer. */
+void zfg_vote_layer(struct zfg_vote *v, int layer);
 /* The vote for a real frame at `now`; 0 while there is none. held: the multiplier in force is below `mult`, or x2's
  * generated frames are off for the running rate (fast). */
 float zfg_vote_step_n(struct zfg_vote *v, int64_t now, int64_t period, int mult, int held, const float *modes,
