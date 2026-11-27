@@ -167,6 +167,9 @@ Prototype (inert unless `PROOT_FASTPATH` is set; see `docs/development/proot-per
   with the same call number and invalid arguments. A trap answers `ENOSYS` again and the fast path
   stops for the process; any other error means the call reached the kernel, so only that one call
   is repeated through a plain `svc` and the fast path stays on.
+  Every wrapper that hands a refused call to libc clears the refusal on the way, and lookups made
+  only to describe a socket (its inode, flags, pending connections) or to write the miss log do not
+  refuse the call they serve, so a refusal does not reach the thread's next call.
 
 Old kernel fixes:
 
