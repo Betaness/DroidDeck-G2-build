@@ -495,6 +495,9 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private val drawerComponentMenu by lazy { ComponentsMenu(this, uiHandler) }
     private var drawerGameProfileId by mutableStateOf<Long?>(null)
     private var fpsLimit by mutableStateOf(SessionState.fpsLimit)
+    private var presentCadence by mutableStateOf(false)
+    /** [mali-g2] BL_FPS from droiddeck-env, the cap droiddeck-game-env gives Vortek and libhybris games (0: none). */
+    private val gameFpsCap: Int by lazy { com.droiddeck.launcher.session.GameFpsCap.read(this) }
 
     private fun noSteamSession(): Boolean = (SessionState.mode == SessionService.MODE_RUN &&
         SessionState.program in setOf(
@@ -1365,6 +1368,13 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 fpsLimit = fps
                 applyOutputPacing()
             },
+            presentCadence = presentCadence,
+            presentCadenceAvailable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU,
+            onPresentCadence = { on ->
+                SessionPrefs.setPresentCadence(this@SessionActivity, on)
+                presentCadence = on
+                applyPresentCadence()
+            },
             onFrameGenPick = { mode ->
                 val zeroFgBefore = FrameGen.engine(this@SessionActivity) == FrameGen.ENGINE_ZEROFG
                 FrameGen.set(this@SessionActivity, mode)
@@ -2037,6 +2047,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         textureAnisotropy = SessionPrefs.textureAnisotropy(this)
         textureLodBias = SessionPrefs.textureLodBias(this)
         gameFill = SessionPrefs.gameFill(this)
+        presentCadence = SessionPrefs.presentCadence(this)
+        applyPresentCadence()
         val nextTouchMode = SessionPrefs.touchMode(this)
         if (touchMode != nextTouchMode) {
             if (::touchpad.isInitialized) touchpad.cancel()
@@ -2494,8 +2506,16 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         return minOf(hz, PerfMode.peakRefreshCap(this), mirrorCap)
     }
 
+    /** [mali-g2] Even frame pacing plans on the phone screen's frame timeline: it waits while the game is on glasses or a bottom screen. */
+    private fun applyPresentCadence() {
+        CompositorHost.setPresentCadence(presentCadence && !glassesOutputActive && !bottomOutputActive &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+    }
+
     private fun applyOutputPacing() {
-        Log.i(TAG, "perf: " + PerfMode.apply(this, outputFpsLimit(false), mirrorRefreshLimit()))
+        val modeLimit = com.droiddeck.launcher.session.GameFpsCap.forMode(outputFpsLimit(false), gameFpsCap)
+        Log.i(TAG, "perf: " + PerfMode.apply(this, modeLimit, mirrorRefreshLimit()) +
+            if (modeLimit > 0 && modeLimit == gameFpsCap) " · mode divides the games' BL_FPS=$gameFpsCap" else "")
         SessionState.wantedHz = runCatching { wantedRefreshHz() }.getOrDefault(0f)
         if (CompositorHost.isStarted) {
             val hz = refreshHz()
@@ -5337,6 +5357,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         updatePointerCapture("output attached")
         if (bottomOutputActive) bottomRecoveries = 0
         if (CompositorHost.isStarted) WaylandCompositor.nativeSetCursorComposite(glassesOutputActive || bottomOutputActive)
+        applyPresentCadence()
         surfaceView.visibility = if (glassesOutputActive || bottomOutputActive) View.INVISIBLE else View.VISIBLE
         Log.i(TAG, "compositor output attached: " +
             if (glassesOutputActive) "glasses display ${glassesScreen?.display?.displayId}"

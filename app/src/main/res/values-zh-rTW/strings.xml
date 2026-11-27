@@ -610,6 +610,8 @@
     <string name="drawer_page_display">顯示</string>
     <string name="drawer_frame_limit">影格率限制</string>
     <string name="drawer_frame_limit_note">限制此遊戲的影格率。若有能被此上限整除的螢幕更新率，顯示器會切換至該更新率；其他上限可能看起來不平順。Steam 遊戲請使用快速存取選單中 Steam 的影格率限制。</string>
+    <string name="drawer_present_cadence">均勻影格節奏</string>
+    <string name="drawer_present_cadence_note">讓影格率上限低於螢幕更新率的遊戲依均勻的節奏出影格，每一影格在螢幕上停留相同的更新次數。畫面最多晚約兩次更新顯示，受限影格率的遊戲執行時顯示系統每次更新都要合成。需要 Android 13。</string>
     <string name="drawer_page_effects">效果</string>
     <string name="drawer_page_controls">控制</string>
     <string name="drawer_page_components">元件</string>

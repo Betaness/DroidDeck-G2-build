@@ -613,6 +613,8 @@
     <string name="drawer_page_display">显示</string>
     <string name="drawer_frame_limit">帧率限制</string>
     <string name="drawer_frame_limit_note">限制此游戏的帧率。如有能被上限整除的刷新率，显示屏会切换到该刷新率；其他上限可能导致画面不均匀。Steam 游戏请使用快捷访问菜单中的 Steam 帧率限制。</string>
+    <string name="drawer_present_cadence">均匀帧节奏</string>
+    <string name="drawer_present_cadence_note">让帧率上限低于刷新率的游戏按均匀的节奏出帧，每一帧在屏幕上停留相同的刷新次数。画面最多晚约两次刷新显示，受限帧率的游戏运行时显示系统每次刷新都要合成。需要 Android 13。</string>
     <string name="drawer_page_effects">画面效果</string>
     <string name="drawer_page_controls">控制</string>
     <string name="drawer_page_components">组件</string>

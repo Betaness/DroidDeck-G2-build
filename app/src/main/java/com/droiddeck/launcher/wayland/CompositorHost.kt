@@ -1,10 +1,12 @@
 package com.droiddeck.launcher.wayland
 
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Process
 import android.view.Choreographer
 import android.view.Surface
+import androidx.annotation.RequiresApi
 import com.droiddeck.launcher.session.SessionPrefs
 import com.droiddeck.launcher.session.SessionState
 
@@ -29,6 +31,32 @@ object CompositorHost {
     @Volatile
     private var vsyncGeneration = 0
 
+    /** [mali-g2] Even frame pacing is on (the activity's choice, while the game is on the phone screen). */
+    @Volatile
+    private var presentCadence = false
+
+    /** [mali-g2] With even frame pacing on API 33+: the tick also hands the compositor the preferred frame timeline. */
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+    private fun timelineCallback(generation: Int) = object : Choreographer.VsyncCallback {
+        override fun onVsync(data: Choreographer.FrameData) {
+            if (generation != vsyncGeneration) return
+            val lines = data.frameTimelines
+            val line = data.preferredFrameTimeline
+            val period = if (lines.size > 1) lines[1].expectedPresentationTimeNanos - lines[0].expectedPresentationTimeNanos else 0L
+            WaylandCompositor.nativeFrameTimeline(line.expectedPresentationTimeNanos, line.deadlineNanos, period)
+            WaylandCompositor.nativeVsync(data.frameTimeNanos)
+            if (vsyncRunning) Choreographer.getInstance().postVsyncCallback(this)
+        }
+    }
+
+    private fun postTick(generation: Int) {
+        if (presentCadence && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Choreographer.getInstance().postVsyncCallback(timelineCallback(generation))
+        } else {
+            Choreographer.getInstance().postFrameCallback(vsyncCallback(generation))
+        }
+    }
+
     private fun vsyncCallback(generation: Int) = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             if (generation != vsyncGeneration) return
@@ -52,6 +80,7 @@ object CompositorHost {
     ): Boolean {
         ownVsyncThread = SessionPrefs.vsyncThread(context)
         WaylandCompositor.nativeSetRenderOnCommit(SessionPrefs.renderOnCommit(context))
+        WaylandCompositor.nativeSetPresentCadence(presentCadence)
         pace(refreshHz, fpsLimit)
         if (!SessionState.running) WaylandCompositor.nativeSetOutputSize(outputWidth, outputHeight)
         if (started) {
@@ -81,6 +110,19 @@ object CompositorHost {
     @Synchronized
     fun updatePacing(refreshHz: Float, fpsLimit: Int, voteHz: Float = refreshHz) {
         if (started) pace(refreshHz, fpsLimit, voteHz)
+    }
+
+    /** [mali-g2] Even frame pacing on or off; the tick restarts so it carries the frame timeline only while on. */
+    @Synchronized
+    fun setPresentCadence(on: Boolean) {
+        if (presentCadence == on) return
+        presentCadence = on
+        if (!started) return
+        WaylandCompositor.nativeSetPresentCadence(on)
+        if (vsyncRunning) {
+            pauseVsync()
+            resumeVsync()
+        }
     }
 
     @Synchronized
@@ -122,14 +164,14 @@ object CompositorHost {
 
     private fun resumeVsync() {
         if (vsyncRunning) return
-        val callback = vsyncCallback(++vsyncGeneration)
+        val generation = ++vsyncGeneration
         vsyncRunning = true
         WaylandCompositor.nativeLog("screen", if (ownVsyncThread) "screen tick runs on its own display-priority thread" else "screen tick runs on the main thread")
         if (!ownVsyncThread) {
-            Choreographer.getInstance().postFrameCallback(callback)
+            postTick(generation)
             return
         }
-        vsyncHandler.post { Choreographer.getInstance().postFrameCallback(callback) }
+        vsyncHandler.post { postTick(generation) }
     }
 
     private fun pauseVsync() {

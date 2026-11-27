@@ -88,6 +88,11 @@ static int g_accept = 1;
 static int g_batching;
 static struct ASurfaceTransaction *g_batch;
 static unsigned g_batch_buffers;  /* layers that got a buffer in g_batch */
+/* g_batch carries the main game window's new frame, shown directly: even frame pacing may hold it
+ * (sc_layer_tx_apply_frame). The arrival time and a duplicate of the frame's acquire fence. */
+static int g_batch_frame;
+static int64_t g_batch_arrival_ns;
+static int g_batch_ready_fd = -1;
 static int g_trace;               /* VORTEK_PRESENT_TRACE=1: a timestamped line per message */
 /* [mali-g2] The layer whose frames go to HyperOS's frame governor (FrameSchedFeed), -1: none yet. It
  * stays with one layer: two windows of the same size (Steam's Big Picture behind a full-screen game)
@@ -198,9 +203,18 @@ static struct ASurfaceTransaction *batch(void) {
 }
 
 static void batch_apply(void) {
-    sc_layer_tx_apply(g_batch);
+    if (g_batch_frame) sc_layer_tx_apply_frame(g_batch, g_batch_arrival_ns, g_batch_ready_fd);
+    else sc_layer_tx_apply(g_batch);
     g_batch = NULL;
     g_batch_buffers = 0;
+    g_batch_frame = 0;
+    g_batch_ready_fd = -1;
+}
+
+static int64_t mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
 void vortek_present_batch_flush(void) {
@@ -366,6 +380,7 @@ static int main_window(int slot, const struct vp_msg *m) {
 }
 
 static void on_present(const struct vp_msg *m, int acquire_fd) {
+    const int64_t arrival_ns = mono_ns();
     struct vp_chain *c = chain_of(m->chain);
     if (!c || m->index >= c->n || !c->ahb[m->index] || g_scene_w <= 0 || g_scene_h <= 0 || !g_accept) {
         if (acquire_fd >= 0) close(acquire_fd);
@@ -416,10 +431,20 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
     const int zfg = zfg_present(&vf, acquire_fd, token_of(m->chain, m->index));
     const int up = zfg == ZFG_SHOWN ? VKU_SHOWN : zfg == ZFG_TAKEN ? VKU_TAKEN : vku_present(&vf, acquire_fd, batch(), &why);
     int r = 0;
+    const int paced = up == VKU_DIRECT && vf.main_window && sc_layer_present_cadence_on();
+    const int ready_fd = paced && acquire_fd >= 0 ? fcntl(acquire_fd, F_DUPFD_CLOEXEC, 0) : -1;
     if (up == VKU_DIRECT)
         r = sc_layer_present_vortek(slot, z, c->ahb[m->index], (int)c->w, (int)c->h, acquire_fd,
                                     token_of(m->chain, m->index), x, y, w, h, g_scene_w, g_scene_h, batch());
     if (r == 0 && up != VKU_TAKEN && g_batch) g_batch_buffers |= 1u << slot;
+    if (r == 0 && paced && g_batch) {
+        if (g_batch_ready_fd >= 0) close(g_batch_ready_fd);
+        g_batch_frame = 1;
+        g_batch_arrival_ns = arrival_ns;
+        g_batch_ready_fd = ready_fd;
+    } else if (ready_fd >= 0) {
+        close(ready_fd);
+    }
     if (r != 0) {
         if (feed_fd >= 0) close(feed_fd);
         vortek_present_release(m->chain, m->index, -1);

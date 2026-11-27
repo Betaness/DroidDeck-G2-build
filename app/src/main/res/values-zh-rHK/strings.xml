@@ -610,6 +610,8 @@
     <string name="drawer_page_display">顯示</string>
     <string name="drawer_frame_limit">幀率限制</string>
     <string name="drawer_frame_limit_note">限制此遊戲的幀率。若有能被此上限整除的螢幕更新率，顯示器會切換至該更新率；其他上限可能看起來不平順。Steam 遊戲請使用快速存取選單中 Steam 的幀率限制。</string>
+    <string name="drawer_present_cadence">平均幀節奏</string>
+    <string name="drawer_present_cadence_note">令幀率上限低於螢幕更新率的遊戲按平均的節奏出幀，每一幀在螢幕上停留相同的更新次數。畫面最多遲約兩次更新顯示，受限幀率的遊戲運行時顯示系統每次更新都要合成。需要 Android 13。</string>
     <string name="drawer_page_effects">效果</string>
     <string name="drawer_page_controls">控制</string>
     <string name="drawer_page_components">組件</string>
