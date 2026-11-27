@@ -26,7 +26,7 @@ class RefreshRateRestorerTest {
                 f="${'$'}(dirname "${'$'}0")/value"
                 case "${'$'}1 ${'$'}2 ${'$'}3" in
                 "get secure user_refresh_rate") if [ -f "${'$'}f" ]; then cat "${'$'}f"; else echo null; fi ;;
-                "put secure user_refresh_rate") echo "${'$'}4" > "${'$'}f" ;;
+                "put secure user_refresh_rate") [ -f "${'$'}f.fail" ] && exit 1; echo "${'$'}4" > "${'$'}f" ;;
                 "delete secure user_refresh_rate") rm -f "${'$'}f" ;;
                 *) exit 1 ;;
                 esac
@@ -114,6 +114,49 @@ class RefreshRateRestorerTest {
         Thread.sleep(2_500)
         assertEquals("144", value)
         assertFalse(marker.exists())
+    }
+
+    @Test fun `after a change the value written last is put back`() {
+        value = "144"
+        val app = armed(Record("120", "144", "c1"))
+        assertEquals(0, sh(RefreshRateLiftLogic.changeCommand(marker.path, Record("120", "90", "c1", confirmed = false, previous = "144"))))
+        assertEquals("90", value)
+        assertEquals("c1 120 90", marker.readText().trim())
+        Thread.sleep(1_500)
+        assertEquals("90", value)
+        gone(app)
+        waitFor { marker.readText().trim().endsWith("restored") }
+        assertEquals("c1 120 90 restored", marker.readText().trim())
+        assertEquals("120", value)
+    }
+
+    @Test fun `a change whose write failed leaves the marker naming both values, and the one before is put back`() {
+        value = "144"
+        val app = armed(Record(null, "144", "c2"))
+        File(dir, "value.fail").writeText("")
+        assertFalse(sh(RefreshRateLiftLogic.changeCommand(marker.path, Record(null, "90", "c2", confirmed = false, previous = "144"))) == 0)
+        File(dir, "value.fail").delete()
+        assertEquals("144", value)
+        assertEquals("c2 unset 90 144", marker.readText().trim())
+        gone(app)
+        waitFor { marker.readText().trim().endsWith("restored") }
+        assertEquals("c2 unset 90 restored", marker.readText().trim())
+        assertFalse(File(dir, "value").exists())
+    }
+
+    @Test fun `during a change either value is put back and any other is left`() {
+        for ((now, outcome) in listOf("90" to "restored", "144" to "restored", "60" to "left")) {
+            value = "144"
+            val id = "d$now"
+            val app = armed(Record("120", "144", id))
+            marker.writeText("$id 120 90 144
+")
+            value = now
+            gone(app)
+            waitFor { marker.readText().trim().endsWith(outcome) }
+            assertEquals("$id 120 90 $outcome", marker.readText().trim())
+            assertEquals(if (outcome == "restored") "120" else now, value)
+        }
     }
 
     @Test fun `a later restorer replaces an earlier one`() {

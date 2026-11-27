@@ -15,6 +15,8 @@ class RefreshRateLiftLogicTest {
         val writes = ArrayList<String?>()
         var failing = false
         var failingPut = false
+        /** A change's write does not go through; its first marker line is written. */
+        var failingChange = false
         var marker: String? = null
         /** The restorers started, by id; the last one runs, an earlier one stops at its next look. */
         val armed = ArrayList<String>()
@@ -49,6 +51,15 @@ class RefreshRateLiftLogicTest {
             armed += record.id
         }
 
+        override fun change(record: Record) {
+            check(!failing) { "no pairing" }
+            marker = RefreshRateLiftLogic.markerLine(record)
+            check(!failingChange) { "settings put failed" }
+            writes += record.written
+            value = record.written
+            marker = RefreshRateLiftLogic.markerLine(record.copy(previous = null))
+        }
+
         override fun disarm() {
             check(!failing) { "no pairing" }
             marker = null
@@ -61,7 +72,7 @@ class RefreshRateLiftLogicTest {
             val m = RefreshRateLiftLogic.parseMarker(marker ?: "") ?: return
             if (m.id != running || m.outcome != null) return
             val line = "${m.id} ${m.original ?: "unset"} ${m.written}"
-            marker = if (value == m.written) {
+            marker = if (value == m.written || (m.previous != null && value == m.previous)) {
                 value = m.original
                 writes += m.original
                 "$line ${RefreshRateLiftLogic.RESTORED}"
@@ -78,8 +89,9 @@ class RefreshRateLiftLogicTest {
 
     private val records = FakeRecords()
     private var ids = 0
+    private var now = 0L
 
-    private fun logic(secure: FakeSecure) = RefreshRateLiftLogic(secure, records) { "r${++ids}" }
+    private fun logic(secure: FakeSecure) = RefreshRateLiftLogic(secure, records, { now }) { "r${++ids}" }
 
     @Test fun `raised while shown and put back after, with the value before recorded and a restorer started first`() {
         val secure = FakeSecure("120")
@@ -359,6 +371,253 @@ class RefreshRateLiftLogicTest {
         assertTrue(secure.writes.isEmpty())
     }
 
+    @Test fun `another rate wanted is written once it held for the steady time and the last write is the dwell old`() {
+        val secure = FakeSecure("120")
+        val lift = logic(secure)
+        assertEquals("user_refresh_rate 120 -> 144 while a session is on screen", lift.shown(true, 144))
+        lift.want(90, 144)
+        assertEquals(5_000L, lift.due(true))
+        now = 1_000
+        lift.want(120, 144)
+        now = 1_500
+        lift.want(90, 144)
+        assertEquals(3_500L, lift.due(true))
+        now = 4_999
+        assertNull(lift.settle(true))
+        assertEquals("144", secure.value)
+        now = 5_000
+        assertEquals(0L, lift.due(true))
+        assertEquals("user_refresh_rate 144 -> 90, the rate the session wants now", lift.settle(true))
+        assertEquals("90", secure.value)
+        assertEquals(Record("120", "90", "r1"), records.record)
+        assertEquals("r1 120 90", secure.marker)
+        assertNull(lift.due(true))
+
+        lift.want(144, 144)
+        assertEquals(5_000L, lift.due(true))
+        now = 9_000
+        assertNull(lift.settle(true))
+        now = 10_000
+        assertEquals("user_refresh_rate 90 -> 144, the rate the session wants now", lift.settle(true))
+        assertEquals("user_refresh_rate 144 -> 120 again", lift.hidden())
+        assertEquals("120", secure.value)
+        assertNull(records.record)
+        assertNull(secure.marker)
+        assertEquals(listOf<String?>("144", "90", "144", "120"), secure.writes)
+        assertEquals(listOf("r1"), secure.armed)
+    }
+
+    @Test fun `a rate wanted for less than the steady time is not written`() {
+        val secure = FakeSecure("120")
+        val lift = logic(secure)
+        lift.shown(true, 144)
+        now = 10_000
+        lift.want(90, 144)
+        now = 11_000
+        lift.want(144, 144)
+        assertNull(lift.due(true))
+        now = 20_000
+        assertNull(lift.settle(true))
+        lift.want(60, 144)
+        now = 21_999
+        assertNull(lift.settle(true))
+        now = 22_500
+        lift.want(120, 144)
+        now = 23_000
+        assertNull(lift.settle(true))
+        assertEquals(1_500L, lift.due(true))
+        assertEquals(listOf<String?>("144"), secure.writes)
+    }
+
+    @Test fun `nothing is due while hidden, with the setting off, or after a call that failed`() {
+        val secure = FakeSecure("120")
+        val lift = logic(secure)
+        lift.want(90, 144)
+        assertNull(lift.due(true))
+        lift.shown(true, 144, 90)
+        assertEquals("90", secure.value)
+        lift.want(144, 144)
+        now = 10_000
+        assertNull(lift.due(false))
+        assertEquals(0L, lift.due(true))
+        lift.hidden()
+        assertNull(lift.due(true))
+        assertNull(lift.settle(true))
+
+        secure.failing = true
+        assertThrows(IllegalStateException::class.java) { lift.shown(true, 144, 144) }
+        lift.want(90, 144)
+        now = 20_000
+        assertNull(lift.due(true))
+        secure.failing = false
+        assertEquals("user_refresh_rate 120 -> 90 while a session is on screen", lift.shown(true, 144, 90))
+    }
+
+    @Test fun `shown again while a change waits, the rate in place is checked and the change keeps its time`() {
+        val secure = FakeSecure("120")
+        val lift = logic(secure)
+        lift.shown(true, 144)
+        lift.want(90, 144)
+        now = 1_000
+        val reads = secure.reads
+        assertNull(lift.shown(true, 144, 90))
+        assertEquals(reads + 1, secure.reads)
+        assertEquals("144", secure.value)
+        assertEquals(4_000L, lift.due(true))
+        now = 5_000
+        assertEquals("user_refresh_rate 144 -> 90, the rate the session wants now", lift.shown(true, 144, 90))
+        assertEquals("90", secure.value)
+    }
+
+    @Test fun `the restorer puts the value back after a change, and the next process only drops its record`() {
+        val secure = FakeSecure("120")
+        val lift = logic(secure)
+        lift.shown(true, 144)
+        lift.want(90, 144)
+        now = 5_000
+        lift.settle(true)
+        secure.processDied()
+        assertEquals("120", secure.value)
+        assertEquals("r1 120 90 restored", secure.marker)
+        assertEquals("user_refresh_rate 120, changed from 90 meanwhile: left as it is", logic(secure).appStarted())
+        assertNull(records.record)
+        assertNull(secure.marker)
+    }
+
+    @Test fun `a change whose write did not go through is put back from the value before it`() {
+        val secure = FakeSecure("120")
+        val lift = logic(secure)
+        lift.shown(true, 144)
+        lift.want(90, 144)
+        now = 5_000
+        secure.failingChange = true
+        assertThrows(IllegalStateException::class.java) { lift.settle(true) }
+        assertEquals("144", secure.value)
+        assertEquals(Record("120", "90", "r1", confirmed = false, previous = "144"), records.record)
+        assertEquals("r1 120 90 144", secure.marker)
+        assertNull(lift.due(true))
+        assertEquals("user_refresh_rate 144 -> 120 again", lift.hidden())
+        assertEquals("120", secure.value)
+        assertNull(records.record)
+        assertNull(secure.marker)
+    }
+
+    @Test fun `with a change under way when the process died, the restorer puts back either value`() {
+        for (left in listOf("144", "90")) {
+            val secure = FakeSecure("120")
+            records.record = null
+            val lift = logic(secure)
+            lift.shown(true, 144)
+            lift.want(90, 144)
+            now += 5_000
+            secure.failingChange = true
+            assertThrows(IllegalStateException::class.java) { lift.settle(true) }
+            secure.value = left // the write went through after all, or not
+            secure.processDied()
+            assertEquals("120", secure.value)
+            assertTrue(secure.marker!!.endsWith(" restored"))
+        }
+    }
+
+    @Test fun `a change under way left by a process that died is put back at the next start, unless the owner changed it`() {
+        for ((value, line) in listOf(
+            "144" to "user_refresh_rate 144 -> 120 again",
+            "90" to "user_refresh_rate 90 -> 120 again",
+            "60" to "user_refresh_rate 60, changed from 90 meanwhile: left as it is",
+        )) {
+            val secure = FakeSecure(value)
+            records.record = Record("120", "90", "r9", confirmed = false, previous = "144")
+            assertEquals(line, logic(secure).appStarted())
+            assertNull(records.record)
+            assertEquals(if (value == "60") "60" else "120", secure.value)
+        }
+    }
+
+    @Test fun `a change lost with the app's data is taken from the marker naming both values`() {
+        val secure = FakeSecure("144")
+        secure.marker = "r7 120 90 144"
+        val lift = logic(secure)
+        assertEquals("user_refresh_rate 144 recorded only in the restorer's marker: kept, the restorer now watches this process", lift.shown(true, 144))
+        assertEquals(Record("120", "144", "r1"), records.record)
+        assertEquals("r1 120 144", secure.marker)
+        assertEquals("user_refresh_rate 144 -> 120 again", lift.hidden())
+    }
+
+    @Test fun `the owner's change while shown is the value put back after the next change`() {
+        val secure = FakeSecure("120")
+        val lift = logic(secure)
+        lift.shown(true, 144)
+        secure.value = "60"
+        lift.want(90, 144)
+        now = 5_000
+        assertEquals("user_refresh_rate 60, changed from 144 meanwhile -> 90 while a session is on screen", lift.settle(true))
+        assertEquals(Record("60", "90", "r2"), records.record)
+        assertEquals("r2 60 90", secure.marker)
+        // and again, to the owner's own value meanwhile: no record
+        secure.value = "120"
+        lift.want(120, 144)
+        now = 12_000
+        assertEquals("user_refresh_rate 120, changed from 90 meanwhile: already the 120 Hz the session wants", lift.settle(true))
+        assertNull(records.record)
+        assertNull(secure.marker)
+        assertNull(lift.hidden())
+        assertEquals("120", secure.value)
+        assertEquals(listOf<String?>("144", "90"), secure.writes)
+    }
+
+    @Test fun `a rate the owner's value already is needs no record, and another one wanted later is written`() {
+        val secure = FakeSecure("120")
+        val lift = logic(secure)
+        assertEquals("user_refresh_rate 120: already the 120 Hz the session wants", lift.shown(true, 144, 120))
+        assertNull(records.record)
+        lift.want(144, 144)
+        assertEquals(2_000L, lift.due(true))
+        now = 2_000
+        assertEquals("user_refresh_rate 120 -> 144 while a session is on screen", lift.settle(true))
+        assertEquals(Record("120", "144", "r1"), records.record)
+        lift.want(120, 144)
+        now = 7_000
+        assertEquals("user_refresh_rate 144 -> 120, the rate the session wants now", lift.settle(true))
+        assertEquals(Record("120", "120", "r1"), records.record)
+        assertEquals("user_refresh_rate 120 -> 120 again", lift.hidden())
+        assertNull(secure.marker)
+    }
+
+    @Test fun `a rate below the owner's is written for the session and put back`() {
+        val secure = FakeSecure("144")
+        val lift = logic(secure)
+        assertEquals("user_refresh_rate 144 -> 120 while a session is on screen", lift.shown(true, 144, 120))
+        assertEquals(Record("144", "120", "r1"), records.record)
+        assertEquals("user_refresh_rate 120 -> 144 again", lift.hidden())
+        assertEquals("144", secure.value)
+        assertEquals("user_refresh_rate 144: already reaches the panel's 144 Hz", lift.shown(true, 144))
+        assertNull(records.record)
+    }
+
+    @Test fun `a new process keeps a value raised before and changes it to the rate wanted`() {
+        val secure = FakeSecure("120")
+        logic(secure).shown(true, 144)
+        secure.armed.clear()
+        val lift = logic(secure)
+        assertEquals("user_refresh_rate 144 raised before: kept, the restorer now watches this process; " +
+            "user_refresh_rate 144 -> 90, the rate the session wants now", lift.shown(true, 144, 90))
+        assertEquals(Record("120", "90", "r2"), records.record)
+        assertEquals("r2 120 90", secure.marker)
+        assertEquals("user_refresh_rate 90 -> 120 again", lift.hidden())
+        assertEquals("120", secure.value)
+    }
+
+    @Test fun `the rate wanted is one of the panel's modes`() {
+        val modes = listOf(60f, 90f, 120f, 144f, 120.00001f)
+        assertEquals(144, RefreshRateLiftLogic.modeFor(0f, modes))
+        assertEquals(90, RefreshRateLiftLogic.modeFor(89.9f, modes))
+        assertEquals(120, RefreshRateLiftLogic.modeFor(100f, modes))
+        assertEquals(60, RefreshRateLiftLogic.modeFor(59.94f, listOf(59.94f, 120f)))
+        assertEquals(60, RefreshRateLiftLogic.modeFor(30f, modes))
+        assertEquals(144, RefreshRateLiftLogic.modeFor(165f, modes))
+        assertEquals(0, RefreshRateLiftLogic.modeFor(90f, emptyList()))
+    }
+
     @Test fun `the shell's answer is read as a rate or unset`() {
         assertNull(RefreshRateLiftLogic.parse("null\n"))
         assertEquals("120", RefreshRateLiftLogic.parse("120\n"))
@@ -381,6 +640,12 @@ class RefreshRateLiftLogicTest {
         assertNull(RefreshRateLiftLogic.parseMarker("a1b2 120 144 maybe"))
         assertNull(RefreshRateLiftLogic.parseMarker("A1;B2 120 144"))
         assertNull(RefreshRateLiftLogic.parseMarker("a1b2 120 144 restored extra"))
+        val changing = Record("120", "90", "a1b2", confirmed = false, previous = "144")
+        assertEquals("a1b2 120 90 144", RefreshRateLiftLogic.markerLine(changing))
+        assertEquals(RefreshRateLiftLogic.Marker("a1b2", "120", "90", null, "144"), RefreshRateLiftLogic.parseMarker("a1b2 120 90 144"))
+        assertNull(RefreshRateLiftLogic.parseMarker("a1b2 120 90 1;4"))
+        assertThrows(IllegalArgumentException::class.java) { RefreshRateLiftLogic.changeCommand("/tmp/m", Record("120", "90", "a1b2")) }
+        assertThrows(IllegalArgumentException::class.java) { RefreshRateLiftLogic.changeCommand("/tmp/m", changing.copy(previous = "1 4")) }
         assertEquals("/data/local/tmp/refresh-lift.com.droiddeck.launcher.g2", RefreshRateLiftLogic.markerPath("com.droiddeck.launcher.g2"))
         assertThrows(IllegalArgumentException::class.java) { RefreshRateLiftLogic.markerPath("a b") }
         assertThrows(IllegalArgumentException::class.java) { RefreshRateLiftLogic.armCommand("/tmp/m", 1, Record("120", "144", "x'y")) }

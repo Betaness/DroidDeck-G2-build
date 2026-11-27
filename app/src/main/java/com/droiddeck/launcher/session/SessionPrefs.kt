@@ -803,7 +803,7 @@ object SessionPrefs {
         prefs(context).edit().putBoolean("coolerMode", on).apply()
     }
 
-    /** [mali-g2] Whether HyperOS's refresh rate for apps is raised to the panel's top rate while a session is on screen (RefreshRateLift); on by default. */
+    /** [mali-g2] Whether HyperOS's refresh rate for apps is set to the rate the session wants (the panel's top rate unless ZeroFG or a frame rate limit asks for another) while a session is on screen (RefreshRateLift); on by default. */
     fun refreshLift(context: Context): Boolean = prefs(context).getBoolean("refreshLift", true)
 
     fun setRefreshLift(context: Context, on: Boolean) {

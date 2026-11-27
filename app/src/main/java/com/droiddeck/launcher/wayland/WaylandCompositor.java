@@ -381,6 +381,9 @@ public final class WaylandCompositor {
     /** The panel's rates up to that peak, which ZeroFG's frame-rate vote picks from (up to 16). */
     public static native void nativeSetZeroFgModes(float[] hz);
 
+    /** The rate ZeroFG's frame-rate vote asks the panel for; 0: no vote in force. */
+    public static native float nativeZeroFgVoteHz();
+
     /** A new game session: ZeroFG, off after a failure in the last one, may run again. */
     public static native void nativeZeroFgNewSession();
 
