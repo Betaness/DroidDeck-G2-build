@@ -2470,7 +2470,10 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             ?.hz?.takeIf { it > 1f }?.let { return minOf(it, PerfMode.peakRefreshCap(this)) }
         glassesScreen?.hz?.takeIf { it > 1f }?.let { return it }
         val display = if (Build.VERSION.SDK_INT >= 30) display else windowManager.defaultDisplay
-        val hz = PerfMode.sessionHz(display, window.attributes.preferredDisplayModeId).takeIf { it > 1f } ?: 60f
+        val wanted = window.attributes.preferredDisplayModeId
+        val requested = display?.supportedModes?.firstOrNull { wanted != 0 && it.modeId == wanted }?.refreshRate
+        val running = display?.refreshRate?.takeIf { it > 1f }
+        val hz = listOfNotNull(requested, running).minOrNull() ?: 60f
         val mirrorCap = mirrorRefreshLimit().takeIf { it > 0 }?.toFloat() ?: Float.POSITIVE_INFINITY
         val capped = minOf(hz, PerfMode.peakRefreshCap(this), mirrorCap)
         return if (capped > 1f) capped else 60f
