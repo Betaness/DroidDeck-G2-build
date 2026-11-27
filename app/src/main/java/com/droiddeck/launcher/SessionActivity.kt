@@ -482,7 +482,10 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             }
             drawerLayerOpen = false
             drawerPinned = false
-            if (value) drawerDocked = dockDrawer() && openDockedMenu()
+            if (value) {
+                releaseHeldKeys()
+                drawerDocked = dockDrawer() && openDockedMenu()
+            }
             drawerOpenState = value
             if (!value && drawerDocked) closeDockedMenu()
         }
@@ -4439,7 +4442,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             }
             return
         }
-        releaseHeldGuestInput()
+        releaseHeldInputOnCaptureLoss()
         val released = captureReleasedFor
         captureReleasedFor = null
         if (released != null) Log.i(TAG, "pointer capture off (released: $released)")
@@ -4797,11 +4800,29 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private fun keyboardCoversPad() =
         SessionState.mode == SessionService.MODE_STEAM && AgentGuest.steamKeyboard
 
-    private fun releaseHeldGuestInput() {
+    /** No app panel or other input surface has taken over keyboard and pointer. */
+    private fun sessionOwnsInput() =
+        resumed && !drawerOpen && !pcKeyboardOpen && !achievementsOpen && !inputSettingsOpen &&
+            !pipUi && !bottomOutputActive && !touchEditorOpen && !wowChatOnTop
+
+    /** Keyboard keys stay held while the session keeps input; window focus loss releases them. */
+    private fun releaseHeldInputOnCaptureLoss() {
+        if (sessionOwnsInput()) releaseHeldPointerInput() else releaseHeldGuestInput()
+    }
+
+    private fun releaseHeldPointerInput() {
         mouseBackInput.cancel()
         heldButtons.release(1 or 2 or 8 or 16)
+    }
+
+    private fun releaseHeldKeys() {
         guestKeysDown.toList().forEach { sendGuestKey(it, false) }
         heldKeys.release(8 or 16 or 32)
+    }
+
+    private fun releaseHeldGuestInput() {
+        releaseHeldPointerInput()
+        releaseHeldKeys()
     }
 
     private fun sendGuestKey(key: Int, down: Boolean, owner: Int = 1) {
