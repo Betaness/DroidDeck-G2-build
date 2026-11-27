@@ -1829,8 +1829,8 @@ case $mode in
       rm -f "$compat_pending"
       : > "$compat_restarted"
       compat_restarts=0
-      # content_log.txt since the client started: an app, workshop or shader update running (download,
-      # verify, commit, install script) until it logs None or Stopping, or an uninstall.
+      # content_log.txt since the client started: an app, workshop or shader update committing or running
+      # an install script (until another state, or Stopping), or an uninstall. Downloads resume after a restart.
       steam_content_busy() {
         local log=$steam_root/logs/content_log.txt
         [ -f "$log" ] || return 1
@@ -1838,7 +1838,7 @@ case $mode in
           /Client version:/ { split("", u); split("", r); next }
           match($0, /AppID [0-9]+ [A-Za-z]+ update changed : /) {
             split(substr($0, RSTART, RLENGTH), f, " "); s = substr($0, RSTART + RLENGTH)
-            if (s ~ /Running Update/ && s !~ /Stopping/) u[f[3] " " f[2]] = 1; else delete u[f[3] " " f[2]]
+            if (s ~ /Running Update/ && s !~ /Stopping/ && s ~ /Committing|Running Script/) u[f[3] " " f[2]] = 1; else delete u[f[3] " " f[2]]
             next
           }
           match($0, /AppID [0-9]+ state changed : /) {

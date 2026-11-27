@@ -1612,40 +1612,32 @@ class SessionService : Service() {
         if (!SessionPrefs.returnAfterGame(this)) return
         val token = ++gameExitWatchToken
         Thread({
-            val startBy = android.os.SystemClock.elapsedRealtime() + GAME_START_TIMEOUT_MS
-            var seen = false
-            var goneSince = 0L
+            val watch = GameExitWatch(android.os.SystemClock.elapsedRealtime() + GAME_START_TIMEOUT_MS, GAME_EXIT_GRACE_MS, GAME_EXIT_HOLD_MAX_MS)
             val content = SteamContentActivity()
-            var held = emptyList<String>()
             while (token == gameExitWatchToken && gen == sessionGen && SessionState.running && !SessionState.stopRequested) {
                 val now = android.os.SystemClock.elapsedRealtime()
-                if (steamGameRunning()) {
-                    if (!seen) Log.i(TAG, "game $gameId started; returning to the launcher when it closes")
-                    seen = true
-                    goneSince = 0L
-                } else if (!seen) {
-                    if (now > startBy) {
+                when (val step = watch.step(now, steamGameRunning()) { steamBusy(content) }) {
+                    GameExitWatch.Step.Wait -> Unit
+                    GameExitWatch.Step.Started -> Log.i(TAG, "game $gameId started; returning to the launcher when it closes")
+                    GameExitWatch.Step.NotStarted -> {
                         Log.i(TAG, "game $gameId did not start; not watching for its exit")
                         return@Thread
                     }
-                } else {
-                    val busy = steamBusy(content)
-                    if (busy != held) {
-                        if (busy.isNotEmpty()) {
-                            Log.i(TAG, "game $gameId closed while Steam is busy (${busy.joinToString()}); returning to the launcher once it is done")
-                            SessionEvents.record("steam.return_held", mapOf("gameId" to gameId, "busy" to busy.joinToString()))
-                        } else {
-                            Log.i(TAG, "Steam is done (${held.joinToString()})")
-                        }
-                        held = busy
+                    is GameExitWatch.Step.Held -> if (step.again) {
+                        Log.i(TAG, "Steam is busy again (${step.busy.joinToString()})")
+                    } else {
+                        Log.i(TAG, "game $gameId closed while Steam is busy (${step.busy.joinToString()}); returning to the launcher once it is done")
+                        SessionEvents.record("steam.return_held", mapOf("gameId" to gameId, "busy" to step.busy.joinToString()))
                     }
-                    when {
-                        busy.isNotEmpty() -> goneSince = 0L
-                        goneSince == 0L -> goneSince = now
-                        now - goneSince >= GAME_EXIT_GRACE_MS -> {
-                            mainHandler.post { returnAfterGame(gameId, gen, token) }
-                            return@Thread
-                        }
+                    is GameExitWatch.Step.Done -> Log.i(TAG, "Steam is done (${step.held.joinToString()})")
+                    is GameExitWatch.Step.Expired -> {
+                        Log.i(TAG, "Steam still busy after ${GAME_EXIT_HOLD_MAX_MS / 60_000L} min (${step.busy.joinToString()}); returning to the launcher anyway")
+                        mainHandler.post { returnAfterGame(gameId, gen, token) }
+                        return@Thread
+                    }
+                    GameExitWatch.Step.Return -> {
+                        mainHandler.post { returnAfterGame(gameId, gen, token) }
+                        return@Thread
                     }
                 }
                 try { Thread.sleep(GAME_EXIT_POLL_MS) } catch (e: InterruptedException) { return@Thread }
@@ -1665,9 +1657,9 @@ class SessionService : Service() {
 
     private fun steamGameRunning(): Boolean = SteamGameProcess.running()
 
-    /** Downloads, install scripts and uninstalls the client is running; it is not asked to exit during them. */
+    /** Install scripts, commits and uninstalls the client is running; it is not asked to exit during them. */
     private fun steamBusy(content: SteamContentActivity): List<String> = runCatching {
-        content.poll(SteamContentActivity.contentLog(LinuxRuntime.rootDir(this), SessionState.steamClientArch))
+        content.poll(LinuxRuntime.rootDir(this), SessionState.steamClientArch)
     }.getOrDefault(emptyList())
 
     private fun resumeSession(panelVisible: Boolean = true) {
@@ -2525,6 +2517,7 @@ class SessionService : Service() {
         private const val GAME_START_TIMEOUT_MS = 20 * 60_000L
         private const val GAME_EXIT_GRACE_MS = 10_000L
         private const val GAME_EXIT_POLL_MS = 2_000L
+        private const val GAME_EXIT_HOLD_MAX_MS = 10 * 60_000L
         private const val NO_PAD_SWITCH = "Download/droiddeck-no-pad"
         private const val NO_UINPUT_SWITCH = "Download/droiddeck-no-uinput"
         private const val NO_DECK_PAD_SWITCH = "Download/droiddeck-no-deck-pad"

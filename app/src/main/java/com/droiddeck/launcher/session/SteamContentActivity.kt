@@ -4,21 +4,22 @@ import java.io.File
 import java.io.RandomAccessFile
 
 /**
- * What the Steam client is doing to its library, from content_log.txt: app, workshop and shader updates
- * that are running (`AppID <id> App update changed : Running Update,...` covers downloading, verifying,
- * committing and `Running Script` for an install script, until `None` or `Stopping`) and uninstalls
- * (`state changed : ...Uninstalling,` until a state without it), since the client last started
- * (`Client version:`). [poll] reads only what was appended since the previous call.
+ * Steps of the Steam client's library work that should not be cut by asking it to exit, from content_log.txt:
+ * an app, workshop or shader update in `Committing` or `Running Script` (an install script; `AppID <id> App
+ * update changed : Running Update,Running Script,` until another state), and uninstalls (`state changed :
+ * ...Uninstalling,` until a state without it), since the client last started (`Client version:`). Downloads,
+ * validation and other update steps resume when the client starts again and are not listed.
+ * [poll] reads only what was appended since the previous call.
  */
 internal class SteamContentActivity(private val firstReadBytes: Long = FIRST_READ_BYTES) {
-    private val updates = LinkedHashSet<String>()
+    private val updates = LinkedHashMap<String, String>()
     private val uninstalls = LinkedHashSet<String>()
     private var log: File? = null
     private var identity: Any? = null
     private var offset = 0L
 
-    /** What is in progress, as `App 1473480`, `Shader 220`, `uninstall 730`. */
-    fun busy(): List<String> = updates.toList() + uninstalls.map { "uninstall $it" }
+    /** What is in progress, as `App 1473480 (Running Script)`, `Workshop 4000 (Committing)`, `uninstall 730`. */
+    fun busy(): List<String> = updates.map { (key, step) -> "$key ($step)" } + uninstalls.map { "uninstall $it" }
 
     fun feed(line: String) {
         if ("Client version:" in line) {
@@ -29,7 +30,8 @@ internal class SteamContentActivity(private val firstReadBytes: Long = FIRST_REA
         SteamDownloadMonitor.CONTENT_UPDATE.find(line)?.let { match ->
             val key = "${match.groupValues[2]} ${match.groupValues[1]}"
             val state = match.groupValues[3]
-            if ("Running Update" in state && "Stopping" !in state) updates += key else updates -= key
+            val step = UNCUT_STEPS.firstOrNull { it in state }
+            if (step != null && "Running Update" in state && "Stopping" !in state) updates[key] = step else updates -= key
             return
         }
         STATE_CHANGED.find(line)?.let { match ->
@@ -37,6 +39,9 @@ internal class SteamContentActivity(private val firstReadBytes: Long = FIRST_REA
             else uninstalls -= match.groupValues[1]
         }
     }
+
+    /** [poll] on the content_log.txt of the client that runs ([contentLog]). */
+    fun poll(runtimeRoot: File, client: String?): List<String> = poll(contentLog(runtimeRoot, client))
 
     fun poll(file: File?): List<String> {
         if (file == null || !file.isFile) {
@@ -95,6 +100,7 @@ internal class SteamContentActivity(private val firstReadBytes: Long = FIRST_REA
             return homes.map { File(runtimeRoot, "$it/logs/content_log.txt") }.filter { it.isFile }.maxByOrNull { it.lastModified() }
         }
 
+        private val UNCUT_STEPS = listOf("Running Script", "Committing")
         private val STATE_CHANGED = Regex("""AppID (\d+) state changed : (.*)""")
         private const val FIRST_READ_BYTES = 4L * 1024L * 1024L
     }
