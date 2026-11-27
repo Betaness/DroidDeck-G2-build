@@ -200,7 +200,8 @@ object DeviceReport {
         k("Session refresh", String.format(Locale.US, "%.2f Hz", SessionState.refreshHz))
         runCatching {
             val display = context.getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)
-            k("Panel refresh now", String.format(Locale.US, "%.2f Hz", display.refreshRate))
+            k("Panel refresh now", String.format(Locale.US, "%.2f Hz", display.mode.refreshRate))
+            k("App frame rate now", String.format(Locale.US, "%.2f Hz", display.refreshRate))
             k("Panel refresh modes", refreshModesSummary(display.supportedModes.map { it.refreshRate }))
         }
         k("peak_refresh_rate", runCatching { Settings.System.getString(context.contentResolver, "peak_refresh_rate") }.getOrNull() ?: "not set")

@@ -23,8 +23,8 @@ object PerfMode {
                 val best = selectMode(display.supportedModes, cur, fpsLimit, cap)
                 if (best != null && needsChange(display.supportedModes, a.window.attributes.preferredDisplayModeId, best)) {
                     a.window.attributes = a.window.attributes.apply { preferredDisplayModeId = best.modeId }
-                    "display ${cur.refreshRate.toInt()} → ${best.refreshRate.toInt()} Hz (mode ${best.modeId})"
-                } else "display ${cur.refreshRate.toInt()} Hz"
+                    "display ${cur.refreshRate.toInt()} → ${best.refreshRate.toInt()} Hz (mode ${best.modeId})" + appRateNote(display)
+                } else "display ${cur.refreshRate.toInt()} Hz" + appRateNote(display)
             }
         } catch (t: Throwable) { Log.w(TAG, "display mode", t); "display mode failed" }
 
@@ -52,6 +52,24 @@ object PerfMode {
             Settings.System.getFloat(context.contentResolver, "peak_refresh_rate")
         } catch (_: Throwable) { 0f }
         return if (peak >= 1f) peak else Float.POSITIVE_INFINITY
+    }
+
+    /**
+     * The rate a session paces at: the requested mode's ([preferredModeId], 0 for none) or the current mode's, whichever
+     * is lower; 0 when unknown. [Display.getRefreshRate] is not used: it reports a per-app frame-rate override (Game
+     * Mode's or a vendor game tool's FPS setting) instead of the panel's mode.
+     */
+    internal fun sessionHz(display: Display?, preferredModeId: Int): Float {
+        val requested = display?.supportedModes?.firstOrNull { preferredModeId != 0 && it.modeId == preferredModeId }?.refreshRate
+        val running = display?.mode?.refreshRate?.takeIf { it > 1f }
+        return listOfNotNull(requested, running).minOrNull() ?: 0f
+    }
+
+    /** For the log: the rate [Display.getRefreshRate] gives this app when it is not the current mode's. */
+    internal fun appRateNote(display: Display): String {
+        val app = display.refreshRate
+        val mode = display.mode.refreshRate
+        return if (app > 1f && Math.abs(app - mode) > 0.5f) " (app frame rate ${Math.round(app)} Hz, not followed)" else ""
     }
 
     internal fun selectMode(modes: Array<Display.Mode>, current: Display.Mode, fpsLimit: Int, cap: Float): Display.Mode? {

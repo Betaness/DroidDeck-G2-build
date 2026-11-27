@@ -241,7 +241,7 @@ class BottomDesktopPanel(
         }
         attached = true
         surfaceUsed = true
-        BottomDesktop.attach(context, holder.surface, width, height, display?.refreshRate ?: 60f)
+        BottomDesktop.attach(context, holder.surface, width, height, display?.mode?.refreshRate ?: 60f)
         showTouchMode()
     }
 
