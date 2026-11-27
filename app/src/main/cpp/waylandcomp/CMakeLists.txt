@@ -102,7 +102,7 @@ else()
     message(STATUS "droiddeckwayland: frame-generation engines NOT built in (standalone build): stub")
     target_sources(droiddeckwayland PRIVATE src/framegen_engine_stub.c)
 endif()
-# [mali-g2] ZeroFG v1.1.0 (../thirdparty/zerofg, Apache-2.0) with its shipped SPIR-V, for zerofg_zc.c (ZEROFG.md).
+# [mali-g2] ZeroFG v1.2.1 (../thirdparty/zerofg, Apache-2.0) with its shipped SPIR-V, for zerofg_zc.c (ZEROFG.md).
 set(DROIDDECK_ZEROFG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/zerofg)
 add_library(droiddeck_zerofg STATIC
         ${DROIDDECK_ZEROFG_DIR}/src/zerofg.cc

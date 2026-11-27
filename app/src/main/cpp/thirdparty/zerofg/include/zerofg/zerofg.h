@@ -95,12 +95,16 @@ struct Image {
   ActiveRect active_rect;
 
   // Identity of the Real this image holds in the host's accepted order (any
-  // strictly increasing counter; 0 = unknown). ZeroFG reuses what it kept
-  // from the previous pair (the Real it prepared, the motion it starts from)
-  // only when the pair it is about to record starts at the Real the previous
-  // recorded pair ended on, i.e. when previous.sequence equals the
-  // current.sequence of a pair this Interpolator recorded. A gap, a reset, a
-  // changed geometry or an unknown (0) sequence simply start from nothing.
+  // strictly increasing counter; 0 = unknown). ZeroFG reuses the Real it
+  // prepared only when the pair it is about to record starts at the Real the
+  // previous recorded pair ended on, i.e. when previous.sequence equals the
+  // current.sequence of a pair this Interpolator recorded; a gap, a reset, a
+  // changed geometry or an unknown (0) sequence prepare it again. The motion
+  // it starts from is a candidate, never a reused result: a known gap (both
+  // sequences nonzero and not continuous) drops it, an unknown sequence keeps
+  // it as a candidate that loses where it does not fit. The same pair again
+  // (both sequences equal to the last call's) is another phase of it: see
+  // Interpolate.
   uint64_t sequence = 0;
 };
 
@@ -114,6 +118,23 @@ struct CreateInfo {
   // Number of independent GPU resource contexts used for
   // frames in flight.
   uint32_t frame_context_count = 3;
+
+  // Zero's development switches (Mode::kZero only; ZeroOption bits), fixed
+  // for the Interpolator's life: the host makes a new one to change them.
+  uint32_t zero_options = 0;
+};
+
+// CreateInfo::zero_options (slimming, 2026-11-18; lab docs/ZERO_SLIM_2026-11.md).
+enum ZeroOption : uint32_t {
+  // Zero light: one background surface, one render pass, the lattice's
+  // mattes without the guided filter. The render about 40 % cheaper on the
+  // Adreno 840; the same or better on the real clips, weaker where several
+  // rigid surfaces cross.
+  kZeroLight = 1u,
+  // MFG: the phases away from the middle (outside 0.3-0.7: x4's quarters)
+  // show the dense-flow base's picture; the layers' picture only near the
+  // middle. The pair's decisions are still made on its first record.
+  kZeroQuarterBase = 2u,
 };
 
 class AlgorithmContext;
@@ -143,6 +164,16 @@ class Interpolator {
   //   0.0 = previous
   //   0.5 = midpoint (the ZeroFG 2x target)
   //   1.0 = current
+  // Any phase strictly between 0 and 1 (x3: 1/3, 2/3; x4: 0.25, 0.5, 0.75).
+  // A call with the pair of the last successful call (previous.sequence and
+  // current.sequence nonzero and equal to that call's, the same geometry),
+  // when this call or that one is off the middle, records only what depends
+  // on the phase: the per-pair work is that call's. Two middles of one pair
+  // are two whole records, as at x2 always.
+  // Record the phases of a pair one after another on the same queue, before
+  // any other pair, each with its own frame_context_index (frame_context_count
+  // at least N + 1 for xN), and keep both Reals alive until the last one
+  // completes. With sequence 0 every call is a full record.
   //
   // previous/current must have VK_IMAGE_USAGE_SAMPLED_BIT.
   // output must be distinct. The chosen backend requires either storage-image
@@ -181,7 +212,9 @@ class Interpolator {
   // makes this exactly the call above: the HUD layer never fails a frame. The
   // engine gets the HUD-free pictures with sequence 0. Zero also hears where
   // the layer left a HUD that stays in place (digits changing on a panel) and
-  // adds it to its own screen, so it never moves pieces of it.
+  // adds it to its own screen, so it never moves pieces of it. Every phase
+  // (x2, x3, x4): another phase of the same pair, with the same planes,
+  // reuses the HUD-free pictures and records only what depends on the phase.
   Status Interpolate(VkCommandBuffer command_buffer,
                      uint32_t frame_context_index,
                      const Image& previous,
@@ -206,6 +239,14 @@ class Interpolator {
   bool hud_failed_ = false;
   uint32_t width_ = 0, height_ = 0;
   VkFormat input_format_ = VK_FORMAT_UNDEFINED, output_format_ = VK_FORMAT_UNDEFINED;
+  // The pair of the last successful plain record (MFG: a call with the same pair records only the new phase).
+  static bool SameGeometry(const Image& a, const Image& b);
+  void NotePair(bool valid, bool hud, const Image& previous, const Image& current, float phase);
+  bool pair_valid_ = false;
+  bool pair_hud_ = false;  // the last record went through the HUD layer (only the layer repeats it)
+  uint64_t pair_previous_ = 0, pair_current_ = 0;
+  float pair_phase_ = 0.5f;
+  Image pair_geometry_[2];
 };
 
 }  // namespace zerofg
