@@ -149,8 +149,7 @@ class RefreshRateRestorerTest {
             value = "144"
             val id = "d$now"
             val app = armed(Record("120", "144", id))
-            marker.writeText("$id 120 90 144
-")
+            marker.writeText("$id 120 90 144\n")
             value = now
             gone(app)
             waitFor { marker.readText().trim().endsWith(outcome) }

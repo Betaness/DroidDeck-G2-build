@@ -117,15 +117,21 @@ internal class RefreshRateLiftLogic(
 
     fun turnedOff(): String? = restore()
 
-    /** After a call failed: puts the value back when it is not wanted raised. */
-    fun retry(enabled: Boolean): String? = if (visible && enabled) null else restore()
+    /**
+     * After a call failed: puts the value back when it is not wanted raised; while shown, writes the rate wanted when the
+     * call that failed left the rate in place unknown.
+     */
+    fun retry(enabled: Boolean): String? = if (!(visible && enabled)) restore() else if (placed <= 0) lift(wanted) else null
 
-    /** Whether a value raised here waits to be put back. */
-    fun pending(enabled: Boolean): Boolean = !(visible && enabled) && records.load() != null
+    /**
+     * Whether a value written here waits to be put back or, while shown, to be replaced by the rate wanted after a call
+     * that failed. Without a record nothing waits: the value is the owner's, and the next start tries again.
+     */
+    fun pending(enabled: Boolean): Boolean = records.load() != null && (!(visible && enabled) || placed <= 0)
 
     /**
      * Milliseconds until the rate wanted may replace the one this process placed (0: now); null while nothing is to
-     * change: not shown, the setting off, nothing placed (a call failed: the next start tries again), or it is in place.
+     * change: not shown, the setting off, nothing placed (a call failed; [pending] tells whether [retry] is due), or it is in place.
      */
     fun due(enabled: Boolean): Long? {
         if (!visible || !enabled || placed <= 0 || wanted <= 0 || wanted == placed) return null

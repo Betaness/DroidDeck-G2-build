@@ -496,10 +496,55 @@ class RefreshRateLiftLogicTest {
         assertEquals(Record("120", "90", "r1", confirmed = false, previous = "144"), records.record)
         assertEquals("r1 120 90 144", secure.marker)
         assertNull(lift.due(true))
+        assertTrue(lift.pending(true))
         assertEquals("user_refresh_rate 144 -> 120 again", lift.hidden())
         assertEquals("120", secure.value)
         assertNull(records.record)
         assertNull(secure.marker)
+    }
+
+    @Test fun `a change that failed while shown is tried again with the rate wanted then`() {
+        val secure = FakeSecure("120")
+        val lift = logic(secure)
+        assertEquals("user_refresh_rate 120 -> 90 while a session is on screen", lift.shown(true, 144, 90))
+        assertFalse(lift.pending(true))
+        lift.want(144, 144)
+        now = 5_000
+        secure.failing = true
+        assertThrows(IllegalStateException::class.java) { lift.settle(true) }
+        assertEquals("90", secure.value)
+        assertNull(lift.due(true))
+        assertTrue(lift.pending(true))
+        assertThrows(IllegalStateException::class.java) { lift.retry(true) }
+        assertTrue(lift.pending(true))
+        secure.failing = false
+        lift.want(120, 144)
+        assertEquals("user_refresh_rate 90 -> 120, the rate the session wants now", lift.retry(true))
+        assertEquals("120", secure.value)
+        assertEquals(Record("120", "120", "r1"), records.record)
+        assertFalse(lift.pending(true))
+        assertNull(lift.retry(true))
+        assertNull(lift.due(true))
+        assertEquals(listOf<String?>("90", "120"), secure.writes)
+    }
+
+    @Test fun `a change whose write did not go through is tried again while shown`() {
+        val secure = FakeSecure("120")
+        val lift = logic(secure)
+        lift.shown(true, 144)
+        lift.want(90, 144)
+        now = 5_000
+        secure.failingChange = true
+        assertThrows(IllegalStateException::class.java) { lift.settle(true) }
+        assertTrue(lift.pending(true))
+        secure.failingChange = false
+        assertEquals("user_refresh_rate 144 -> 90, the rate the session wants now", lift.retry(true))
+        assertEquals("90", secure.value)
+        assertEquals(Record("120", "90", "r1"), records.record)
+        assertEquals("r1 120 90", secure.marker)
+        assertFalse(lift.pending(true))
+        assertEquals("user_refresh_rate 90 -> 120 again", lift.hidden())
+        assertEquals("120", secure.value)
     }
 
     @Test fun `with a change under way when the process died, the restorer puts back either value`() {

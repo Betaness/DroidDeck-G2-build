@@ -2572,23 +2572,23 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var liftWhy = ""
 
     /** [mali-g2] Tells RefreshRateLift the built-in panel's rate the session wants: HyperOS sets the panel from
-     *  user_refresh_rate and leaves app votes and modes aside. ZeroFG's vote while it votes for the game on this screen;
-     *  else the requested mode while a frame rate limit (the games' held BL_FPS, the compositor's limit) or the
-     *  mirror picks it; else none in particular (the panel's top rate). */
+     *  user_refresh_rate and leaves app votes and modes aside. The rules are RefreshRateLiftDriver.sessionWant's:
+     *  ZeroFG's vote while it votes for the game on this screen; else the requested mode while a frame rate limit (the
+     *  games' held BL_FPS, the compositor's limit) or the mirror picks it; else none in particular (the panel's top rate). */
     private fun updateLiftWant() {
         if (!com.droiddeck.launcher.session.RefreshRateLift.available) return
-        val elsewhere = bottomGame?.takeIf { bottomOutputActive }?.hz?.let { it > 1f } == true ||
-            glassesScreen?.hz?.let { it > 1f } == true
-        val vote = if (!elsewhere && CompositorHost.isStarted && FrameGen.engine(this) == FrameGen.ENGINE_ZEROFG)
-            runCatching { WaylandCompositor.nativeZeroFgVoteHz() }.getOrDefault(0f) else 0f
         val gameCap = if (gameCapHold.held) gameFpsCap else 0
-        val limit = com.droiddeck.launcher.session.GameFpsCap.forMode(outputFpsLimit(false), gameCap)
-        val (hz, why) = when {
-            vote > 1f -> vote to "ZeroFG's frame-rate vote"
-            limit > 0 || mirrorRefreshLimit() > 0 -> runCatching { wantedRefreshHz() }.getOrDefault(0f) to
-                (if (limit > 0) "the mode that divides $limit fps" else "the mirror's rate")
-            else -> 0f to "the panel's top rate"
-        }
+        val want = com.droiddeck.launcher.session.RefreshRateLiftDriver.sessionWant(
+            zeroFg = CompositorHost.isStarted && FrameGen.engine(this) == FrameGen.ENGINE_ZEROFG,
+            vote = { WaylandCompositor.nativeZeroFgVoteHz() },
+            bottomHz = bottomGame?.takeIf { bottomOutputActive }?.hz ?: 0f,
+            glassesHz = glassesScreen?.hz ?: 0f,
+            limitFps = com.droiddeck.launcher.session.GameFpsCap.forMode(outputFpsLimit(false), gameCap),
+            mirrorHz = mirrorRefreshLimit(),
+            mode = { wantedRefreshHz() },
+        )
+        val hz = want.hz
+        val why = want.why
         if (kotlin.math.abs(hz - liftWant) < 0.01f && why == liftWhy) return
         liftWant = hz
         liftWhy = why
